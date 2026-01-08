@@ -10,7 +10,7 @@ mv imdb queries/ceb-imdb-full
 rm imdb.tar.gz
 
 ## downloading data about imdb schema etc.
-wget -O imdb_data.json https://www.dropbox.com/s/o8m1fthow6zn1kg/imdb-unique-plans-sqls.tar.gz?dl=1
+wget -O imdb_data.json https://www.dropbox.com/s/nxtt17s4gdt21r5/imdb_data.json?dl=1
 cp imdb_data.json queries/ceb-imdb-full/dbdata.json
 
 ## CEB-IMDb UniquePlans workload (~3k queries, subset of full CEB-IMDb)

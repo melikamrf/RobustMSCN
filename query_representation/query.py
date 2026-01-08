@@ -152,7 +152,7 @@ def get_true_cardinalities(qrep):
 
 def subplan_to_sql(qrep, subplan_node):
     '''
-    @ests: dict; key: label of the subplan. value: cardinality estimate.
+    @ests: dict; key: label of the subplan. value: PostgreSQL cardinality estimate.
     '''
     sg = qrep["join_graph"].subgraph(subplan_node)
     subsql = nx_graph_to_query(sg)

@@ -10,7 +10,7 @@ mv joblight_train_1950 queries/
 rm joblight_train.tar.gz
 
 ## downloading data about imdb schema etc.
-wget -O imdb_data.json https://www.dropbox.com/s/o8m1fthow6zn1kg/imdb-unique-plans-sqls.tar.gz?dl=1
+wget -O imdb_data.json https://www.dropbox.com/s/nxtt17s4gdt21r5/imdb_data.json?dl=1
 cp imdb_data.json queries/joblight_train_1950/dbdata.json
 
 
@@ -22,7 +22,7 @@ mv joblight_train_1980 queries/
 rm joblight_train.tar.gz
 
 ## downloading data about imdb schema etc.
-wget -O imdb_data.json https://www.dropbox.com/s/o8m1fthow6zn1kg/imdb-unique-plans-sqls.tar.gz?dl=1
+wget -O imdb_data.json https://www.dropbox.com/s/nxtt17s4gdt21r5/imdb_data.json?dl=1
 cp imdb_data.json queries/joblight_train_1980/dbdata.json
 
 

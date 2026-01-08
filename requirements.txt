@@ -1,6 +1,6 @@
 numpy
 pandas
-networkx
+networkx==2.8.8
 sqlparse
 psycopg2-binary
 matplotlib
@@ -11,3 +11,5 @@ torch
 pygtrie
 wandb
 seaborn
+klepto
+captum

@@ -28,8 +28,8 @@ if system == 'Linux':
     lib_file = "libflowloss.so"
     lib_file = lib_dir + "/" + lib_file
     fl_cpp = CDLL(lib_file, mode=RTLD_GLOBAL)
-else:
-    print("flow loss C library not being used as we are not on linux")
+# else:
+#     print("flow loss C library not being used as we are not on linux")
 
 DEBUG_JAX = False
 DEBUG = False

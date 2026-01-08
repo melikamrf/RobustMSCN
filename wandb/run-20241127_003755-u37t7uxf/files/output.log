@@ -1,0 +1,36 @@
+Skipped templates:
+going to read only 509 CEB queries
+Selected 9 train templates, 7 test templates
+Training templates: 11a,9a,10a,9b,4a,3b,7a,6a,2b
+Evaluation templates: 1a,8a,3a,11b,2c,5a,2a
+Selected Queries: 1043 train, 1833 test, 257 val, 509 eval
+Updated stats to remove alias based columns
+updating global features to include flowloss specific ones
+Max tables: 16 , Max pred vals: 56 ,Max joins: 18
+Traceback (most recent call last):
+  File "/Users/erostrate9/Desktop/CSI5137F Data Management/project/project2/Robust-MSCN/main.py", line 284, in <module>
+    main()
+  File "/Users/erostrate9/Desktop/CSI5137F Data Management/project/project2/Robust-MSCN/main.py", line 215, in main
+    featurizer = get_featurizer(trainqs, valqs, testqs, evalqs)
+  File "/Users/erostrate9/Desktop/CSI5137F Data Management/project/project2/Robust-MSCN/main.py", line 156, in get_featurizer
+    featurizer.update_workload_stats(trainqs+valqs+testqs+all_evalqs)
+  File "/Users/erostrate9/Desktop/CSI5137F Data Management/project/project2/Robust-MSCN/cardinality_estimation/featurizer.py", line 677, in update_workload_stats
+    joins = extract_join_clause(qrep["sql"])
+  File "/Users/erostrate9/Desktop/CSI5137F Data Management/project/project2/Robust-MSCN/query_representation/utils.py", line 840, in extract_join_clause
+    froms, aliases, table_names = extract_from_clause(query)
+  File "/Users/erostrate9/Desktop/CSI5137F Data Management/project/project2/Robust-MSCN/query_representation/utils.py", line 1070, in extract_from_clause
+    parsed = sqlparse.parse(query)[0]
+  File "/Users/erostrate9/miniconda3/envs/ceb/lib/python3.10/site-packages/sqlparse/__init__.py", line 30, in parse
+    return tuple(parsestream(sql, encoding))
+  File "/Users/erostrate9/miniconda3/envs/ceb/lib/python3.10/site-packages/sqlparse/engine/filter_stack.py", line 39, in run
+    stmt = grouping.group(stmt)
+  File "/Users/erostrate9/miniconda3/envs/ceb/lib/python3.10/site-packages/sqlparse/engine/grouping.py", line 450, in group
+    func(stmt)
+  File "/Users/erostrate9/miniconda3/envs/ceb/lib/python3.10/site-packages/sqlparse/engine/grouping.py", line 167, in group_period
+    _group(tlist, sql.Identifier, match, valid_prev, valid_next, post)
+  File "/Users/erostrate9/miniconda3/envs/ceb/lib/python3.10/site-packages/sqlparse/engine/grouping.py", line 480, in _group
+    grp = tlist.group_tokens(cls, from_idx, to_idx, extend=extend)
+  File "/Users/erostrate9/miniconda3/envs/ceb/lib/python3.10/site-packages/sqlparse/sql.py", line 333, in group_tokens
+    grp = grp_cls(subtokens)
+  File "/Users/erostrate9/miniconda3/envs/ceb/lib/python3.10/site-packages/sqlparse/sql.py", line 160, in __init__
+    def __init__(self, tokens=None):

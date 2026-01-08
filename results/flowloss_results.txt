@@ -1,0 +1,54 @@
+==================================
+Unseen templates – True cardinality:
+imdb, test, True, #samples: 1833, PostgresPlanCost-C: mean: 2312062.592, median: 957481.11, 99p: 28418995.314
+imdb, test, True, #samples: 496554, QError: mean: 1.0, median: 1.0, 99p: 1.0
+All loss computations took:  26.068381786346436
+true Evaluation time on test set: 26.07 seconds
+==================================
+Unseen templates – Postgres:
+imdb, test, Postgres, #samples: 1833, PostgresPlanCost-C: mean: 10503093.074, median: 2463092.88, 99p: 130112846.725
+imdb, test, Postgres, #samples: 496554, QError: mean: 57319.316, median: 8.971, 99p: 679277.91
+All loss computations took:  25.689532995224
+postgres Evaluation time on test set: 25.70 seconds
+==================================
+Unseen templates – MSCN trained with MSE
+test, MSCN. All templates. #samples: 1833, Relative Postgres Cost: 1.75
+imdb, test, MSCN, #samples: 1833, PostgresPlanCost-C: mean: 3043373.591, median: 1375994.91, 99p: 43245215.403
+imdb, test, MSCN, #samples: 496554, QError: mean: 645.955, median: 4.254, 99p: 2029.659
+All loss computations took:  309.630006313324
+mscn Evaluation time on test set: 309.77 seconds
+==================================
+Unseen templates – MSCN trained with flow-loss
+test, MSCN. All templates. #samples: 1833, Relative Postgres Cost: 1.785
+imdb, test, MSCN, #samples: 1833, PostgresPlanCost-C: mean: 3104753.141, median: 1371927.26, 99p: 43245215.403
+imdb, test, MSCN, #samples: 496554, QError: mean: 1859.392, median: 6.76, 99p: 13331.431
+All loss computations took:  327.7439739704132
+mscn Evaluation time on test set: 327.76 seconds
+==================================
+==================================
+Seen templates – True cardinality:
+imdb, test, True, #samples: 971, PostgresPlanCost-C: mean: 7310472.611, median: 846985.21, 99p: 252580116.972
+imdb, test, True, #samples: 314791, QError: mean: 1.0, median: 1.0, 99p: 1.0
+All loss computations took:  28.72379207611084
+true Evaluation time on test set: 28.73 seconds
+==================================
+Seen templates – Postgres:
+imdb, test, Postgres, #samples: 971, PostgresPlanCost-C: mean: 16118585.324, median: 2290590.79, 99p: 309508758.633
+imdb, test, Postgres, #samples: 314791, QError: mean: 79803.96, median: 31.15, 99p: 1300081.5
+All loss computations took:  30.9172580242157
+postgres Evaluation time on test set: 30.92 seconds
+==================================
+Seen templates – MSCN trained with MSE
+test, MSCN. All templates. #samples: 971, Relative Postgres Cost: 1.515
+imdb, test, MSCN, #samples: 971, PostgresPlanCost-C: mean: 7751576.358, median: 1201866.66, 99p: 180856560.51
+imdb, test, MSCN, #samples: 314791, QError: mean: 254.714, median: 3.224, 99p: 456.312
+All loss computations took:  215.12982940673828
+mscn Evaluation time on test set: 215.19 seconds
+==================================
+Seen templates – MSCN trained with flow-loss
+test, MSCN. All templates. #samples: 971, Relative Postgres Cost: 1.952
+imdb, test, MSCN, #samples: 971, PostgresPlanCost-C: mean: 9983051.321, median: 1278967.38, 99p: 237203423.027
+imdb, test, MSCN, #samples: 314791, QError: mean: 577.811, median: 4.452, 99p: 1947.039
+All loss computations took:  233.0154309272766
+mscn Evaluation time on test set: 233.04 seconds
+==================================

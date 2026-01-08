@@ -1,2 +1,5 @@
 __pycache__
-queries/
+queries/*
+!queries/ceb_runtime_qnames.txt
+pg_hint_plan/
+.lc_cache

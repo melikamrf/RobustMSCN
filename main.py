@@ -21,6 +21,7 @@ import wandb
 import logging
 logger = logging.getLogger("wandb")
 logger.setLevel(logging.ERROR)
+import time
 
 def eval_alg(alg, eval_funcs, qreps, cfg,
         samples_type,
@@ -228,17 +229,31 @@ def main():
         alg.train(trainqs, valqs=valqs, testqs=None, evalqs = None,
                 eval_qdirs = eval_qdirs, featurizer=featurizer)
 
-    eval_alg(alg, eval_fns, trainqs, cfg, "train", featurizer=featurizer)
+    # start_time = time.time()
+    # eval_alg(alg, eval_fns, trainqs, cfg, "train", featurizer=featurizer)
+    # execution_time = time.time() - start_time
+    # print(f"{args.alg} Evaluation time on train set: {execution_time:.2f} seconds")
 
-    if len(valqs) > 0:
-        eval_alg(alg, eval_fns, valqs, cfg, "val", featurizer=featurizer)
+    # if len(valqs) > 0:
+    #     start_time = time.time()
+    #     eval_alg(alg, eval_fns, valqs, cfg, "val", featurizer=featurizer)
+    #     execution_time = time.time() - start_time
+    #     print(f"{args.alg} Evaluation time on val set: {execution_time:.2f} seconds")
 
     if len(testqs) > 0:
+        start_time = time.time()
+        print(' ----------- Evaluation time on test set starts -----------')
         eval_alg(alg, eval_fns, testqs, cfg, "test", featurizer=featurizer)
+        execution_time = time.time() - start_time
+        print(f"{args.alg} Evaluation time on test set: {execution_time:.2f} seconds")
+        print(' ----------- Evaluation time on test set ends -----------')
 
     if len(evalqs) > 0 and len(evalqs[0]) > 0:
         for ei, evalq in enumerate(evalqs):
+            start_time = time.time()
             eval_alg(alg, eval_fns, evalq, cfg, eval_qdirs[ei], featurizer=featurizer)
+            execution_time = time.time() - start_time
+            print(f"Evaluation time on eval set {ei}: {execution_time:.2f} seconds")
             del evalq[:]
 
 def read_flags():

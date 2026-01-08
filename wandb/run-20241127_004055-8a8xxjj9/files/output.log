@@ -1,0 +1,16 @@
+Skipped templates:
+going to read only 509 CEB queries
+Selected 9 train templates, 7 test templates
+Training templates: 11a,9a,10a,9b,4a,3b,7a,6a,2b
+Evaluation templates: 1a,8a,3a,11b,2c,5a,2a
+Traceback (most recent call last):
+  File "/Users/erostrate9/Desktop/CSI5137F Data Management/project/project2/Robust-MSCN/main.py", line 284, in <module>
+    main()
+  File "/Users/erostrate9/Desktop/CSI5137F Data Management/project/project2/Robust-MSCN/main.py", line 199, in main
+    trainqs = load_qdata(train_qfns)
+  File "/Users/erostrate9/Desktop/CSI5137F Data Management/project/project2/Robust-MSCN/query_representation/utils.py", line 133, in load_qdata
+    qrep = load_qrep(qfn)
+  File "/Users/erostrate9/Desktop/CSI5137F Data Management/project/project2/Robust-MSCN/query_representation/query.py", line 69, in load_qrep
+    nx.OrderedDiGraph(json_graph.adjacency_graph(query["subset_graph"]))
+  File "/Users/erostrate9/miniconda3/envs/ceb/lib/python3.10/site-packages/networkx/readwrite/json_graph/adjacency.py", line 137, in adjacency_graph
+    graph.graph = dict(data.get("graph", []))

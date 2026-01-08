@@ -1,0 +1,48 @@
+Skipped templates:
+going to read only 509 CEB queries
+Selected Queries: 1501 train, 1012 test, 620 val, 509 eval
+Updated stats to remove alias based columns
+updating global features to include flowloss specific ones
+Max tables: 16 , Max pred vals: 56 ,Max joins: 18
+max pred vals: 56
+Seen comparison operators:  {'lt', 'eq', 'like', 'in'}
+Tables:  {'company_name', 'movie_keyword', 'person_info', 'movie_companies', 'info_type', 'keyword', 'company_type', 'cast_info', 'kind_type', 'movie_info', 'name', 'movie_info_idx', 'role_type', 'aka_name', 'title'}
+Number of global features:  260
+min y: 0.0, max y: 24.44008533063267
+Features not saved before.
+Extracting features took:  169.41006207466125
+Features not saved before.
+Extracting features took:  73.79082131385803
+Features not saved before.
+Extracting features took:  7.79387903213501
+Features not saved before.
+Extracting features took:  6.84794282913208
+Features not saved before.
+Extracting features took:  46.52776098251343
+SetConvFlow(
+  (inp_drop_layer): Dropout(p=0.0, inplace=False)
+  (hl_drop_layer): Dropout(p=0.0, inplace=False)
+  (combined_drop_layer): Dropout(p=0.0, inplace=False)
+  (sample_mlp1): Linear(in_features=15, out_features=128, bias=True)
+  (sample_mlp2): Linear(in_features=128, out_features=128, bias=True)
+  (predicate_mlp1): Linear(in_features=31, out_features=128, bias=True)
+  (predicate_mlp2): Linear(in_features=128, out_features=128, bias=True)
+  (join_mlp1): Linear(in_features=27, out_features=128, bias=True)
+  (join_mlp2): Linear(in_features=128, out_features=128, bias=True)
+  (flow_mlp1): Linear(in_features=260, out_features=128, bias=True)
+  (flow_mlp2): Linear(in_features=128, out_features=128, bias=True)
+  (out_mlp1): Linear(in_features=512, out_features=128, bias=True)
+  (out_mlp2): Linear(in_features=128, out_features=1, bias=True)
+)
+Training samples: 1501, Model size: 0.699908
+Traceback (most recent call last):
+  File "/Users/erostrate9/Desktop/CSI5137F Data Management/project/project2/Robust-MSCN/main.py", line 284, in <module>
+    main()
+  File "/Users/erostrate9/Desktop/CSI5137F Data Management/project/project2/Robust-MSCN/main.py", line 226, in main
+    alg.train(trainqs, valqs=valqs, testqs=testqs, evalqs = evalqs,
+  File "/Users/erostrate9/Desktop/CSI5137F Data Management/project/project2/Robust-MSCN/cardinality_estimation/algs.py", line 596, in train
+    self.update_flow_training_info()
+  File "/Users/erostrate9/Desktop/CSI5137F Data Management/project/project2/Robust-MSCN/cardinality_estimation/algs.py", line 424, in update_flow_training_info
+    get_optimization_variables(true_cards,
+  File "/Users/erostrate9/Desktop/CSI5137F Data Management/project/project2/Robust-MSCN/evaluation/flow_loss.py", line 234, in get_optimization_variables
+    fl_cpp.get_optimization_variables(ests.ctypes.data_as(c_void_p),

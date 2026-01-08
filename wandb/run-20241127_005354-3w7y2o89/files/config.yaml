@@ -1,0 +1,315 @@
+wandb_version: 1
+
+eval-use_wandb:
+  desc: null
+  value: 1
+eval-save_test_preds:
+  desc: null
+  value: 0
+eval-save_pdf_plans:
+  desc: null
+  value: 0
+eval-num_processes:
+  desc: null
+  value: -1
+data-query_dir:
+  desc: null
+  value: ./queries/ceb-imdb
+data-eval_query_dir:
+  desc: null
+  value: ./queries/ceb-imdb
+data-bitmap_dir:
+  desc: null
+  value: ./queries/allbitmaps/
+data-query_templates:
+  desc: null
+  value: all
+data-eval_templates:
+  desc: null
+  value: all
+data-num_samples_per_template:
+  desc: null
+  value: -1
+data-train_test_split_kind:
+  desc: null
+  value: query
+data-test_size:
+  desc: null
+  value: 0.4
+data-val_size:
+  desc: null
+  value: 0.2
+data-train_tmps:
+  desc: null
+  value: null
+data-test_tmps:
+  desc: null
+  value: null
+data-no_regex_templates:
+  desc: null
+  value: 0
+data-skip7a:
+  desc: null
+  value: 0
+data-seed:
+  desc: null
+  value: 123
+data-diff_templates_seed:
+  desc: null
+  value: 1
+data-only_pgplan_data:
+  desc: null
+  value: 0
+db-db_name:
+  desc: null
+  value: imdb
+db-db_host:
+  desc: null
+  value: localhost
+db-user:
+  desc: null
+  value: imdb
+db-pwd:
+  desc: null
+  value: password
+db-port:
+  desc: null
+  value: 5432
+featurizer-ynormalization:
+  desc: null
+  value: log
+featurizer-join_bitmap:
+  desc: null
+  value: 0
+featurizer-use_saved_feats:
+  desc: null
+  value: 0
+featurizer-feat_onlyseen_maxy:
+  desc: null
+  value: 1
+featurizer-like_char_features:
+  desc: null
+  value: 0
+featurizer-global_feat_tables:
+  desc: null
+  value: 0
+featurizer-sample_bitmap:
+  desc: null
+  value: 0
+featurizer-sample_bitmap_num:
+  desc: null
+  value: 1000
+featurizer-sample_bitmap_buckets:
+  desc: null
+  value: 1000
+featurizer-bitmap_onehotmask:
+  desc: null
+  value: 1
+featurizer-feat_separate_alias:
+  desc: null
+  value: 0
+featurizer-feat_separate_like_ests:
+  desc: null
+  value: 0
+featurizer-feat_mcvs:
+  desc: null
+  value: 0
+featurizer-heuristic_features:
+  desc: null
+  value: 1
+featurizer-table_features:
+  desc: null
+  value: 1
+featurizer-pred_features:
+  desc: null
+  value: 1
+featurizer-global_features:
+  desc: null
+  value: 1
+featurizer-join_features:
+  desc: null
+  value: onehot
+featurizer-set_column_feature:
+  desc: null
+  value: onehot
+featurizer-max_discrete_featurizing_buckets:
+  desc: null
+  value: 1
+featurizer-max_like_featurizing_buckets:
+  desc: null
+  value: 1
+featurizer-feat_onlyseen_preds:
+  desc: null
+  value: 1
+featurizer-clamp_timeouts:
+  desc: null
+  value: 1
+featurizer-true_base_cards:
+  desc: null
+  value: 0
+featurizer-embedding_fn:
+  desc: null
+  value: null
+featurizer-embedding_pooling:
+  desc: null
+  value: null
+featurizer-implied_pred_features:
+  desc: null
+  value: 0
+model-onehot_dropout:
+  desc: null
+  value: 0
+model-onehot_mask_truep:
+  desc: null
+  value: 0.8
+model-random_bitmap_idx:
+  desc: null
+  value: 0
+model-loss_func_name:
+  desc: null
+  value: mse
+model-normalize_flow_loss:
+  desc: null
+  value: 1
+model-max_epochs:
+  desc: null
+  value: 100
+model-eval_epoch:
+  desc: null
+  value: 2
+model-eval_fns:
+  desc: null
+  value: qerr,ppc
+model-lr:
+  desc: null
+  value: 0.0001
+model-num_hidden_layers:
+  desc: null
+  value: 2
+model-hidden_layer_size:
+  desc: null
+  value: 128
+model-load_padded_mscn_feats:
+  desc: null
+  value: 1
+model-cost_model:
+  desc: null
+  value: C
+model-mb_size:
+  desc: null
+  value: 1024
+model-weight_decay:
+  desc: null
+  value: 0.0
+model-optimizer_name:
+  desc: null
+  value: adamw
+model-clip_gradient:
+  desc: null
+  value: 20.0
+model-early_stopping:
+  desc: null
+  value: 0
+model-inp_dropout:
+  desc: null
+  value: 0.0
+model-hl_dropout:
+  desc: null
+  value: 0.0
+model-comb_dropout:
+  desc: null
+  value: 0.0
+model-load_query_together:
+  desc: null
+  value: 0
+model-mask_unseen_subplans:
+  desc: null
+  value: 0
+model-subplan_level_outputs:
+  desc: null
+  value: 0
+model-heuristic_unseen_preds:
+  desc: null
+  value: null
+model-other_hid_units:
+  desc: null
+  value: null
+model-onehot_reg:
+  desc: null
+  value: 0
+model-onehot_reg_decay:
+  desc: null
+  value: 0.01
+model-test_random_bitmap:
+  desc: null
+  value: 0
+model-reg_loss:
+  desc: null
+  value: 0
+model-max_num_tables:
+  desc: null
+  value: -1
+model-training_opt:
+  desc: null
+  value: ''
+model-opt_lr:
+  desc: null
+  value: 0.005
+model-swa_start:
+  desc: null
+  value: 5
+config:
+  desc: null
+  value: configs/config-seen-mse.yaml
+alg:
+  desc: null
+  value: postgres
+regen_featstats:
+  desc: null
+  value: 0
+save_featstats:
+  desc: null
+  value: 0
+use_saved_feats:
+  desc: null
+  value: 1
+wandb_tags:
+  desc: null
+  value: null
+result_dir:
+  desc: null
+  value: ./results/seen/postgres
+eval_fns:
+  desc: null
+  value: ppc,qerr
+_wandb:
+  desc: null
+  value:
+    python_version: 3.10.14
+    cli_version: 0.17.7
+    framework: torch
+    is_jupyter_run: false
+    is_kaggle_kernel: false
+    start_time: 1732686834
+    t:
+      1:
+      - 1
+      - 5
+      - 53
+      - 55
+      2:
+      - 1
+      - 5
+      - 53
+      - 55
+      3:
+      - 15
+      - 16
+      - 23
+      - 62
+      4: 3.10.14
+      5: 0.17.7
+      8:
+      - 4
+      - 5
+      13: darwin-arm64

@@ -1,0 +1,68 @@
+Skipped templates:
+going to read only 509 CEB queries
+Selected Queries: 1501 train, 1012 test, 620 val, 509 eval
+train, Postgres. All templates. #samples: 1501, Relative Postgres Cost: 2.458
+Template: 10a, #samples: 33 Relative Postgres Cost: 1.171, Avg Err: 3123215.325
+Template: 1a, #samples: 300 Relative Postgres Cost: 5.39, Avg Err: 5045561.13
+Template: 11b, #samples: 102 Relative Postgres Cost: 3.919, Avg Err: 25988930.929
+Template: 2a, #samples: 186 Relative Postgres Cost: 7.468, Avg Err: 6793192.14
+Template: 2c, #samples: 55 Relative Postgres Cost: 1.088, Avg Err: 20808.823
+Template: 11a, #samples: 68 Relative Postgres Cost: 1.31, Avg Err: 2234658.492
+Template: 5a, #samples: 43 Relative Postgres Cost: 1.421, Avg Err: 1860825.876
+Template: 9a, #samples: 124 Relative Postgres Cost: 1.511, Avg Err: 35133897.137
+Template: 6a, #samples: 105 Relative Postgres Cost: 54.531, Avg Err: 22111044.706
+Template: 8a, #samples: 136 Relative Postgres Cost: 11.305, Avg Err: 9160639.232
+Template: 3b, #samples: 36 Relative Postgres Cost: 1.212, Avg Err: 48328.335
+Template: 3a, #samples: 58 Relative Postgres Cost: 3.22, Avg Err: 184537.079
+Template: 2b, #samples: 136 Relative Postgres Cost: 8.571, Avg Err: 4439110.279
+Template: 7a, #samples: 60 Relative Postgres Cost: 131.373, Avg Err: 42166984.065
+Template: 4a, #samples: 4 Relative Postgres Cost: 1.188, Avg Err: 525161.46
+Template: 9b, #samples: 55 Relative Postgres Cost: 2.622, Avg Err: 1372885.505
+imdb, train, Postgres, #samples: 1501, PostgresPlanCost-C: mean: 18993660.046, median: 2555969.92, 99p: 336107199.62
+/Users/erostrate9/Desktop/CSI5137F Data Management/project/project2/Robust-MSCN/evaluation/eval_fns.py:470: FutureWarning: The behavior of DataFrame concatenation with empty or all-NA entries is deprecated. In a future version, this will no longer exclude empty or all-NA columns when determining the result dtypes. To retain the old behavior, exclude the relevant entries before the concat operation.
+  combined_df = pd.concat([costs_df, cur_df], ignore_index=True)
+imdb, train, Postgres, #samples: 654384, QError: mean: 198065.074, median: 221.0, 99p: 3359423.46
+All loss computations took:  254.09937191009521
+postgres Evaluation time on train set: 254.11 seconds
+val, Postgres. All templates. #samples: 620, Relative Postgres Cost: 3.289
+Template: 1a, #samples: 124 Relative Postgres Cost: 4.896, Avg Err: 4606866.6
+Template: 7a, #samples: 25 Relative Postgres Cost: 195.09, Avg Err: 61214644.222
+Template: 2a, #samples: 77 Relative Postgres Cost: 8.22, Avg Err: 7973897.897
+Template: 9a, #samples: 52 Relative Postgres Cost: 1.324, Avg Err: 18376667.477
+Template: 6a, #samples: 44 Relative Postgres Cost: 73.072, Avg Err: 31257189.586
+Template: 2b, #samples: 56 Relative Postgres Cost: 7.945, Avg Err: 4964671.45
+Template: 3a, #samples: 24 Relative Postgres Cost: 3.877, Avg Err: 303544.121
+Template: 11b, #samples: 42 Relative Postgres Cost: 5.937, Avg Err: 45407817.888
+Template: 2c, #samples: 23 Relative Postgres Cost: 1.104, Avg Err: 26846.807
+Template: 5a, #samples: 17 Relative Postgres Cost: 19.674, Avg Err: 2524963.205
+Template: 11a, #samples: 28 Relative Postgres Cost: 29.163, Avg Err: 41271446.669
+Template: 9b, #samples: 23 Relative Postgres Cost: 1.261, Avg Err: 2028532.871
+Template: 8a, #samples: 56 Relative Postgres Cost: 10.568, Avg Err: 8725919.523
+Template: 10a, #samples: 13 Relative Postgres Cost: 2.774, Avg Err: 1685825.121
+Template: 3b, #samples: 15 Relative Postgres Cost: 1.219, Avg Err: 39029.604
+Template: 4a, #samples: 1 Relative Postgres Cost: 1.0, Avg Err: 0.0
+imdb, val, Postgres, #samples: 620, PostgresPlanCost-C: mean: 20847520.252, median: 2999519.395, 99p: 365890659.888
+imdb, val, Postgres, #samples: 271634, QError: mean: 227747.661, median: 222.428, 99p: 4473800.0
+All loss computations took:  134.44482421875
+postgres Evaluation time on val set: 134.45 seconds
+Traceback (most recent call last):
+  File "/Users/erostrate9/Desktop/CSI5137F Data Management/project/project2/Robust-MSCN/main.py", line 284, in <module>
+    main()
+  File "/Users/erostrate9/Desktop/CSI5137F Data Management/project/project2/Robust-MSCN/main.py", line 245, in main
+    eval_alg(alg, eval_fns, testqs, cfg, "test", featurizer=featurizer)
+  File "/Users/erostrate9/Desktop/CSI5137F Data Management/project/project2/Robust-MSCN/main.py", line 63, in eval_alg
+    errors = efunc.eval(qreps, ests,
+  File "/Users/erostrate9/Desktop/CSI5137F Data Management/project/project2/Robust-MSCN/evaluation/eval_fns.py", line 596, in eval
+    ppc.compute_costs(sqls, join_graphs,
+  File "/Users/erostrate9/Desktop/CSI5137F Data Management/project/project2/Robust-MSCN/evaluation/plan_losses.py", line 352, in compute_costs
+    all_costs = pool.starmap(compute_cost_pg_single, par_args)
+  File "/Users/erostrate9/miniconda3/envs/ceb/lib/python3.10/multiprocessing/pool.py", line 375, in starmap
+    return self._map_async(func, iterable, starmapstar, chunksize).get()
+  File "/Users/erostrate9/miniconda3/envs/ceb/lib/python3.10/multiprocessing/pool.py", line 768, in get
+    self.wait(timeout)
+  File "/Users/erostrate9/miniconda3/envs/ceb/lib/python3.10/multiprocessing/pool.py", line 765, in wait
+    self._event.wait(timeout)
+  File "/Users/erostrate9/miniconda3/envs/ceb/lib/python3.10/threading.py", line 607, in wait
+    signaled = self._cond.wait(timeout)
+  File "/Users/erostrate9/miniconda3/envs/ceb/lib/python3.10/threading.py", line 320, in wait
+    waiter.acquire()

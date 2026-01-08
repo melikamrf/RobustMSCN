@@ -48,7 +48,7 @@ data:
 db:
   db_name : "imdb"
   db_host : "localhost"
-  user    : "ceb"
+  user    : "imdb"
   pwd     : "password"
   port    : 5432
 

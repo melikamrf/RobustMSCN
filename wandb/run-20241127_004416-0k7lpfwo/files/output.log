@@ -1,0 +1,22 @@
+Skipped templates:
+going to read only 509 CEB queries
+Selected Queries: 1501 train, 1012 test, 620 val, 509 eval
+Updated stats to remove alias based columns
+updating global features to include flowloss specific ones
+Max tables: 16 , Max pred vals: 56 ,Max joins: 18
+max pred vals: 56
+Seen comparison operators:  {'eq', 'lt', 'in', 'like'}
+Tables:  {'keyword', 'movie_info', 'cast_info', 'person_info', 'movie_companies', 'movie_keyword', 'kind_type', 'company_type', 'role_type', 'info_type', 'movie_info_idx', 'company_name', 'name', 'aka_name', 'title'}
+Number of global features:  260
+min y: 0.0, max y: 24.44008533063267
+Traceback (most recent call last):
+  File "/Users/erostrate9/Desktop/CSI5137F Data Management/project/project2/Robust-MSCN/main.py", line 284, in <module>
+    main()
+  File "/Users/erostrate9/Desktop/CSI5137F Data Management/project/project2/Robust-MSCN/main.py", line 219, in main
+    alg = get_alg(args.alg, cfg)
+  File "/Users/erostrate9/Desktop/CSI5137F Data Management/project/project2/Robust-MSCN/cardinality_estimation/__init__.py", line 43, in get_alg
+    return MSCN(
+  File "/Users/erostrate9/Desktop/CSI5137F Data Management/project/project2/Robust-MSCN/cardinality_estimation/algs.py", line 268, in __init__
+    self.eval_fn_handles.append(get_eval_fn(efn))
+  File "/Users/erostrate9/Desktop/CSI5137F Data Management/project/project2/Robust-MSCN/evaluation/eval_fns.py", line 41, in get_eval_fn
+    return FlowLoss()

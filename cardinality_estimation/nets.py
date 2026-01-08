@@ -8,6 +8,7 @@ from .set_transformer import SetTransformer
 import pdb
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+# print(f'device used in experiemnt: {device}')
 DEBUG_TIMES=False
 
 class SimpleRegression(torch.nn.Module):

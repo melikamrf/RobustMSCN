@@ -22,8 +22,8 @@ data:
 
     # query, custom, templates
     train_test_split_kind : "query"
-    test_size : 0.0
-    val_size : 0.0
+    test_size : 0.1
+    val_size : 0.2
     # only used if split == custom
     train_tmps : null
     test_tmps : null
@@ -46,7 +46,7 @@ data:
 db:
   db_name : "imdb"
   db_host : "localhost"
-  user    : "ceb"
+  user    : "imdb"
   pwd     : "password"
   port    : 5432
 

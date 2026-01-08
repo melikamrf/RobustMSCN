@@ -1,0 +1,24 @@
+Skipped templates:
+going to read only 509 CEB queries
+Selected Queries: 1501 train, 1012 test, 620 val, 509 eval
+Traceback (most recent call last):
+  File "/Users/erostrate9/Desktop/CSI5137F Data Management/project/project2/Robust-MSCN/main.py", line 284, in <module>
+    main()
+  File "/Users/erostrate9/Desktop/CSI5137F Data Management/project/project2/Robust-MSCN/main.py", line 233, in main
+    eval_alg(alg, eval_fns, trainqs, cfg, "train", featurizer=featurizer)
+  File "/Users/erostrate9/Desktop/CSI5137F Data Management/project/project2/Robust-MSCN/main.py", line 63, in eval_alg
+    errors = efunc.eval(qreps, ests,
+  File "/Users/erostrate9/Desktop/CSI5137F Data Management/project/project2/Robust-MSCN/evaluation/eval_fns.py", line 596, in eval
+    ppc.compute_costs(sqls, join_graphs,
+  File "/Users/erostrate9/Desktop/CSI5137F Data Management/project/project2/Robust-MSCN/evaluation/plan_losses.py", line 352, in compute_costs
+    all_costs = pool.starmap(compute_cost_pg_single, par_args)
+  File "/Users/erostrate9/miniconda3/envs/ceb/lib/python3.10/multiprocessing/pool.py", line 375, in starmap
+    return self._map_async(func, iterable, starmapstar, chunksize).get()
+  File "/Users/erostrate9/miniconda3/envs/ceb/lib/python3.10/multiprocessing/pool.py", line 768, in get
+    self.wait(timeout)
+  File "/Users/erostrate9/miniconda3/envs/ceb/lib/python3.10/multiprocessing/pool.py", line 765, in wait
+    self._event.wait(timeout)
+  File "/Users/erostrate9/miniconda3/envs/ceb/lib/python3.10/threading.py", line 607, in wait
+    signaled = self._cond.wait(timeout)
+  File "/Users/erostrate9/miniconda3/envs/ceb/lib/python3.10/threading.py", line 320, in wait
+    waiter.acquire()
