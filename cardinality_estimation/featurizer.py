@@ -2468,9 +2468,11 @@ class Featurizer():
 
         # y-stuff
         true_val = einfo["join_key_cardinality"][joincol]["actual"]
+        pg_val = einfo["join_key_cardinality"][joincol]["expected"]
+        residual = true_val - pg_val
+        y_res = self.normalize_val(residual, None)
         y = self.normalize_val(true_val, None)
-
-        return x,y
+        return x,y_res
 
     def get_subplan_features(self, qrep, node, bitmaps=None,
             join_bitmaps=None):

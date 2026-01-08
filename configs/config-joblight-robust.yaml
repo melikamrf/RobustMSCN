@@ -75,7 +75,7 @@ featurizer:
   feat_separate_like_ests : 0
 
   feat_mcvs : 0
-  heuristic_features : 1
+  heuristic_features : 0 #1
 
   table_features: 1
   pred_features : 1
