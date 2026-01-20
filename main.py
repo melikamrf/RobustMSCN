@@ -4,6 +4,7 @@ sys.path.append(".")
 from query_representation.utils import get_query_splits
 
 from cardinality_estimation.featurizer import *
+from cardinality_estimation.dataset import QueryDataset, load_qdata
 from cardinality_estimation import get_alg
 from evaluation.eval_fns import get_eval_fn
 # import glob
@@ -23,6 +24,31 @@ logger = logging.getLogger("wandb")
 logger.setLevel(logging.ERROR)
 import time
 
+def update_labels(qreps):
+    """
+    Add residual labels to qreps without overwriting true cardinalities.
+    residual = actual - expected.
+    """
+    for qrep in qreps:
+        sg = qrep["subset_graph"]
+        for node, data in sg.nodes(data=True):
+            if "cardinality" not in data:
+                continue
+            card = data["cardinality"]
+            card["changed"] = False
+            if "actual" in card and "expected" in card:
+                card["actual"] = card["actual"] / card["expected"]
+                #card["changed"] = True
+
+        for _, _, data in sg.edges(data=True):
+            if "join_key_cardinality" not in data:
+                continue
+            for _, jcard in data["join_key_cardinality"].items():
+                if "actual" in jcard and "expected" in jcard:
+                    jcard["actual"] = jcard["actual"] / jcard["expected"]
+
+    return qreps
+    
 def eval_alg(alg, eval_funcs, qreps, cfg,
         samples_type,
         featurizer=None):
@@ -35,7 +61,6 @@ def eval_alg(alg, eval_funcs, qreps, cfg,
     exp_name = alg.get_exp_name()
 
     ests = alg.test(qreps)
-
     rdir = None
     if args.result_dir is not None:
         rdir = os.path.join(args.result_dir, exp_name)
@@ -73,11 +98,12 @@ def eval_alg(alg, eval_funcs, qreps, cfg,
                 use_wandb = cfg["eval"]["use_wandb"],
                 featurizer = featurizer, alg=alg)
 
-        print("{}, {}, {}, #samples: {}, {}: mean: {}, median: {}, 99p: {}"\
+        print("{}, {}, {}, #samples: {}, {}: mean: {}, median: {}, 99p: {}, max: {}"\
                 .format(cfg["db"]["db_name"], samples_type, alg, len(errors),
                     efunc.__str__(), np.round(np.mean(errors),3),
                     np.round(np.median(errors),3),
-                    np.round(np.percentile(errors,99),3)))
+                    np.round(np.percentile(errors,99),3),
+                    np.round(np.max(errors))))
 
         if cfg["eval"]["use_wandb"]:
             loss_key = "Final-{}-{}-{}".format(str(efunc), samples_type,
@@ -195,17 +221,26 @@ def main():
                 tags=wandb_tags)
 
     train_qfns, test_qfns, val_qfns, eval_qfns = get_query_splits(cfg["data"])
-
     trainqs = load_qdata(train_qfns)
     # Note: can be quite memory intensive to load them all; might want to just
     # keep around the qfns and load them as needed
     valqs = load_qdata(val_qfns)
     testqs = load_qdata(test_qfns)
 
+    if args.learn_residual: 
+        trainqs = update_labels(trainqs)
+        valqs = update_labels(valqs)
+        testqs = update_labels(testqs)
+    
     eval_qdirs = cfg["data"]["eval_query_dir"].split(",")
     evalqs = []
     for eval_qfn in eval_qfns:
-        evalqs.append(load_qdata(eval_qfn))
+        temp_evalqs = load_qdata(eval_qfn)
+        if args.learn_residual:
+            temp_evalqs = update_labels(temp_evalqs)
+            
+        evalqs.append(temp_evalqs)
+        
     eqs = [len(eq) for eq in evalqs]
     print("""Selected Queries: {} train, {} test, {} val, {} eval"""\
             .format(len(trainqs), len(testqs), len(valqs), sum(eqs)))
@@ -222,7 +257,15 @@ def main():
     for efn in args.eval_fns.split(","):
         eval_fns.append(get_eval_fn(efn))
 
-    if cfg["model"]["eval_epoch"] < cfg["model"]["max_epochs"]:
+    if args.load_model is not None:
+        alg.featurizer = featurizer
+        dummy_ds = QueryDataset(testqs[:1], featurizer,
+                    load_query_together=alg.load_query_together,
+                    load_padded_mscn_feats=getattr(alg, 'load_padded_mscn_feats', False),
+                    max_num_tables=-1)
+        alg.load_model(args.load_model, sample=dummy_ds[0])
+
+    elif cfg["model"]["eval_epoch"] < cfg["model"]["max_epochs"]:
         alg.train(trainqs, valqs=valqs, testqs=testqs, evalqs = evalqs,
                 eval_qdirs = eval_qdirs, featurizer=featurizer)
     else:
@@ -279,6 +322,11 @@ def read_flags():
     parser.add_argument("--eval_fns", type=str, required=False,
             default="ppc,qerr")
 
+    parser.add_argument("--learn_residual", type=int, required=False,
+                        default=0)
+    parser.add_argument("--load_model", type=str, required=False,
+            default=None,
+            help="If specified, load the model from the given path")
     return parser.parse_args()
 
 if __name__ == "__main__":

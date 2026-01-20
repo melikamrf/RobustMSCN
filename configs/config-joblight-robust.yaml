@@ -4,8 +4,8 @@
 ### uses query masking + join bitmap
 
 eval:
-  use_wandb : 1
-  save_test_preds : 0
+  use_wandb : 0 #1
+  save_test_preds : 1 #0
   save_pdf_plans : 0
 
   # for parallelizing computing plan costs
@@ -13,7 +13,7 @@ eval:
 
 data:
     query_dir: "./queries/joblight_train"
-    eval_query_dir: "./queries/job/,./queries/ceb-imdb"
+    eval_query_dir:  "queries/job/" #,./queries/ceb-imdb"
     #bitmap_dir: "./queries/allbitmaps-debug2/"
     bitmap_dir: "./queries/allbitmaps"
     query_templates: "all"
@@ -57,7 +57,7 @@ featurizer:
   join_bitmap : 1
 
   # save feats and re-use them if all args match
-  use_saved_feats : 0
+  use_saved_feats : 1 #0
 
   # 1 :: set a maxy based only on the training workloads; or incl. all test
   # workloads

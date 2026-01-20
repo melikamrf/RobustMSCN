@@ -693,6 +693,7 @@ class NN(CardinalityEstimationAlg):
 
             # self.nets[0].load_state_dict(self.best_model_dict)
             # self.nets[0].eval()
+        self.save_model(save_dir='./saved_models', suffix_name="_epoch"+str(self.epoch))
 
     def _eval_ds(self, ds, samples=None):
         torch.set_grad_enabled(False)
@@ -1059,8 +1060,46 @@ class NN(CardinalityEstimationAlg):
     def __str__(self):
         return self.__class__.__name__
 
+    def load_model(self, model_path, sample=None, map_location=None):
+        if map_location is None:
+            map_location = device
+
+        checkpoint = torch.load(model_path, map_location=map_location)
+
+        if not hasattr(self, "net"):
+            if sample is None:
+                raise RuntimeError("Provide a sample to init_net() before loading weights.")
+            self.net, self.optimizer = self.init_net(sample)
+
+        self.net.load_state_dict(checkpoint["model_state"])
+        if hasattr(self, "optimizer") and checkpoint.get("optimizer_state") is not None:
+            self.optimizer.load_state_dict(checkpoint["optimizer_state"])
+        if "epoch" in checkpoint and checkpoint["epoch"] is not None:
+            self.epoch = checkpoint["epoch"]
+
+        self.net.eval() #switches the PyTorch model into evaluation mode. 
+        print("Loaded model from: {}".format(model_path))
+        
     def save_model(self, save_dir="./", suffix_name=""):
-        pass
+        if not hasattr(self, "net"):
+            raise RuntimeError("Model network is not initialized; train or init_net first.")
+
+        os.makedirs(save_dir, exist_ok=True)
+        exp_name = self.get_exp_name()
+        if suffix_name:
+            fname = "{}_{}.pt".format(exp_name, suffix_name)
+        else:
+            fname = "{}.pt".format(exp_name)
+        save_path = os.path.join(save_dir, fname)
+
+        payload = {
+            "model_state": self.net.state_dict(),
+            "optimizer_state": self.optimizer.state_dict() if hasattr(self, "optimizer") else None,
+            "epoch": getattr(self, "epoch", None),
+            "alg_name": self.__str__(),
+        }
+        torch.save(payload, save_path)
+        print("Saved model to: {}".format(save_path))
 
 
 class SavedPreds(CardinalityEstimationAlg):
