@@ -24,6 +24,42 @@ logger = logging.getLogger("wandb")
 logger.setLevel(logging.ERROR)
 import time
 
+import pandas as pd
+import numpy as np
+
+def extract_cardinalities(qreps, ests):
+    """
+    Extract true, postgres estimated, and model estimated cardinalities.
+    """
+    card_data = []
+    
+    for idx, (qrep, est) in enumerate(zip(qreps, ests)):
+        # Access subset_graph nodes (this is where cardinalities are stored)
+        if "subset_graph" in qrep:
+            sg = qrep["subset_graph"]
+            for node, data in sg.nodes(data=True):
+            
+                true_card = data["cardinality"]["actual"]
+                postgres_card = data["cardinality"]["expected"]
+                
+                # Calculate the ratio to verify update_labels was applied
+                # If update_labels was applied: new_actual = old_actual / old_expected
+                # So the ratio should reflect the updated value
+                ratio = true_card / postgres_card if postgres_card > 0 else None
+                
+                card_data.append({
+                    "name": qrep.get("name", f"query_{idx}"),
+                    "node": node,
+                    "true_cardinality": true_card,
+                    "postgres_estimated": postgres_card,
+                    "model_estimated": est[node] if node in est else None,  # Model estimates the root query
+                    "actual_expected_ratio": ratio,
+                    # Add original values before update if available
+                    "is_ratio_close_to_1": abs(ratio - 1.0) < 0.01 if ratio else False
+                })
+    
+    return pd.DataFrame(card_data)
+
 def update_labels(qreps):
     """
     Add residual labels to qreps without overwriting true cardinalities.
@@ -69,6 +105,11 @@ def eval_alg(alg, eval_funcs, qreps, cfg,
         args_fn = os.path.join(rdir, "cfg.json")
         with open(args_fn, 'w', encoding='utf-8') as f:
             json.dump(cfg, f, ensure_ascii=False, indent=4)
+            
+    df = extract_cardinalities(qreps, ests)
+    card_path = os.path.join(args.result_dir, exp_name, f"cardinality_distributions_{samples_type}.csv")
+    df.to_csv(card_path, index=False)
+    print(f"Saved {len(df)} query cardinalities to CSV")
 
     if samples_type != "train" and cfg["eval"]["save_test_preds"]:
         preds_dir = os.path.join(rdir, samples_type + "-preds")
@@ -294,7 +335,8 @@ def main():
     if len(evalqs) > 0 and len(evalqs[0]) > 0:
         for ei, evalq in enumerate(evalqs):
             start_time = time.time()
-            eval_alg(alg, eval_fns, evalq, cfg, eval_qdirs[ei], featurizer=featurizer)
+            #TODO: sample type needs to be changed
+            eval_alg(alg, eval_fns, evalq, cfg, os.path.basename(eval_qdirs[ei]), featurizer=featurizer)
             execution_time = time.time() - start_time
             print(f"Evaluation time on eval set {ei}: {execution_time:.2f} seconds")
             del evalq[:]
