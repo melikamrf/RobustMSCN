@@ -467,6 +467,8 @@ class NN(CardinalityEstimationAlg):
         self.all_errs = []
         self.best_model_epoch = -1
         self.model_weights = []
+        self.adv_weights = None
+        self.adv_weight_level = kwargs.get("adv_weight_level", "dataset")
 
         self.true_costs = {}
         self.true_costs["val"] = 0.0
@@ -493,6 +495,21 @@ class NN(CardinalityEstimationAlg):
                 max_num_tables = self.max_num_tables,
                 load_padded_mscn_feats=self.load_padded_mscn_feats,
                 subplan_mask = subplan_mask
+                )
+
+        if "adv_weights" in kwargs and kwargs["adv_weights"] is not None:
+            self.adv_weights = np.asarray(kwargs["adv_weights"], dtype=np.float32)
+            if self.adv_weight_level == "dataset":
+                expected = len(self.trainds)
+            elif self.adv_weight_level == "query":
+                expected = len(training_samples)
+            else:
+                raise ValueError(f"Unsupported adv_weight_level: {self.adv_weight_level}")
+
+            if len(self.adv_weights) != expected:
+                raise ValueError(
+                    f"Expected {expected} adversarial weights for level "
+                    f"{self.adv_weight_level}, got {len(self.adv_weights)}"
                 )
 
         self.trainloader = data.DataLoader(self.trainds,
@@ -840,6 +857,60 @@ class NN(CardinalityEstimationAlg):
         # pf_mask = torch.from_numpy(pf_mask).float()
         # return tf_mask, jf_mask, pf_mask
 
+    def _extract_info_field(self, info, field):
+        if isinstance(info, dict):
+            values = info[field]
+            if torch.is_tensor(values):
+                return values.detach().cpu().tolist()
+            elif isinstance(values, np.ndarray):
+                return values.tolist()
+            else:
+                return list(values)
+
+        if len(info) == 0:
+            return []
+
+        if isinstance(info[0], dict):
+            return [cur[field] for cur in info]
+
+        if isinstance(info[0], list):
+            # Query-grouped batches such as flowloss keep one info list per query.
+            return [cur[0][field] for cur in info]
+
+        raise TypeError(f"Unsupported info container type: {type(info)}")
+
+    def _get_adversarial_batch_weights(self, info, losses):
+        weights = getattr(self, "adv_weights", None)
+        if weights is None:
+            return None
+
+        level = getattr(self, "adv_weight_level", "dataset")
+        if level == "dataset":
+            idx_field = "dataset_idx"
+        elif level == "query":
+            idx_field = "query_idx"
+        else:
+            raise ValueError(f"Unsupported adv_weight_level: {level}")
+
+        batch_idxs = self._extract_info_field(info, idx_field)
+        batch_weights = torch.as_tensor(
+            weights[batch_idxs],
+            dtype=losses.dtype,
+            device=losses.device,
+        )
+        return batch_weights.reshape(losses.shape)
+
+    def _reduce_losses(self, losses, info):
+        if len(losses.shape) == 0:
+            return losses
+
+        batch_weights = self._get_adversarial_batch_weights(info, losses)
+        if batch_weights is None:
+            return losses.sum() / len(losses)
+
+        weighted_losses = losses * batch_weights
+        return weighted_losses.sum() / batch_weights.sum().clamp_min(1e-8)
+
     def train_one_epoch(self):
         if self.loss_func_name == "flowloss":
             torch.set_num_threads(1)
@@ -938,23 +1009,17 @@ class NN(CardinalityEstimationAlg):
                     qstart += len(cur_info)
 
                 losses = torch.stack(losses)
-                loss = losses.sum() / len(losses)
+                loss = self._reduce_losses(losses, info)
             elif self.loss_func_name == "qloss" and \
                 self.featurizer.ynormalization == "log":
                 # unnormalize both pred and ybatch
                 pred = self.featurizer.unnormalize_torch(pred, None)
                 ybatch = self.featurizer.unnormalize_torch(ybatch, None)
                 losses = self.loss_func(pred, ybatch)
-                if len(losses.shape) != 0:
-                    loss = losses.sum() / len(losses)
-                else:
-                    loss = losses
+                loss = self._reduce_losses(losses, info)
             else:
                 losses = self.loss_func(pred, ybatch)
-                if len(losses.shape) != 0:
-                    loss = losses.sum() / len(losses)
-                else:
-                    loss = losses
+                loss = self._reduce_losses(losses, info)
 
             epoch_losses.append(loss.item())
 

@@ -22,10 +22,40 @@ import wandb
 import logging
 logger = logging.getLogger("wandb")
 logger.setLevel(logging.ERROR)
+
+# Setup main logger
+main_logger = logging.getLogger(__name__)
+main_logger.setLevel(logging.INFO)
+if not main_logger.handlers:
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    handler.setFormatter(formatter)
+    main_logger.addHandler(handler)
+
 import time
 
 import pandas as pd
 import numpy as np
+
+
+def split_queries_for_discriminator(target_queries, holdout_fraction=0.5, random_state=42):
+    """
+    Split target queries at the query level into:
+      1. discriminator adaptation target set
+      2. held-out target eval set for later MSCN evaluation
+    """
+    if len(target_queries) < 2 or holdout_fraction <= 0.0:
+        return list(target_queries), []
+
+    from sklearn.model_selection import train_test_split
+
+    disc_targetqs, heldout_evalqs = train_test_split(
+        list(target_queries),
+        test_size=holdout_fraction,
+        random_state=random_state,
+        shuffle=True,
+    )
+    return disc_targetqs, heldout_evalqs
 
 def extract_cardinalities(qreps, ests):
     """
@@ -258,7 +288,7 @@ def main():
         wandb_tags = ["1a"]
         if args.wandb_tags is not None:
             wandb_tags += args.wandb_tags.split(",")
-        wandb.init("ceb", config=wandbcfg,
+        wandb.init(project="ceb", config=wandbcfg,
                 tags=wandb_tags)
 
     train_qfns, test_qfns, val_qfns, eval_qfns = get_query_splits(cfg["data"])
@@ -298,6 +328,81 @@ def main():
     for efn in args.eval_fns.split(","):
         eval_fns.append(get_eval_fn(efn))
 
+    # from Adversarial_weight import learn_weights
+
+    # main_logger.info("Starting adversarial weight learning...")
+    # start_weight_time = time.time()
+    # result = learn_weights(
+    #     source_queries=trainqs,
+    #     target_queries=valqs,   # or testqs / one eval workload
+    #     featurizer=featurizer,
+    #     batch_size=128,
+    #     epochs=100,
+    #     lr=1e-3,
+    #     n_disc_steps=5,
+    # )
+    # weight_time = time.time() - start_weight_time
+    # main_logger.info(f"Adversarial weight learning completed in {weight_time:.2f} seconds")
+
+    # weights = result["weights"]
+    # main_logger.info(f"Result feature stats: {result['feature_stats']}")
+
+    disc_weights = None
+    mscn_evalqs = evalqs
+    mscn_eval_qdirs = eval_qdirs
+    if len(evalqs) > 0 and len(evalqs[0]) > 0:
+        disc_targetqs, heldout_evalqs = split_queries_for_discriminator(
+            evalqs[0],
+            holdout_fraction=args.disc_holdout_frac,
+            random_state=args.random_seed,
+        )
+        main_logger.info(
+            "Target workload split for discriminator/MSCN eval: "
+            f"{len(disc_targetqs)} queries for discriminator training, "
+            f"{len(heldout_evalqs)} held out for MSCN evaluation"
+        )
+        if len(heldout_evalqs) > 0:
+            mscn_evalqs = [heldout_evalqs]
+            mscn_eval_qdirs = [eval_qdirs[0]]
+        else:
+            mscn_evalqs = []
+            mscn_eval_qdirs = []
+
+        from discriminator import train_discriminator, save_discriminator_outputs
+
+        main_logger.info("Starting domain discriminator training...")
+        start_disc_time = time.time()
+        disc_result = train_discriminator(
+            source_queries=trainqs,
+            target_queries=disc_targetqs,
+            featurizer=featurizer,
+            batch_size=args.disc_batch_size,
+            epochs=args.disc_epochs,
+            lr=args.disc_lr,
+        )
+        disc_time = time.time() - start_disc_time
+        main_logger.info(f"Domain discriminator training completed in {disc_time:.2f} seconds")
+        main_logger.info(f"Discriminator loss plot saved to: {disc_result['plot_path']}")
+        main_logger.info(
+            f"Discriminator stats - "
+            f"Source predictions mean: {disc_result['source_predictions'].mean():.4f}, "
+            f"Target predictions mean: {disc_result['target_predictions'].mean():.4f}"
+        )
+
+        disc_dir = os.path.join(args.result_dir, "domain_discriminator")
+        artifact_paths = save_discriminator_outputs(disc_result, disc_dir)
+        main_logger.info(
+            f"Saved discriminator artifacts: source_predictions={artifact_paths['source_predictions']}, "
+            f"source_density_ratios={artifact_paths['source_density_ratios']}, "
+            f"source_weight_map={artifact_paths['source_weight_map']}, "
+            f"model_state={artifact_paths['model_state']}"
+        )
+        disc_weights = disc_result["source_density_ratios"]
+    else:
+        main_logger.info("Skipping discriminator training because no eval queries were loaded.")
+        mscn_evalqs = []
+        mscn_eval_qdirs = []
+
     if args.load_model is not None:
         alg.featurizer = featurizer
         dummy_ds = QueryDataset(testqs[:1], featurizer,
@@ -307,11 +412,13 @@ def main():
         alg.load_model(args.load_model, sample=dummy_ds[0])
 
     elif cfg["model"]["eval_epoch"] < cfg["model"]["max_epochs"]:
-        alg.train(trainqs, valqs=valqs, testqs=testqs, evalqs = evalqs,
-                eval_qdirs = eval_qdirs, featurizer=featurizer)
+        alg.train(trainqs, valqs=valqs, testqs=testqs, evalqs = mscn_evalqs,
+                eval_qdirs = mscn_eval_qdirs, featurizer=featurizer,
+                adv_weights=disc_weights, adv_weight_level="dataset")
     else:
         alg.train(trainqs, valqs=valqs, testqs=None, evalqs = None,
-                eval_qdirs = eval_qdirs, featurizer=featurizer)
+                eval_qdirs = mscn_eval_qdirs, featurizer=featurizer,
+                adv_weights=disc_weights, adv_weight_level="dataset")
 
     # start_time = time.time()
     # eval_alg(alg, eval_fns, trainqs, cfg, "train", featurizer=featurizer)
@@ -332,13 +439,12 @@ def main():
         print(f"{args.alg} Evaluation time on test set: {execution_time:.2f} seconds")
         print(' ----------- Evaluation time on test set ends -----------')
 
-    if len(evalqs) > 0 and len(evalqs[0]) > 0:
-        for ei, evalq in enumerate(evalqs):
+    if len(mscn_evalqs) > 0 and len(mscn_evalqs[0]) > 0:
+        for ei, evalq in enumerate(mscn_evalqs):
             start_time = time.time()
-            #TODO: sample type needs to be changed
-            eval_alg(alg, eval_fns, evalq, cfg, os.path.basename(eval_qdirs[ei]), featurizer=featurizer)
+            eval_alg(alg, eval_fns, evalq, cfg, os.path.basename(mscn_eval_qdirs[ei]), featurizer=featurizer)
             execution_time = time.time() - start_time
-            print(f"Evaluation time on eval set {ei}: {execution_time:.2f} seconds")
+            print(f"Evaluation time on held-out eval set {ei}: {execution_time:.2f} seconds")
             del evalq[:]
 
 def read_flags():
@@ -369,6 +475,17 @@ def read_flags():
     parser.add_argument("--load_model", type=str, required=False,
             default=None,
             help="If specified, load the model from the given path")
+    parser.add_argument("--disc_holdout_frac", type=float, required=False,
+            default=0.5,
+            help="Fraction of target/eval queries held out for MSCN evaluation")
+    parser.add_argument("--disc_epochs", type=int, required=False,
+            default=10)
+    parser.add_argument("--disc_batch_size", type=int, required=False,
+            default=128)
+    parser.add_argument("--disc_lr", type=float, required=False,
+            default=1e-3)
+    parser.add_argument("--random_seed", type=int, required=False,
+            default=42)
     return parser.parse_args()
 
 if __name__ == "__main__":

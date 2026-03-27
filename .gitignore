@@ -2,4 +2,6 @@ __pycache__
 queries/*
 !queries/ceb_runtime_qnames.txt
 pg_hint_plan/
+results/*
+wandb/*
 .lc_cache
