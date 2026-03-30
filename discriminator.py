@@ -10,16 +10,17 @@ Uses 80/20 train/val split with stratification, and plots loss curves.
 """
 
 import logging
+import math
 import os
 import pickle
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterator, List, Optional, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, Sampler, TensorDataset
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 from sklearn.metrics import roc_auc_score
@@ -34,7 +35,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-
+#TODO - Check this function for numerical stability and edge cases (probs near 0 or 1)
 def _density_ratio_from_probs(
     probs: np.ndarray,
     eps: float = 1e-6,
@@ -111,35 +112,19 @@ class DomainDiscriminator(nn.Module):
 
 def discriminator_loss(
     disc: nn.Module,
-    source_feats: torch.Tensor,
-    target_feats: torch.Tensor,
+    batch_feats: torch.Tensor,
+    batch_labels: torch.Tensor,
 ) -> torch.Tensor:
     """
-    GAN-style discriminator loss used in adversarial training.
+    Binary cross-entropy loss over the full batch.
 
-    Minimizes:
-        BCE(D(x_t), 1) + BCE(D(x_s), 0)
-    where x_t are target-domain samples and x_s are source-domain samples.
+    Labels are expected to be 0 for source samples and 1 for target samples.
     """
-
-    losses = []
-
-    if target_feats.numel() > 0:
-        target_probs = disc(target_feats)
-        losses.append(
-            F.binary_cross_entropy(target_probs, torch.ones_like(target_probs))
-        )
-
-    if source_feats.numel() > 0:
-        source_probs = disc(source_feats)
-        losses.append(
-            F.binary_cross_entropy(source_probs, torch.zeros_like(source_probs))
-        )
-
-    if not losses:
+    if batch_feats.numel() == 0:
         return torch.tensor(0.0, device=next(disc.parameters()).device)
 
-    return torch.stack(losses).sum()
+    batch_probs = disc(batch_feats)
+    return F.binary_cross_entropy(batch_probs, batch_labels)
 
 
 def _log_label_balance(split_name: str, labels: torch.Tensor) -> None:
@@ -167,6 +152,53 @@ def _log_label_balance(split_name: str, labels: torch.Tensor) -> None:
     )
 
 
+class StratifiedBatchSampler(Sampler[List[int]]):
+    """Yield batches with fixed source/target counts for binary labels."""
+
+    def __init__(self, labels: torch.Tensor, batch_size: int, drop_last: bool = False):
+        if batch_size < 2:
+            raise ValueError("batch_size must be >= 2 for stratified batching")
+
+        flat = labels.reshape(-1).to(torch.int64).cpu().numpy()
+        self.source_indices = np.where(flat == 0)[0]
+        self.target_indices = np.where(flat == 1)[0]
+
+        if len(self.source_indices) == 0 or len(self.target_indices) == 0:
+            raise ValueError("Both classes must be present for stratified batching")
+
+        self.batch_size = batch_size
+        self.drop_last = drop_last
+        self.source_per_batch = batch_size // 2
+        self.target_per_batch = batch_size - self.source_per_batch
+
+        if self.source_per_batch == 0 or self.target_per_batch == 0:
+            raise ValueError("batch_size must allocate at least one sample per class")
+
+        if drop_last:
+            self.num_batches = len(flat) // batch_size
+        else:
+            self.num_batches = math.ceil(len(flat) / batch_size)
+
+    def __len__(self) -> int:
+        return self.num_batches
+
+    def __iter__(self) -> Iterator[List[int]]:
+        for _ in range(self.num_batches):
+            src = np.random.choice(
+                self.source_indices,
+                size=self.source_per_batch,
+                replace=len(self.source_indices) < self.source_per_batch,
+            )
+            tgt = np.random.choice(
+                self.target_indices,
+                size=self.target_per_batch,
+                replace=len(self.target_indices) < self.target_per_batch,
+            )
+            batch = np.concatenate([src, tgt])
+            np.random.shuffle(batch)
+            yield batch.tolist()
+
+#TODO - check if this is correct
 def _safe_div(numerator: float, denominator: float) -> float:
     return numerator / denominator if denominator > 0 else 0.0
 
@@ -177,8 +209,6 @@ def _compute_binary_metrics(
     threshold: float = 0.5,
 ) -> Dict[str, float]:
     """
-    Compute imbalance-aware binary metrics.
-
     Returns overall accuracy, balanced accuracy, macro-F1, and per-class
     precision/recall/F1 for source(0) and target(1).
     """
@@ -245,6 +275,7 @@ def train_discriminator(
     overfit_loss_gap: float = 0.10,
     min_delta: float = 1e-4,
     min_epochs: int = 10,
+    stratify_train_batches: bool = True,
 ) -> Dict[str, object]:
     """
     Train a domain discriminator to distinguish source from target features.
@@ -268,6 +299,8 @@ def train_discriminator(
         overfit_loss_gap: Overfit signal when val_loss > train_loss * (1 + gap)
         min_delta: Minimum AUC improvement to reset patience
         min_epochs: Minimum epochs before early stopping can trigger
+        stratify_train_batches: Ensure each training batch contains both
+            source and target samples
 
     Returns:
         dict with:
@@ -379,7 +412,32 @@ def train_discriminator(
     train_dataset = TensorDataset(train_feats, train_labels)
     val_dataset = TensorDataset(val_feats, val_labels)
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    if stratify_train_batches:
+        try:
+            stratified_sampler = StratifiedBatchSampler(
+                train_labels,
+                batch_size=batch_size,
+                drop_last=False,
+            )
+            train_loader = DataLoader(train_dataset, batch_sampler=stratified_sampler)
+
+            train_flat = train_labels.reshape(-1)
+            source_count = int((train_flat == 0).sum().item())
+            target_count = int((train_flat == 1).sum().item())
+            logger.info(
+                "Created stratified train DataLoader with per-batch composition "
+                f"source={batch_size // 2}, target={batch_size - (batch_size // 2)} "
+                f"(train split source={source_count}, target={target_count})."
+            )
+        except ValueError as exc:
+            logger.warning(
+                f"Could not create stratified train batches ({exc}). "
+                "Falling back to shuffled DataLoader."
+            )
+            train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    else:
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 
     logger.info(f"Created dataloaders with batch_size={batch_size}")
@@ -413,13 +471,8 @@ def train_discriminator(
             feats = feats.to(device)
             labels = labels.to(device)
 
-            source_mask = (labels == 0).squeeze(-1)
-            target_mask = (labels == 1).squeeze(-1)
-            source_batch = feats[source_mask]
-            target_batch = feats[target_mask]
-
             # Forward pass
-            loss = discriminator_loss(model, source_batch, target_batch)
+            loss = discriminator_loss(model, feats, labels)
 
             # Backward pass
             optimizer.zero_grad()
@@ -449,12 +502,7 @@ def train_discriminator(
                 val_probs.append(batch_probs.detach().cpu())
                 val_true_labels.append(labels.detach().cpu())
 
-                source_mask = (labels == 0).squeeze(-1)
-                target_mask = (labels == 1).squeeze(-1)
-                source_batch = feats[source_mask]
-                target_batch = feats[target_mask]
-
-                loss = discriminator_loss(model, source_batch, target_batch)
+                loss = discriminator_loss(model, feats, labels)
 
                 val_epoch_loss += loss.item()
                 val_batch_count += 1

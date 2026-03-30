@@ -57,6 +57,78 @@ def split_queries_for_discriminator(target_queries, holdout_fraction=0.5, random
     )
     return disc_targetqs, heldout_evalqs
 
+
+def prepare_discriminator_weights(trainqs, evalqs, eval_qdirs, featurizer):
+    """
+    Optionally train discriminator and return:
+      1. adversarial source weights for training
+      2. eval query sets to use for MSCN evaluation
+      3. eval query directories aligned with returned eval query sets
+    """
+    disc_weights = None
+    mscn_evalqs = evalqs
+    mscn_eval_qdirs = eval_qdirs
+
+    if not args.use_discriminator:
+        main_logger.info(
+            "Discriminator disabled via --use_discriminator=0. "
+            "Proceeding with uniform training weights."
+        )
+        return disc_weights, mscn_evalqs, mscn_eval_qdirs
+
+    if len(evalqs) == 0 or len(evalqs[0]) == 0:
+        main_logger.info("Skipping discriminator training because no eval queries were loaded.")
+        return disc_weights, [], []
+
+    disc_targetqs, heldout_evalqs = split_queries_for_discriminator(
+        evalqs[0],
+        holdout_fraction=args.disc_holdout_frac,
+        random_state=args.random_seed,
+    )
+    main_logger.info(
+        "Target workload split for discriminator/MSCN eval: "
+        f"{len(disc_targetqs)} queries for discriminator training, "
+        f"{len(heldout_evalqs)} held out for MSCN evaluation"
+    )
+    if len(heldout_evalqs) > 0:
+        mscn_evalqs = [heldout_evalqs]
+        mscn_eval_qdirs = [eval_qdirs[0]]
+    else:
+        mscn_evalqs = []
+        mscn_eval_qdirs = []
+
+    from discriminator import train_discriminator, save_discriminator_outputs
+
+    main_logger.info("Starting domain discriminator training...")
+    start_disc_time = time.time()
+    disc_result = train_discriminator(
+        source_queries=trainqs,
+        target_queries=disc_targetqs,
+        featurizer=featurizer,
+        batch_size=args.disc_batch_size,
+        epochs=args.disc_epochs,
+        lr=args.disc_lr,
+    )
+    disc_time = time.time() - start_disc_time
+    main_logger.info(f"Domain discriminator training completed in {disc_time:.2f} seconds")
+    main_logger.info(f"Discriminator loss plot saved to: {disc_result['plot_path']}")
+    main_logger.info(
+        f"Discriminator stats - "
+        f"Source predictions mean: {disc_result['source_predictions'].mean():.4f}, "
+        f"Target predictions mean: {disc_result['target_predictions'].mean():.4f}"
+    )
+
+    disc_dir = os.path.join(args.result_dir, "domain_discriminator")
+    artifact_paths = save_discriminator_outputs(disc_result, disc_dir)
+    main_logger.info(
+        f"Saved discriminator artifacts: source_predictions={artifact_paths['source_predictions']}, "
+        f"source_density_ratios={artifact_paths['source_density_ratios']}, "
+        f"source_weight_map={artifact_paths['source_weight_map']}, "
+        f"model_state={artifact_paths['model_state']}"
+    )
+    disc_weights = disc_result["source_density_ratios"]
+    return disc_weights, mscn_evalqs, mscn_eval_qdirs
+
 def extract_cardinalities(qreps, ests):
     """
     Extract true, postgres estimated, and model estimated cardinalities.
@@ -347,61 +419,12 @@ def main():
     # weights = result["weights"]
     # main_logger.info(f"Result feature stats: {result['feature_stats']}")
 
-    disc_weights = None
-    mscn_evalqs = evalqs
-    mscn_eval_qdirs = eval_qdirs
-    if len(evalqs) > 0 and len(evalqs[0]) > 0:
-        disc_targetqs, heldout_evalqs = split_queries_for_discriminator(
-            evalqs[0],
-            holdout_fraction=args.disc_holdout_frac,
-            random_state=args.random_seed,
-        )
-        main_logger.info(
-            "Target workload split for discriminator/MSCN eval: "
-            f"{len(disc_targetqs)} queries for discriminator training, "
-            f"{len(heldout_evalqs)} held out for MSCN evaluation"
-        )
-        if len(heldout_evalqs) > 0:
-            mscn_evalqs = [heldout_evalqs]
-            mscn_eval_qdirs = [eval_qdirs[0]]
-        else:
-            mscn_evalqs = []
-            mscn_eval_qdirs = []
-
-        from discriminator import train_discriminator, save_discriminator_outputs
-
-        main_logger.info("Starting domain discriminator training...")
-        start_disc_time = time.time()
-        disc_result = train_discriminator(
-            source_queries=trainqs,
-            target_queries=disc_targetqs,
-            featurizer=featurizer,
-            batch_size=args.disc_batch_size,
-            epochs=args.disc_epochs,
-            lr=args.disc_lr,
-        )
-        disc_time = time.time() - start_disc_time
-        main_logger.info(f"Domain discriminator training completed in {disc_time:.2f} seconds")
-        main_logger.info(f"Discriminator loss plot saved to: {disc_result['plot_path']}")
-        main_logger.info(
-            f"Discriminator stats - "
-            f"Source predictions mean: {disc_result['source_predictions'].mean():.4f}, "
-            f"Target predictions mean: {disc_result['target_predictions'].mean():.4f}"
-        )
-
-        disc_dir = os.path.join(args.result_dir, "domain_discriminator")
-        artifact_paths = save_discriminator_outputs(disc_result, disc_dir)
-        main_logger.info(
-            f"Saved discriminator artifacts: source_predictions={artifact_paths['source_predictions']}, "
-            f"source_density_ratios={artifact_paths['source_density_ratios']}, "
-            f"source_weight_map={artifact_paths['source_weight_map']}, "
-            f"model_state={artifact_paths['model_state']}"
-        )
-        disc_weights = disc_result["source_density_ratios"]
-    else:
-        main_logger.info("Skipping discriminator training because no eval queries were loaded.")
-        mscn_evalqs = []
-        mscn_eval_qdirs = []
+    disc_weights, mscn_evalqs, mscn_eval_qdirs = prepare_discriminator_weights(
+        trainqs=trainqs,
+        evalqs=evalqs,
+        eval_qdirs=eval_qdirs,
+        featurizer=featurizer,
+    )
 
     if args.load_model is not None:
         alg.featurizer = featurizer
@@ -478,6 +501,9 @@ def read_flags():
     parser.add_argument("--disc_holdout_frac", type=float, required=False,
             default=0.5,
             help="Fraction of target/eval queries held out for MSCN evaluation")
+    parser.add_argument("--use_discriminator", type=int, required=False,
+            default=1,
+            help="Set to 1 to train/use discriminator weights, 0 for uniform weights")
     parser.add_argument("--disc_epochs", type=int, required=False,
             default=10)
     parser.add_argument("--disc_batch_size", type=int, required=False,
