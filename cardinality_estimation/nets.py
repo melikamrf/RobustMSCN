@@ -54,7 +54,10 @@ class SetConv(nn.Module):
             hid_units,
             other_hid_units,
             num_hidden_layers=2, n_out=1,
-            dropouts=[0.0, 0.0, 0.0], use_sigmoid=True):
+            dropouts=[0.0, 0.0, 0.0], use_sigmoid=True,
+            enable_latent_interface=False,
+            enable_discriminator=False,
+            enable_decoder=False):
         super(SetConv, self).__init__()
 
         ## debug time code
@@ -65,6 +68,11 @@ class SetConv(nn.Module):
             other_hid_units = int(other_hid_units)
 
         self.use_sigmoid = use_sigmoid
+        self.enable_latent_interface = enable_latent_interface
+        self.enable_discriminator = enable_discriminator
+        self.enable_decoder = enable_decoder
+        self.discriminator = None
+        self.decoder = None
 
         self.sample_feats = sample_feats
         self.predicate_feats = predicate_feats
@@ -143,11 +151,29 @@ class SetConv(nn.Module):
         # unless flow_feats is 0
         combined_hid_size += flow_feats
         self.out_mlp2 = nn.Linear(combined_hid_size, n_out).to(device)
+        self.latent_dim = self.out_mlp1.out_features
 
-    def forward(self, xbatch):
-        '''
-        #TODO: describe shapes
-        '''
+    def configure_auxiliary_components(self, enable_latent_interface=None,
+            enable_discriminator=None, enable_decoder=None):
+        if enable_latent_interface is not None:
+            self.enable_latent_interface = enable_latent_interface
+        if enable_discriminator is not None:
+            self.enable_discriminator = enable_discriminator
+        if enable_decoder is not None:
+            self.enable_decoder = enable_decoder
+
+    def register_auxiliary_modules(self, discriminator=None, decoder=None):
+        self.discriminator = discriminator
+        self.decoder = decoder
+
+    def _require_latent_interface(self):
+        if not self.enable_latent_interface:
+            raise RuntimeError(
+                "Latent interface is disabled. Set enable_latent_interface=True "
+                "to access the MSCN encoder output."
+            )
+
+    def _compute_combined_hidden(self, xbatch):
         start = time.time()
 
         samples = xbatch["table"]
@@ -163,12 +189,6 @@ class SetConv(nn.Module):
         if self.sample_feats != 0:
             samples = samples.to(device, non_blocking=True)
             samples = self.inp_drop_layer(samples)
-
-            ## hardcoded layers
-            # hid_sample = F.relu(self.sample_mlp1(samples))
-            # hid_sample = self.hl_drop_layer(hid_sample)
-            # if self.num_hidden_layers == 2:
-                # hid_sample = F.relu(self.sample_mlp2(hid_sample))
 
             hid_sample = samples
             for i in range(0, self.num_hidden_layers):
@@ -193,11 +213,6 @@ class SetConv(nn.Module):
             predicate_mask = predicate_mask.to(device, non_blocking=True)
             predicates = self.inp_drop_layer(predicates)
 
-            # hid_predicate = F.relu(self.predicate_mlp1(predicates))
-            # hid_predicate = self.hl_drop_layer(hid_predicate)
-            # if self.num_hidden_layers == 2:
-                # hid_predicate = F.relu(self.predicate_mlp2(hid_predicate))
-
             hid_predicate = predicates
             for i in range(0, self.num_hidden_layers):
                 hid_predicate = F.relu(self.predicate_mlps[i](hid_predicate))
@@ -214,11 +229,6 @@ class SetConv(nn.Module):
             joins = joins.to(device, non_blocking=True)
             joins = self.inp_drop_layer(joins)
             join_mask = join_mask.to(device, non_blocking=True)
-
-            # hid_join = F.relu(self.join_mlp1(joins))
-            # hid_join = self.hl_drop_layer(hid_join)
-            # if self.num_hidden_layers == 2:
-                # hid_join = F.relu(self.join_mlp2(hid_join))
 
             hid_join = joins
             for i in range(0, self.num_hidden_layers):
@@ -239,13 +249,12 @@ class SetConv(nn.Module):
 
         if DEBUG_TIMES:
             inplayer_time = time.time()-start
+        else:
+            inplayer_time = None
 
         if self.flow_feats:
             flows = flows.to(device, non_blocking=True)
             flows = self.inp_drop_layer(flows)
-            # hid_flow = F.relu(self.flow_mlp1(flows))
-            # hid_flow = self.hl_drop_layer(hid_flow)
-            # hid_flow = F.relu(self.flow_mlp2(hid_flow))
             tocat.append(flows)
 
         try:
@@ -256,15 +265,41 @@ class SetConv(nn.Module):
             pdb.set_trace()
 
         hid = self.combined_drop_layer(hid)
+        return hid, flows, start, inplayer_time
 
-        hid = F.relu(self.out_mlp1(hid))
+    def encode(self, xbatch):
+        self._require_latent_interface()
+        hid, _, _, _ = self._compute_combined_hidden(xbatch)
+        return F.relu(self.out_mlp1(hid))
+
+    def predict_from_latent(self, z, flows=None):
+        hid = z
         if self.flow_feats:
+            if flows is None:
+                raise RuntimeError(
+                    "flows must be provided when predicting from latent z "
+                    "for flow-aware SetConv."
+                )
             hid = torch.cat([hid, flows], 1)
 
         if self.use_sigmoid:
-            out = torch.sigmoid(self.out_mlp2(hid))
-        else:
-            out = self.out_mlp2(hid)
+            return torch.sigmoid(self.out_mlp2(hid))
+        return self.out_mlp2(hid)
+
+    def forward_with_latent(self, xbatch):
+        self._require_latent_interface()
+        hid, flows, _, _ = self._compute_combined_hidden(xbatch)
+        z = F.relu(self.out_mlp1(hid))
+        out = self.predict_from_latent(z, flows=flows)
+        return out, z
+
+    def forward(self, xbatch):
+        '''
+        #TODO: describe shapes
+        '''
+        hid, flows, start, inplayer_time = self._compute_combined_hidden(xbatch)
+        z = F.relu(self.out_mlp1(hid))
+        out = self.predict_from_latent(z, flows=flows)
 
         total_time = time.time()-start
 
@@ -277,9 +312,17 @@ class SetConv(nn.Module):
 class SetConvFlow(nn.Module):
     def __init__(self, sample_feats, predicate_feats, join_feats, flow_feats,
             hid_units, num_hidden_layers=2, n_out=1,
-            dropouts=[0.0, 0.0, 0.0], use_sigmoid=True):
+            dropouts=[0.0, 0.0, 0.0], use_sigmoid=True,
+            enable_latent_interface=False,
+            enable_discriminator=False,
+            enable_decoder=False):
         super(SetConvFlow, self).__init__()
         self.use_sigmoid = use_sigmoid
+        self.enable_latent_interface = enable_latent_interface
+        self.enable_discriminator = enable_discriminator
+        self.enable_decoder = enable_decoder
+        self.discriminator = None
+        self.decoder = None
 
         sample_feats = int(sample_feats)
         hid_units = int(hid_units)
@@ -334,11 +377,29 @@ class SetConvFlow(nn.Module):
                 hid_units).to(device)
 
         self.out_mlp2 = nn.Linear(hid_units, n_out).to(device)
+        self.latent_dim = self.out_mlp1.out_features
 
-    def forward(self, xbatch):
-        '''
-        #TODO: describe shapes
-        '''
+    def configure_auxiliary_components(self, enable_latent_interface=None,
+            enable_discriminator=None, enable_decoder=None):
+        if enable_latent_interface is not None:
+            self.enable_latent_interface = enable_latent_interface
+        if enable_discriminator is not None:
+            self.enable_discriminator = enable_discriminator
+        if enable_decoder is not None:
+            self.enable_decoder = enable_decoder
+
+    def register_auxiliary_modules(self, discriminator=None, decoder=None):
+        self.discriminator = discriminator
+        self.decoder = decoder
+
+    def _require_latent_interface(self):
+        if not self.enable_latent_interface:
+            raise RuntimeError(
+                "Latent interface is disabled. Set enable_latent_interface=True "
+                "to access the MSCN encoder output."
+            )
+
+    def _compute_combined_hidden(self, xbatch):
         samples = xbatch["table"]
         predicates = xbatch["pred"]
         joins = xbatch["join"]
@@ -412,7 +473,6 @@ class SetConvFlow(nn.Module):
 
             tocat.append(hid_join)
 
-
         if self.flow_feats:
             flows = flows.to(device, non_blocking=True)
             flows = self.inp_drop_layer(flows)
@@ -421,32 +481,43 @@ class SetConvFlow(nn.Module):
             if self.num_hidden_layers == 2:
                 hid_flow = F.relu(self.flow_mlp2(hid_flow))
 
-            # if hid_flow.shape[0] == 1 and tocat[0].shape[0] != 1:
             hid_flow = hid_flow.squeeze()
             tocat.append(hid_flow)
 
         try:
             hid = torch.cat(tocat, 1)
-            # if tocat[0].shape[0] == 1:
-                # hid = torch.cat(tocat, 1)
-            # else:
-                # hid = torch.cat(tocat)
         except Exception as e:
             for tc in tocat:
                 print(tc.shape)
             hid = torch.cat(tocat)
-            # pdb.set_trace()
 
         hid = self.combined_drop_layer(hid)
-        hid = F.relu(self.out_mlp1(hid))
+        return hid
 
-        # if self.flow_feats:
-            # hid = torch.cat([hid, flows], 1)
+    def encode(self, xbatch):
+        self._require_latent_interface()
+        hid = self._compute_combined_hidden(xbatch)
+        return F.relu(self.out_mlp1(hid))
 
+    def predict_from_latent(self, z):
         if self.use_sigmoid:
-            out = torch.sigmoid(self.out_mlp2(hid))
-        else:
-            out = self.out_mlp2(hid)
+            return torch.sigmoid(self.out_mlp2(z))
+        return self.out_mlp2(z)
+
+    def forward_with_latent(self, xbatch):
+        self._require_latent_interface()
+        hid = self._compute_combined_hidden(xbatch)
+        z = F.relu(self.out_mlp1(hid))
+        out = self.predict_from_latent(z)
+        return out, z
+
+    def forward(self, xbatch):
+        '''
+        #TODO: describe shapes
+        '''
+        hid = self._compute_combined_hidden(xbatch)
+        z = F.relu(self.out_mlp1(hid))
+        out = self.predict_from_latent(z)
         return out
 
 NUM_HEADS=4

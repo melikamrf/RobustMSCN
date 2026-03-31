@@ -12,6 +12,15 @@ import wandb
 
 class MSCN(NN):
 
+    def _get_auxiliary_component_kwargs(self):
+        return {
+            "enable_latent_interface": getattr(self,
+                "enable_latent_interface", False),
+            "enable_discriminator": getattr(self,
+                "enable_discriminator", False),
+            "enable_decoder": getattr(self, "enable_decoder", False),
+        }
+
     def init_dataset(self, samples, load_query_together,
             max_num_tables = -1,
             load_padded_mscn_feats=False,
@@ -64,7 +73,8 @@ class MSCN(NN):
                     num_hidden_layers = self.num_hidden_layers,
                     dropouts=[self.inp_dropout, self.hl_dropout,
                         self.comb_dropout],
-                    use_sigmoid = use_sigmoid)
+                    use_sigmoid = use_sigmoid,
+                    **self._get_auxiliary_component_kwargs())
         else:
             net = SetConv(sfeats,
                     pfeats, jfeats,
@@ -75,11 +85,21 @@ class MSCN(NN):
                     num_hidden_layers = self.num_hidden_layers,
                     dropouts=[self.inp_dropout, self.hl_dropout,
                         self.comb_dropout],
-                    use_sigmoid = use_sigmoid)
+                    use_sigmoid = use_sigmoid,
+                    **self._get_auxiliary_component_kwargs())
 
         return net
 
 class MSCN_JoinKeyCards(NN):
+
+    def _get_auxiliary_component_kwargs(self):
+        return {
+            "enable_latent_interface": getattr(self,
+                "enable_latent_interface", False),
+            "enable_discriminator": getattr(self,
+                "enable_discriminator", False),
+            "enable_decoder": getattr(self, "enable_decoder", False),
+        }
 
     def init_dataset(self, samples, load_query_together,
             max_num_tables = -1,
@@ -129,7 +149,8 @@ class MSCN_JoinKeyCards(NN):
                     n_out=n_out,
                     dropouts=[self.inp_dropout, self.hl_dropout,
                         self.comb_dropout],
-                    use_sigmoid = use_sigmoid)
+                    use_sigmoid = use_sigmoid,
+                    **self._get_auxiliary_component_kwargs())
         else:
             net = SetConv(sfeats,
                     pfeats, jfeats,
@@ -139,7 +160,8 @@ class MSCN_JoinKeyCards(NN):
                     n_out=n_out,
                     dropouts=[self.inp_dropout, self.hl_dropout,
                         self.comb_dropout],
-                    use_sigmoid = use_sigmoid)
+                    use_sigmoid = use_sigmoid,
+                    **self._get_auxiliary_component_kwargs())
 
         return net
 
