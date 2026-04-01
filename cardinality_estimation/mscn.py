@@ -12,13 +12,40 @@ import wandb
 
 class MSCN(NN):
 
-    def _get_auxiliary_component_kwargs(self):
+    def _infer_decoder_output_dim(self, sample_x):
+        explicit_dim = getattr(self, "decoder_output_dim", None)
+        if explicit_dim is not None:
+            return explicit_dim
+
+        if not getattr(self, "enable_decoder", False):
+            return None
+
+        if not getattr(self, "load_padded_mscn_feats", False):
+            raise RuntimeError(
+                "enable_decoder requires load_padded_mscn_feats=1 or an "
+                "explicit decoder_output_dim so the reconstruction target has "
+                "a stable size."
+            )
+
+        output_dim = 0
+        for key in ["table", "pred", "join", "flow"]:
+            output_dim += int(sample_x[key].numel())
+        return output_dim
+
+    def _get_auxiliary_component_kwargs(self, sample_x):
         return {
             "enable_latent_interface": getattr(self,
                 "enable_latent_interface", False),
             "enable_discriminator": getattr(self,
                 "enable_discriminator", False),
             "enable_decoder": getattr(self, "enable_decoder", False),
+            "discriminator_hidden_dims": getattr(self,
+                "discriminator_hidden_dims", None),
+            "discriminator_dropout": getattr(self,
+                "discriminator_dropout", 0.1),
+            "decoder_output_dim": self._infer_decoder_output_dim(sample_x),
+            "decoder_hidden_dims": getattr(self, "decoder_hidden_dims", None),
+            "decoder_dropout": getattr(self, "decoder_dropout", 0.0),
         }
 
     def init_dataset(self, samples, load_query_together,
@@ -74,7 +101,7 @@ class MSCN(NN):
                     dropouts=[self.inp_dropout, self.hl_dropout,
                         self.comb_dropout],
                     use_sigmoid = use_sigmoid,
-                    **self._get_auxiliary_component_kwargs())
+                    **self._get_auxiliary_component_kwargs(sample[0]))
         else:
             net = SetConv(sfeats,
                     pfeats, jfeats,
@@ -86,19 +113,46 @@ class MSCN(NN):
                     dropouts=[self.inp_dropout, self.hl_dropout,
                         self.comb_dropout],
                     use_sigmoid = use_sigmoid,
-                    **self._get_auxiliary_component_kwargs())
+                    **self._get_auxiliary_component_kwargs(sample[0]))
 
         return net
 
 class MSCN_JoinKeyCards(NN):
 
-    def _get_auxiliary_component_kwargs(self):
+    def _infer_decoder_output_dim(self, sample_x):
+        explicit_dim = getattr(self, "decoder_output_dim", None)
+        if explicit_dim is not None:
+            return explicit_dim
+
+        if not getattr(self, "enable_decoder", False):
+            return None
+
+        if not getattr(self, "load_padded_mscn_feats", False):
+            raise RuntimeError(
+                "enable_decoder requires load_padded_mscn_feats=1 or an "
+                "explicit decoder_output_dim so the reconstruction target has "
+                "a stable size."
+            )
+
+        output_dim = 0
+        for key in ["table", "pred", "join", "flow"]:
+            output_dim += int(sample_x[key].numel())
+        return output_dim
+
+    def _get_auxiliary_component_kwargs(self, sample_x):
         return {
             "enable_latent_interface": getattr(self,
                 "enable_latent_interface", False),
             "enable_discriminator": getattr(self,
                 "enable_discriminator", False),
             "enable_decoder": getattr(self, "enable_decoder", False),
+            "discriminator_hidden_dims": getattr(self,
+                "discriminator_hidden_dims", None),
+            "discriminator_dropout": getattr(self,
+                "discriminator_dropout", 0.1),
+            "decoder_output_dim": self._infer_decoder_output_dim(sample_x),
+            "decoder_hidden_dims": getattr(self, "decoder_hidden_dims", None),
+            "decoder_dropout": getattr(self, "decoder_dropout", 0.0),
         }
 
     def init_dataset(self, samples, load_query_together,
@@ -150,7 +204,7 @@ class MSCN_JoinKeyCards(NN):
                     dropouts=[self.inp_dropout, self.hl_dropout,
                         self.comb_dropout],
                     use_sigmoid = use_sigmoid,
-                    **self._get_auxiliary_component_kwargs())
+                    **self._get_auxiliary_component_kwargs(sample[0]))
         else:
             net = SetConv(sfeats,
                     pfeats, jfeats,
@@ -161,7 +215,7 @@ class MSCN_JoinKeyCards(NN):
                     dropouts=[self.inp_dropout, self.hl_dropout,
                         self.comb_dropout],
                     use_sigmoid = use_sigmoid,
-                    **self._get_auxiliary_component_kwargs())
+                    **self._get_auxiliary_component_kwargs(sample[0]))
 
         return net
 

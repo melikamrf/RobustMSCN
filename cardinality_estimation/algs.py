@@ -19,6 +19,7 @@ from .dataset import QueryDataset, pad_sets, to_variable,\
 from .nets import *
 from evaluation.flow_loss import FlowLoss, \
         get_optimization_variables, get_subsetg_vectors
+from .discriminator import LatentDiscriminator
 
 from torch.utils import data
 from torch.nn.utils.clip_grad import clip_grad_norm_
@@ -462,6 +463,297 @@ class NN(CardinalityEstimationAlg):
 
         print("precomputing flow info took: ", time.time()-fstart)
 
+    def _collect_target_queries(self, kwargs):
+        target_samples = []
+        if "evalqs" not in kwargs or kwargs["evalqs"] is None:
+            return target_samples
+
+        evalqs = kwargs["evalqs"]
+        if len(evalqs) > 0 and isinstance(evalqs[0], list):
+            for cur_evalqs in evalqs:
+                target_samples.extend(cur_evalqs)
+        else:
+            target_samples = list(evalqs)
+
+        return target_samples
+
+    def _slice_batch_inputs(self, xbatch, batch_size):
+        if torch.is_tensor(xbatch):
+            return xbatch[:batch_size]
+
+        sliced = {}
+        for k, v in xbatch.items():
+            if torch.is_tensor(v):
+                sliced[k] = v[:batch_size]
+            else:
+                sliced[k] = v
+        return sliced
+
+    def _slice_batch_info(self, info, batch_size):
+        if isinstance(info, dict):
+            sliced = {}
+            for k, v in info.items():
+                if torch.is_tensor(v):
+                    sliced[k] = v[:batch_size]
+                elif isinstance(v, np.ndarray):
+                    sliced[k] = v[:batch_size]
+                elif hasattr(v, "__len__"):
+                    sliced[k] = v[:batch_size]
+                else:
+                    sliced[k] = v
+            return sliced
+
+        if isinstance(info, list):
+            return info[:batch_size]
+
+        return info
+
+    def _apply_training_batch_transforms(self, xbatch):
+        if self.random_bitmap_idx and "join" in xbatch:
+            idxs = torch.randperm(xbatch["join"].shape[-1])
+            xbatch["join"] = xbatch["join"][:, :, idxs]
+
+        if self.onehot_dropout == 0:
+            return xbatch
+
+        if not self.onehot_dropout:
+            return xbatch
+
+        if self.featurizer.featurization_type == "combined":
+            mask = np.zeros(xbatch.shape[1])
+            mask[-1] = 1
+            mask[-3] = 1
+            mask[-4] = 1
+            mask = self._get_onehot_mask(mask)
+            xbatch = xbatch * mask
+            return xbatch
+
+        tf_mask = self._get_onehot_mask(self.featurizer.table_onehot_mask)
+        jf_mask = self._get_onehot_mask(self.featurizer.join_onehot_mask)
+        pf_mask = self._get_onehot_mask(self.featurizer.pred_onehot_mask)
+
+        if self.featurizer.pred_features:
+            xbatch["pred"] = xbatch["pred"] * pf_mask
+        if self.featurizer.join_features:
+            xbatch["join"] = xbatch["join"] * jf_mask
+        if self.featurizer.table_features:
+            xbatch["table"] = xbatch["table"] * tf_mask
+        return xbatch
+
+    def _ensure_latent_discriminator_ready(self):
+        if hasattr(self.net, "configure_auxiliary_components"):
+            self.net.configure_auxiliary_components(
+                enable_latent_interface=True,
+                enable_discriminator=True,
+                enable_decoder=False,
+            )
+
+        if getattr(self.net, "discriminator", None) is None:
+            hidden_dims = getattr(self.net, "discriminator_hidden_dims", None)
+            dropout = getattr(self.net, "discriminator_dropout", 0.1)
+            self.net.register_auxiliary_modules(
+                discriminator=LatentDiscriminator(
+                    self.net.latent_dim,
+                    hidden_dims=hidden_dims,
+                    dropout=dropout,
+                ).to(device)
+            )
+
+    def _build_optimizer_for_params(self, params, lr):
+        if len(params) == 0:
+            raise ValueError("Cannot build optimizer for an empty parameter list.")
+
+        if self.optimizer_name == "ams":
+            return torch.optim.Adam(
+                params, lr=lr, amsgrad=True, weight_decay=self.weight_decay
+            )
+        if self.optimizer_name in ["adam", "adamw"]:
+            return torch.optim.Adam(
+                params, lr=lr, amsgrad=False, weight_decay=self.weight_decay
+            )
+        if self.optimizer_name == "sgd":
+            return torch.optim.SGD(
+                params, lr=lr, momentum=0.9, weight_decay=self.weight_decay
+            )
+        raise ValueError(f"Unsupported optimizer_name: {self.optimizer_name}")
+
+    def _init_new_discriminator_optimizers(self):
+        named_params = [(name, param) for name, param in self.net.named_parameters()
+                if param.requires_grad]
+
+        discriminator_params = [p for n, p in named_params if n.startswith("discriminator.")]
+        regressor_params = [p for n, p in named_params
+                if n.startswith("out_mlp2.") and not n.startswith("discriminator.")]
+        encoder_params = [p for n, p in named_params
+                if not n.startswith("discriminator.")
+                and not n.startswith("out_mlp2.")
+                and not n.startswith("decoder.")]
+
+        if len(discriminator_params) == 0:
+            raise RuntimeError(
+                "Latent discriminator parameters were not found. "
+                "Make sure enable_discriminator is active."
+            )
+        if len(regressor_params) == 0:
+            raise RuntimeError("Regressor parameters (out_mlp2.*) were not found.")
+        if len(encoder_params) == 0:
+            raise RuntimeError("Encoder parameters were not found.")
+
+        reg_lr = getattr(self, "adv_regression_lr", self.lr)
+        disc_lr = getattr(self, "adv_discriminator_lr", self.lr)
+        gen_lr = getattr(self, "adv_generator_lr", self.lr)
+
+        self.opt_regression = self._build_optimizer_for_params(
+            encoder_params + regressor_params, reg_lr)
+        self.opt_discriminator = self._build_optimizer_for_params(
+            discriminator_params, disc_lr)
+        self.opt_generator = self._build_optimizer_for_params(
+            encoder_params, gen_lr)
+
+        self.optimizer = self.opt_regression
+        self.bce_loss = torch.nn.BCELoss()
+
+    def _compute_regression_loss(self, pred, ybatch, info):
+        if self.loss_func_name == "flowloss":
+            raise RuntimeError(
+                "train_with_new_discriminator does not support flowloss. "
+                "Use mse/qloss variants for this training mode."
+            )
+
+        if self.loss_func_name == "qloss" and self.featurizer.ynormalization == "log":
+            pred_unnorm = self.featurizer.unnormalize_torch(pred, None)
+            ybatch_unnorm = self.featurizer.unnormalize_torch(ybatch, None)
+            losses = self.loss_func(pred_unnorm, ybatch_unnorm)
+            return self._reduce_losses(losses, info)
+
+        losses = self.loss_func(pred, ybatch)
+        return self._reduce_losses(losses, info)
+
+    def train_one_epoch_with_new_discriminator(self, target_loader):
+        start = time.time()
+        reg_losses = []
+        disc_losses = []
+        gen_losses = []
+        disc_accs = []
+        disc_acc_source = []
+        disc_acc_target = []
+        gen_fool_accs = []
+
+        target_iter = iter(target_loader)
+
+        for _, (xbatch_source, ybatch_source, info_source) in enumerate(self.trainloader):
+            ybatch_source = ybatch_source.to(device, non_blocking=True)
+
+            try:
+                xbatch_target, _, _ = next(target_iter)
+            except StopIteration:
+                target_iter = iter(target_loader)
+                xbatch_target, _, _ = next(target_iter)
+
+            source_batch_size = ybatch_source.shape[0]
+            if isinstance(xbatch_target, dict):
+                target_batch_size = xbatch_target["flow"].shape[0]
+            else:
+                target_batch_size = xbatch_target.shape[0]
+
+            current_batch_size = min(source_batch_size, target_batch_size)
+            if current_batch_size <= 0:
+                continue
+
+            xbatch_source = self._slice_batch_inputs(xbatch_source, current_batch_size)
+            ybatch_source = ybatch_source[:current_batch_size]
+            info_source = self._slice_batch_info(info_source, current_batch_size)
+            xbatch_target = self._slice_batch_inputs(xbatch_target, current_batch_size)
+
+            xbatch_source = self._apply_training_batch_transforms(xbatch_source)
+            xbatch_target = self._apply_training_batch_transforms(xbatch_target)
+
+            # Phase 1: regression on source only.
+            self.opt_regression.zero_grad()
+            if self.subplan_level_outputs:
+                pred = self.net(xbatch_source).squeeze(1)
+                idxs = torch.zeros(pred.shape, dtype=torch.bool)
+                for i, nt in enumerate(info_source["num_tables"]):
+                    if nt >= 10:
+                        nt = 10
+                    nt -= 1
+                    idxs[i, nt] = True
+                pred = pred[idxs]
+            else:
+                pred = self.net(xbatch_source).squeeze(1)
+
+            loss_reg = self._compute_regression_loss(pred, ybatch_source, info_source)
+            loss_reg.backward()
+            if self.clip_gradient is not None:
+                clip_grad_norm_(
+                    self.opt_regression.param_groups[0]["params"],
+                    self.clip_gradient,
+                )
+            self.opt_regression.step()
+
+            # Phase 2: train discriminator (source vs target).
+            self.opt_discriminator.zero_grad()
+            _, z_source_det = self.net.forward_with_latent(xbatch_source)
+            _, z_target_det = self.net.forward_with_latent(xbatch_target)
+            z_source_det = z_source_det.detach()
+            z_target_det = z_target_det.detach()
+
+            labels_source = torch.ones(current_batch_size, 1, device=device)
+            labels_target = torch.zeros(current_batch_size, 1, device=device)
+
+            pred_source_disc = self.net.discriminate(z_source_det)
+            pred_target_disc = self.net.discriminate(z_target_det)
+
+            loss_d_source = self.bce_loss(pred_source_disc, labels_source)
+            loss_d_target = self.bce_loss(pred_target_disc, labels_target)
+            loss_d = 0.5 * (loss_d_source + loss_d_target)
+            loss_d.backward()
+            self.opt_discriminator.step()
+
+            # Phase 3: train encoder to fool discriminator on target.
+            self.opt_generator.zero_grad()
+            _, z_target_gen = self.net.forward_with_latent(xbatch_target)
+            trick_labels = torch.ones(current_batch_size, 1, device=device)
+            pred_target_gen = self.net.discriminate(z_target_gen)
+            loss_g = self.bce_loss(pred_target_gen, trick_labels)
+            loss_g.backward()
+            if self.clip_gradient is not None:
+                clip_grad_norm_(
+                    self.opt_generator.param_groups[0]["params"],
+                    self.clip_gradient,
+                )
+            self.opt_generator.step()
+
+            with torch.no_grad():
+                disc_pred_source_cls = (pred_source_disc >= 0.5).float()
+                disc_pred_target_cls = (pred_target_disc >= 0.5).float()
+                source_acc = (disc_pred_source_cls == labels_source).float().mean().item()
+                target_acc = (disc_pred_target_cls == labels_target).float().mean().item()
+                combined_preds = torch.cat([disc_pred_source_cls, disc_pred_target_cls], dim=0)
+                combined_labels = torch.cat([labels_source, labels_target], dim=0)
+                disc_acc = (combined_preds == combined_labels).float().mean().item()
+                fool_acc = (pred_target_gen >= 0.5).float().mean().item()
+
+            reg_losses.append(loss_reg.item())
+            disc_losses.append(loss_d.item())
+            gen_losses.append(loss_g.item())
+            disc_accs.append(disc_acc)
+            disc_acc_source.append(source_acc)
+            disc_acc_target.append(target_acc)
+            gen_fool_accs.append(fool_acc)
+
+        metrics = {
+            "loss_reg": float(np.mean(reg_losses)) if len(reg_losses) > 0 else 0.0,
+            "loss_d": float(np.mean(disc_losses)) if len(disc_losses) > 0 else 0.0,
+            "loss_g": float(np.mean(gen_losses)) if len(gen_losses) > 0 else 0.0,
+            "disc_acc": float(np.mean(disc_accs)) if len(disc_accs) > 0 else 0.0,
+            "disc_acc_source": float(np.mean(disc_acc_source)) if len(disc_acc_source) > 0 else 0.0,
+            "disc_acc_target": float(np.mean(disc_acc_target)) if len(disc_acc_target) > 0 else 0.0,
+            "gen_fool_acc": float(np.mean(gen_fool_accs)) if len(gen_fool_accs) > 0 else 0.0,
+            "epoch_seconds": round(time.time() - start, 2),
+        }
+        return metrics
+
     def train(self, training_samples, **kwargs):
 
         self.all_errs = []
@@ -711,6 +1003,265 @@ class NN(CardinalityEstimationAlg):
             # self.nets[0].load_state_dict(self.best_model_dict)
             # self.nets[0].eval()
         self.save_model(save_dir='./saved_models', suffix_name="_epoch"+str(self.epoch))
+
+    def train_with_new_discriminator(self, training_samples, **kwargs):
+        self.all_errs = []
+        self.best_model_epoch = -1
+        self.model_weights = []
+        self.adv_weights = None
+        self.adv_weight_level = kwargs.get("adv_weight_level", "dataset")
+        self.adversarial_train_history = []
+
+        if self.loss_func_name == "flowloss" or self.load_query_together:
+            raise RuntimeError(
+                "train_with_new_discriminator currently supports non-flowloss training only."
+            )
+
+        self.true_costs = {}
+        self.true_costs["val"] = 0.0
+        self.true_costs["test"] = 0.0
+
+        assert isinstance(training_samples[0], dict)
+        self.featurizer = kwargs["featurizer"]
+        self.training_samples = training_samples
+
+        self.seen_subplans = set()
+        for sample in training_samples:
+            for node in sample["subset_graph"].nodes():
+                self.seen_subplans.add(str(node))
+
+        if "subplan_mask" in kwargs:
+            subplan_mask = kwargs["subplan_mask"]
+        else:
+            subplan_mask = None
+
+        self.trainds = self.init_dataset(
+            training_samples,
+            self.load_query_together,
+            max_num_tables=self.max_num_tables,
+            load_padded_mscn_feats=self.load_padded_mscn_feats,
+            subplan_mask=subplan_mask,
+        )
+
+        if "adv_weights" in kwargs and kwargs["adv_weights"] is not None:
+            self.adv_weights = np.asarray(kwargs["adv_weights"], dtype=np.float32)
+            if self.adv_weight_level == "dataset":
+                expected = len(self.trainds)
+            elif self.adv_weight_level == "query":
+                expected = len(training_samples)
+            else:
+                raise ValueError(f"Unsupported adv_weight_level: {self.adv_weight_level}")
+
+            if len(self.adv_weights) != expected:
+                raise ValueError(
+                    f"Expected {expected} adversarial weights for level "
+                    f"{self.adv_weight_level}, got {len(self.adv_weights)}"
+                )
+
+        self.trainloader = data.DataLoader(
+            self.trainds,
+            batch_size=self.mb_size,
+            shuffle=True,
+            collate_fn=self.collate_fn,
+        )
+
+        self.eval_ds = {}
+        self.samples = {}
+
+        if self.eval_epoch < self.max_epochs:
+            if "valqs" in kwargs and len(kwargs["valqs"]) > 0:
+                self.eval_ds["val"] = self.init_dataset(
+                    kwargs["valqs"], False,
+                    load_padded_mscn_feats=self.load_padded_mscn_feats,
+                )
+                self.samples["val"] = kwargs["valqs"]
+
+            if "testqs" in kwargs and len(kwargs["testqs"]) > 0:
+                if len(kwargs["testqs"]) > 400:
+                    ns = int(len(kwargs["testqs"]) / 10)
+                    random.seed(42)
+                    testqs = random.sample(kwargs["testqs"], ns)
+                else:
+                    testqs = kwargs["testqs"]
+
+                self.eval_ds["test"] = self.init_dataset(
+                    testqs, False,
+                    load_padded_mscn_feats=self.load_padded_mscn_feats,
+                )
+                self.samples["test"] = testqs
+
+            if "evalqs" in kwargs and len(kwargs["eval_qdirs"]) > 0:
+                eval_qdirs = kwargs["eval_qdirs"]
+                for ei, cur_evalqs in enumerate(kwargs["evalqs"]):
+                    evalqname = eval_qdirs[ei]
+                    if "job" in evalqname:
+                        evalqname = "JOB"
+                        print("Going to remove JOB Q29 from evaluation because it takes too long for computing PPC")
+                        cur_evalqs = [q for q in cur_evalqs if "29" not in q["name"]]
+                    elif "imdb" in evalqname:
+                        group_evalqs = [q for q in cur_evalqs if "group" in q["sql"].lower()]
+                        not_group_evalqs = [q for q in cur_evalqs if "group" not in q["sql"].lower()]
+                        gqname = "CEB-IMDb-Complex"
+                        not_gqname = "CEB-IMDb-NoGroupNoLike"
+                        self.eval_ds[gqname] = self.init_dataset(
+                            group_evalqs, False,
+                            load_padded_mscn_feats=self.load_padded_mscn_feats,
+                        )
+                        self.true_costs[gqname] = 0.0
+                        self.samples[gqname] = group_evalqs
+
+                        self.eval_ds[not_gqname] = self.init_dataset(
+                            not_group_evalqs, False,
+                            load_padded_mscn_feats=self.load_padded_mscn_feats,
+                        )
+                        self.true_costs[not_gqname] = 0.0
+                        self.samples[not_gqname] = not_group_evalqs
+                        continue
+                    elif "stats" in evalqname:
+                        evalqname = "Stats-CEB"
+
+                    print("{}, num eval queries: {}".format(evalqname, len(cur_evalqs)))
+                    if len(cur_evalqs) == 0:
+                        continue
+
+                    self.eval_ds[evalqname] = self.init_dataset(
+                        cur_evalqs, False,
+                        load_padded_mscn_feats=self.load_padded_mscn_feats,
+                    )
+                    self.true_costs[evalqname] = 0.0
+                    self.samples[evalqname] = cur_evalqs
+
+        self.net, self.optimizer = self.init_net(self.trainds[0])
+        if not hasattr(self.net, "forward_with_latent") or \
+                not hasattr(self.net, "discriminate"):
+            raise RuntimeError(
+                "train_with_new_discriminator requires an MSCN-style network "
+                "with forward_with_latent() and discriminate()."
+            )
+        self._ensure_latent_discriminator_ready()
+        self._init_new_discriminator_optimizers()
+
+        if self.training_opt == "swa":
+            raise RuntimeError(
+                "SWA training is not supported in train_with_new_discriminator."
+            )
+
+        target_samples = self._collect_target_queries(kwargs)
+        if len(target_samples) == 0:
+            raise ValueError(
+                "No target queries available for train_with_new_discriminator. "
+                "Pass evalqs."
+            )
+
+        self.targetds = self.init_dataset(
+            target_samples,
+            self.load_query_together,
+            max_num_tables=self.max_num_tables,
+            load_padded_mscn_feats=self.load_padded_mscn_feats,
+        )
+        self.target_loader = data.DataLoader(
+            self.targetds,
+            batch_size=self.mb_size,
+            shuffle=True,
+            collate_fn=self.collate_fn,
+        )
+
+        model_size = self.num_parameters()
+        print(
+            "Training samples: {}, Target samples: {}, Model size: {}".format(
+                len(self.trainds), len(self.targetds), model_size
+            )
+        )
+
+        if self.max_epochs == -1:
+            total_epochs = 1000
+        else:
+            total_epochs = self.max_epochs
+
+        if self.early_stopping:
+            eplosses = []
+            pct_chngs = []
+
+        for self.epoch in range(0, total_epochs):
+            if self.epoch % self.eval_epoch == 0:
+                self.periodic_eval()
+
+            epoch_metrics = self.train_one_epoch_with_new_discriminator(self.target_loader)
+            self.adversarial_train_history.append(epoch_metrics)
+            self.model_weights.append(copy.deepcopy(self.net.state_dict()))
+
+            if self.epoch % 2 == 0:
+                print(
+                    "Epoch {} took {}s, reg_loss={}, disc_loss={}, gen_loss={}, disc_acc={}, source_acc={}, target_acc={}, fool_acc={}".format(
+                        self.epoch,
+                        epoch_metrics["epoch_seconds"],
+                        round(epoch_metrics["loss_reg"], 6),
+                        round(epoch_metrics["loss_d"], 6),
+                        round(epoch_metrics["loss_g"], 6),
+                        round(epoch_metrics["disc_acc"], 6),
+                        round(epoch_metrics["disc_acc_source"], 6),
+                        round(epoch_metrics["disc_acc_target"], 6),
+                        round(epoch_metrics["gen_fool_acc"], 6),
+                    )
+                )
+
+            if self.use_wandb:
+                wandb.log(
+                    {
+                        "TrainLoss": epoch_metrics["loss_reg"],
+                        "Adv-Loss-D": epoch_metrics["loss_d"],
+                        "Adv-Loss-G": epoch_metrics["loss_g"],
+                        "Adv-Disc-Acc": epoch_metrics["disc_acc"],
+                        "Adv-Disc-Source-Acc": epoch_metrics["disc_acc_source"],
+                        "Adv-Disc-Target-Acc": epoch_metrics["disc_acc_target"],
+                        "Adv-Gen-Fool-Acc": epoch_metrics["gen_fool_acc"],
+                        "epoch": self.epoch,
+                    }
+                )
+
+            if self.early_stopping == 1:
+                if "val" in self.eval_ds:
+                    ds = self.eval_ds["val"]
+                else:
+                    ds = self.eval_ds["train"]
+
+                preds, ys = self._eval_ds(ds)
+                losses = self.loss_func(torch.from_numpy(preds), torch.from_numpy(ys))
+                eploss = torch.mean(losses).item()
+                if len(eplosses) >= 1:
+                    pct = 100 * ((eploss - eplosses[-1]) / eplosses[-1])
+                    pct_chngs.append(pct)
+
+                eplosses.append(eploss)
+                if len(pct_chngs) > 5:
+                    trailing_chng = np.mean(pct_chngs[-5:-1])
+                    if trailing_chng > -0.1:
+                        print("Going to exit training at epoch: ", self.epoch)
+                        break
+
+            elif self.early_stopping == 2:
+                self.periodic_eval()
+                ppc_rel = self.all_errs[-1]["PostgresPlanCost-C-Relative-val"]
+
+                if len(eplosses) >= 1:
+                    pct = 100 * ((ppc_rel - eplosses[-1]) / eplosses[-1])
+                    pct_chngs.append(pct)
+
+                eplosses.append(ppc_rel)
+
+                if self.epoch > 2 and pct_chngs[-1] > 1:
+                    print(eplosses)
+                    print(pct_chngs)
+                    print("Going to exit training at epoch: ", self.epoch)
+                    self.best_model_epoch = self.epoch - 1
+                    break
+
+        if self.best_model_epoch != -1:
+            print("training done, will update our model based on validation set")
+            assert len(self.model_weights) > 0
+            self.net.load_state_dict(self.model_weights[self.best_model_epoch])
+
+        self.save_model(save_dir="./saved_models", suffix_name="_epoch" + str(self.epoch))
 
     def _eval_ds(self, ds, samples=None):
         torch.set_grad_enabled(False)

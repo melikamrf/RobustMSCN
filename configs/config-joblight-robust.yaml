@@ -113,7 +113,7 @@ model:
   normalize_flow_loss : 1
 
   # important training / optimization flags
-  max_epochs : 100
+  max_epochs : 10
   eval_epoch : 2 # how often to evaluate on eval_fns during training
   eval_fns : "qerr,ppc" # logging things during training
   lr : 0.0001
@@ -122,6 +122,15 @@ model:
 
   # keep padded set features in memory; faster to train, takes more RAM
   load_padded_mscn_feats : 1
+
+  # new latent adversarial training path (keeps original train() untouched)
+  use_new_discriminator_train : 1
+  enable_latent_interface : 1
+  enable_discriminator : 1
+  enable_decoder : 0
+  adv_regression_lr : 0.0001
+  adv_discriminator_lr : 0.0001
+  adv_generator_lr : 0.0001
 
   cost_model : "C"
 

@@ -5,6 +5,8 @@ import torch.nn.functional as F
 import time
 import math
 from .set_transformer import SetTransformer
+from .decoder import Decoder
+from .discriminator import LatentDiscriminator
 import pdb
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -57,7 +59,12 @@ class SetConv(nn.Module):
             dropouts=[0.0, 0.0, 0.0], use_sigmoid=True,
             enable_latent_interface=False,
             enable_discriminator=False,
-            enable_decoder=False):
+            enable_decoder=False,
+            discriminator_hidden_dims=None,
+            discriminator_dropout=0.1,
+            decoder_output_dim=None,
+            decoder_hidden_dims=None,
+            decoder_dropout=0.0):
         super(SetConv, self).__init__()
 
         ## debug time code
@@ -73,6 +80,11 @@ class SetConv(nn.Module):
         self.enable_decoder = enable_decoder
         self.discriminator = None
         self.decoder = None
+        self.discriminator_hidden_dims = discriminator_hidden_dims
+        self.discriminator_dropout = discriminator_dropout
+        self.decoder_output_dim = decoder_output_dim
+        self.decoder_hidden_dims = decoder_hidden_dims
+        self.decoder_dropout = decoder_dropout
 
         self.sample_feats = sample_feats
         self.predicate_feats = predicate_feats
@@ -153,6 +165,17 @@ class SetConv(nn.Module):
         self.out_mlp2 = nn.Linear(combined_hid_size, n_out).to(device)
         self.latent_dim = self.out_mlp1.out_features
 
+        if self.enable_discriminator:
+            self.discriminator = LatentDiscriminator(self.latent_dim,
+                    hidden_dims=self.discriminator_hidden_dims,
+                    dropout=self.discriminator_dropout).to(device)
+
+        if self.enable_decoder and self.decoder_output_dim is not None:
+            self.decoder = Decoder(self.latent_dim,
+                    self.decoder_output_dim,
+                    hidden_dims=self.decoder_hidden_dims,
+                    dropout=self.decoder_dropout).to(device)
+
     def configure_auxiliary_components(self, enable_latent_interface=None,
             enable_discriminator=None, enable_decoder=None):
         if enable_latent_interface is not None:
@@ -163,14 +186,40 @@ class SetConv(nn.Module):
             self.enable_decoder = enable_decoder
 
     def register_auxiliary_modules(self, discriminator=None, decoder=None):
-        self.discriminator = discriminator
-        self.decoder = decoder
+        if discriminator is not None:
+            self.discriminator = discriminator
+        if decoder is not None:
+            self.decoder = decoder
 
     def _require_latent_interface(self):
         if not self.enable_latent_interface:
             raise RuntimeError(
                 "Latent interface is disabled. Set enable_latent_interface=True "
                 "to access the MSCN encoder output."
+            )
+
+    def _require_decoder(self):
+        if not self.enable_decoder:
+            raise RuntimeError(
+                "Decoder is disabled. Set enable_decoder=True to use the "
+                "decoder head."
+            )
+        if self.decoder is None:
+            raise RuntimeError(
+                "Decoder is not initialized. Provide decoder_output_dim or "
+                "register a decoder module explicitly."
+            )
+
+    def _require_discriminator(self):
+        if not self.enable_discriminator:
+            raise RuntimeError(
+                "Discriminator is disabled. Set enable_discriminator=True to "
+                "use the discriminator head."
+            )
+        if self.discriminator is None:
+            raise RuntimeError(
+                "Discriminator is not initialized. Register a discriminator "
+                "module explicitly or enable the built-in latent discriminator."
             )
 
     def _compute_combined_hidden(self, xbatch):
@@ -272,6 +321,24 @@ class SetConv(nn.Module):
         hid, _, _, _ = self._compute_combined_hidden(xbatch)
         return F.relu(self.out_mlp1(hid))
 
+    def get_decoder_target(self, xbatch):
+        flat_inputs = []
+        for key in ["table", "pred", "join"]:
+            feats = xbatch[key].to(device, non_blocking=True)
+            flat_inputs.append(feats.reshape(feats.shape[0], -1))
+
+        flows = xbatch["flow"].to(device, non_blocking=True)
+        flat_inputs.append(flows.reshape(flows.shape[0], -1))
+        return torch.cat(flat_inputs, 1)
+
+    def decode(self, z):
+        self._require_decoder()
+        return self.decoder(z)
+
+    def discriminate(self, z):
+        self._require_discriminator()
+        return self.discriminator(z)
+
     def predict_from_latent(self, z, flows=None):
         hid = z
         if self.flow_feats:
@@ -292,6 +359,17 @@ class SetConv(nn.Module):
         z = F.relu(self.out_mlp1(hid))
         out = self.predict_from_latent(z, flows=flows)
         return out, z
+
+    def forward_with_decoder(self, xbatch):
+        out, z = self.forward_with_latent(xbatch)
+        reconstruction = self.decode(z)
+        target = self.get_decoder_target(xbatch)
+        return out, z, reconstruction, target
+
+    def forward_with_discriminator(self, xbatch):
+        out, z = self.forward_with_latent(xbatch)
+        domain_probs = self.discriminate(z)
+        return out, z, domain_probs
 
     def forward(self, xbatch):
         '''
@@ -315,7 +393,12 @@ class SetConvFlow(nn.Module):
             dropouts=[0.0, 0.0, 0.0], use_sigmoid=True,
             enable_latent_interface=False,
             enable_discriminator=False,
-            enable_decoder=False):
+            enable_decoder=False,
+            discriminator_hidden_dims=None,
+            discriminator_dropout=0.1,
+            decoder_output_dim=None,
+            decoder_hidden_dims=None,
+            decoder_dropout=0.0):
         super(SetConvFlow, self).__init__()
         self.use_sigmoid = use_sigmoid
         self.enable_latent_interface = enable_latent_interface
@@ -323,6 +406,11 @@ class SetConvFlow(nn.Module):
         self.enable_decoder = enable_decoder
         self.discriminator = None
         self.decoder = None
+        self.discriminator_hidden_dims = discriminator_hidden_dims
+        self.discriminator_dropout = discriminator_dropout
+        self.decoder_output_dim = decoder_output_dim
+        self.decoder_hidden_dims = decoder_hidden_dims
+        self.decoder_dropout = decoder_dropout
 
         sample_feats = int(sample_feats)
         hid_units = int(hid_units)
@@ -379,6 +467,17 @@ class SetConvFlow(nn.Module):
         self.out_mlp2 = nn.Linear(hid_units, n_out).to(device)
         self.latent_dim = self.out_mlp1.out_features
 
+        if self.enable_discriminator:
+            self.discriminator = LatentDiscriminator(self.latent_dim,
+                    hidden_dims=self.discriminator_hidden_dims,
+                    dropout=self.discriminator_dropout).to(device)
+
+        if self.enable_decoder and self.decoder_output_dim is not None:
+            self.decoder = Decoder(self.latent_dim,
+                    self.decoder_output_dim,
+                    hidden_dims=self.decoder_hidden_dims,
+                    dropout=self.decoder_dropout).to(device)
+
     def configure_auxiliary_components(self, enable_latent_interface=None,
             enable_discriminator=None, enable_decoder=None):
         if enable_latent_interface is not None:
@@ -389,14 +488,40 @@ class SetConvFlow(nn.Module):
             self.enable_decoder = enable_decoder
 
     def register_auxiliary_modules(self, discriminator=None, decoder=None):
-        self.discriminator = discriminator
-        self.decoder = decoder
+        if discriminator is not None:
+            self.discriminator = discriminator
+        if decoder is not None:
+            self.decoder = decoder
 
     def _require_latent_interface(self):
         if not self.enable_latent_interface:
             raise RuntimeError(
                 "Latent interface is disabled. Set enable_latent_interface=True "
                 "to access the MSCN encoder output."
+            )
+
+    def _require_decoder(self):
+        if not self.enable_decoder:
+            raise RuntimeError(
+                "Decoder is disabled. Set enable_decoder=True to use the "
+                "decoder head."
+            )
+        if self.decoder is None:
+            raise RuntimeError(
+                "Decoder is not initialized. Provide decoder_output_dim or "
+                "register a decoder module explicitly."
+            )
+
+    def _require_discriminator(self):
+        if not self.enable_discriminator:
+            raise RuntimeError(
+                "Discriminator is disabled. Set enable_discriminator=True to "
+                "use the discriminator head."
+            )
+        if self.discriminator is None:
+            raise RuntimeError(
+                "Discriminator is not initialized. Register a discriminator "
+                "module explicitly or enable the built-in latent discriminator."
             )
 
     def _compute_combined_hidden(self, xbatch):
@@ -499,6 +624,24 @@ class SetConvFlow(nn.Module):
         hid = self._compute_combined_hidden(xbatch)
         return F.relu(self.out_mlp1(hid))
 
+    def get_decoder_target(self, xbatch):
+        flat_inputs = []
+        for key in ["table", "pred", "join"]:
+            feats = xbatch[key].to(device, non_blocking=True)
+            flat_inputs.append(feats.reshape(feats.shape[0], -1))
+
+        flows = xbatch["flow"].to(device, non_blocking=True)
+        flat_inputs.append(flows.reshape(flows.shape[0], -1))
+        return torch.cat(flat_inputs, 1)
+
+    def decode(self, z):
+        self._require_decoder()
+        return self.decoder(z)
+
+    def discriminate(self, z):
+        self._require_discriminator()
+        return self.discriminator(z)
+
     def predict_from_latent(self, z):
         if self.use_sigmoid:
             return torch.sigmoid(self.out_mlp2(z))
@@ -510,6 +653,17 @@ class SetConvFlow(nn.Module):
         z = F.relu(self.out_mlp1(hid))
         out = self.predict_from_latent(z)
         return out, z
+
+    def forward_with_decoder(self, xbatch):
+        out, z = self.forward_with_latent(xbatch)
+        reconstruction = self.decode(z)
+        target = self.get_decoder_target(xbatch)
+        return out, z, reconstruction, target
+
+    def forward_with_discriminator(self, xbatch):
+        out, z = self.forward_with_latent(xbatch)
+        domain_probs = self.discriminate(z)
+        return out, z, domain_probs
 
     def forward(self, xbatch):
         '''

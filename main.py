@@ -419,12 +419,23 @@ def main():
     # weights = result["weights"]
     # main_logger.info(f"Result feature stats: {result['feature_stats']}")
 
-    disc_weights, mscn_evalqs, mscn_eval_qdirs = prepare_discriminator_weights(
-        trainqs=trainqs,
-        evalqs=evalqs,
-        eval_qdirs=eval_qdirs,
-        featurizer=featurizer,
-    )
+    use_new_discriminator_train = bool(cfg["model"].get("use_new_discriminator_train", 0))
+
+    if use_new_discriminator_train:
+        main_logger.info(
+            "Using train_with_new_discriminator: skipping standalone feature-space "
+            "discriminator weighting."
+        )
+        disc_weights = None
+        mscn_evalqs = evalqs
+        mscn_eval_qdirs = eval_qdirs
+    else:
+        disc_weights, mscn_evalqs, mscn_eval_qdirs = prepare_discriminator_weights(
+            trainqs=trainqs,
+            evalqs=evalqs,
+            eval_qdirs=eval_qdirs,
+            featurizer=featurizer,
+        )
 
     if args.load_model is not None:
         alg.featurizer = featurizer
@@ -435,13 +446,45 @@ def main():
         alg.load_model(args.load_model, sample=dummy_ds[0])
 
     elif cfg["model"]["eval_epoch"] < cfg["model"]["max_epochs"]:
-        alg.train(trainqs, valqs=valqs, testqs=testqs, evalqs = mscn_evalqs,
-                eval_qdirs = mscn_eval_qdirs, featurizer=featurizer,
-                adv_weights=disc_weights, adv_weight_level="dataset")
+        if use_new_discriminator_train:
+            if not hasattr(alg, "train_with_new_discriminator"):
+                raise RuntimeError(
+                    f"{args.alg} does not support train_with_new_discriminator"
+                )
+            alg.train_with_new_discriminator(
+                trainqs,
+                valqs=valqs,
+                testqs=testqs,
+                evalqs=mscn_evalqs,
+                eval_qdirs=mscn_eval_qdirs,
+                featurizer=featurizer,
+                adv_weights=disc_weights,
+                adv_weight_level="dataset",
+            )
+        else:
+            alg.train(trainqs, valqs=valqs, testqs=testqs, evalqs = mscn_evalqs,
+                    eval_qdirs = mscn_eval_qdirs, featurizer=featurizer,
+                    adv_weights=disc_weights, adv_weight_level="dataset")
     else:
-        alg.train(trainqs, valqs=valqs, testqs=None, evalqs = None,
-                eval_qdirs = mscn_eval_qdirs, featurizer=featurizer,
-                adv_weights=disc_weights, adv_weight_level="dataset")
+        if use_new_discriminator_train:
+            if not hasattr(alg, "train_with_new_discriminator"):
+                raise RuntimeError(
+                    f"{args.alg} does not support train_with_new_discriminator"
+                )
+            alg.train_with_new_discriminator(
+                trainqs,
+                valqs=valqs,
+                testqs=None,
+                evalqs=mscn_evalqs,
+                eval_qdirs=mscn_eval_qdirs,
+                featurizer=featurizer,
+                adv_weights=disc_weights,
+                adv_weight_level="dataset",
+            )
+        else:
+            alg.train(trainqs, valqs=valqs, testqs=None, evalqs = None,
+                    eval_qdirs = mscn_eval_qdirs, featurizer=featurizer,
+                    adv_weights=disc_weights, adv_weight_level="dataset")
 
     # start_time = time.time()
     # eval_alg(alg, eval_fns, trainqs, cfg, "train", featurizer=featurizer)
@@ -502,7 +545,7 @@ def read_flags():
             default=0.5,
             help="Fraction of target/eval queries held out for MSCN evaluation")
     parser.add_argument("--use_discriminator", type=int, required=False,
-            default=1,
+            default=0,
             help="Set to 1 to train/use discriminator weights, 0 for uniform weights")
     parser.add_argument("--disc_epochs", type=int, required=False,
             default=10)
