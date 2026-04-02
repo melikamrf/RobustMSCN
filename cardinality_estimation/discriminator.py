@@ -7,7 +7,7 @@ class LatentDiscriminator(nn.Module):
         super(LatentDiscriminator, self).__init__()
 
         if hidden_dims is None:
-            hidden_dims = [128, 64, 32]
+            hidden_dims = [64, 32]
 
         dims = [input_dim] + list(hidden_dims) + [1]
         layers = []

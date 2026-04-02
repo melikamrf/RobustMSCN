@@ -3,6 +3,11 @@ sys.path.append(".")
 # from query_representation.query import *
 from query_representation.utils import get_query_splits
 
+import os
+# This forces the output to be unbuffered at the binary level
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
+
 from cardinality_estimation.featurizer import *
 from cardinality_estimation.dataset import QueryDataset, load_qdata
 from cardinality_estimation import get_alg
@@ -458,6 +463,7 @@ def main():
                 evalqs=mscn_evalqs,
                 eval_qdirs=mscn_eval_qdirs,
                 featurizer=featurizer,
+                result_dir=args.result_dir,
                 adv_weights=disc_weights,
                 adv_weight_level="dataset",
             )
@@ -478,6 +484,7 @@ def main():
                 evalqs=mscn_evalqs,
                 eval_qdirs=mscn_eval_qdirs,
                 featurizer=featurizer,
+                result_dir=args.result_dir,
                 adv_weights=disc_weights,
                 adv_weight_level="dataset",
             )

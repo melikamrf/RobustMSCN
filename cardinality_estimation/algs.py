@@ -29,6 +29,7 @@ from torch.optim.swa_utils import AveragedModel, SWALR
 import wandb
 import random
 import pickle
+import matplotlib.pyplot as plt
 
 QERR_MIN_EPS=0.0000001
 DEBUG_TIMES=False
@@ -629,6 +630,72 @@ class NN(CardinalityEstimationAlg):
         losses = self.loss_func(pred, ybatch)
         return self._reduce_losses(losses, info)
 
+    def _compute_mean_loss_from_numpy(self, preds, ys):
+        if self.loss_func_name == "flowloss":
+            return None
+
+        pred_t = torch.from_numpy(preds).float()
+        y_t = torch.from_numpy(ys).float()
+
+        if self.loss_func_name == "qloss" and self.featurizer.ynormalization == "log":
+            pred_t = self.featurizer.unnormalize_torch(pred_t, None)
+            y_t = self.featurizer.unnormalize_torch(y_t, None)
+
+        losses = self.loss_func(pred_t, y_t)
+        if torch.is_tensor(losses):
+            if losses.ndim == 0:
+                return float(losses.item())
+            return float(torch.mean(losses).item())
+        return float(np.mean(losses))
+
+    def _save_adversarial_training_plot(self, save_dir):
+        if not hasattr(self, "adversarial_train_history"):
+            return None
+        if len(self.adversarial_train_history) == 0:
+            return None
+
+        os.makedirs(save_dir, exist_ok=True)
+
+        epochs = np.arange(len(self.adversarial_train_history))
+        reg_loss = [m["loss_reg"] for m in self.adversarial_train_history]
+        disc_loss = [m["loss_d"] for m in self.adversarial_train_history]
+        gen_loss = [m["loss_g"] for m in self.adversarial_train_history]
+        val_loss = [m.get("val_loss", np.nan) for m in self.adversarial_train_history]
+        disc_acc = [m["disc_acc"] for m in self.adversarial_train_history]
+        source_acc = [m["disc_acc_source"] for m in self.adversarial_train_history]
+        target_acc = [m["disc_acc_target"] for m in self.adversarial_train_history]
+        fool_acc = [m["gen_fool_acc"] for m in self.adversarial_train_history]
+
+        fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+
+        axes[0].plot(epochs, reg_loss, label="Regression Loss")
+        axes[0].plot(epochs, disc_loss, label="Discriminator Loss")
+        axes[0].plot(epochs, gen_loss, label="Generator Loss")
+        if np.isfinite(np.asarray(val_loss)).any():
+            axes[0].plot(epochs, val_loss, label="Validation Loss")
+        axes[0].set_title("Adversarial Training Losses")
+        axes[0].set_xlabel("Epoch")
+        axes[0].set_ylabel("Loss")
+        axes[0].grid(True, alpha=0.3)
+        axes[0].legend()
+
+        axes[1].plot(epochs, disc_acc, label="Disc Acc")
+        axes[1].plot(epochs, source_acc, label="Source Acc")
+        axes[1].plot(epochs, target_acc, label="Target Acc")
+        axes[1].plot(epochs, fool_acc, label="Fool Acc")
+        axes[1].set_title("Adversarial Training Accuracy")
+        axes[1].set_xlabel("Epoch")
+        axes[1].set_ylabel("Accuracy")
+        axes[1].set_ylim(0.0, 1.0)
+        axes[1].grid(True, alpha=0.3)
+        axes[1].legend()
+
+        plt.tight_layout()
+        plot_path = os.path.join(save_dir, "adversarial_training_curves.png")
+        fig.savefig(plot_path, dpi=200, bbox_inches="tight")
+        plt.close(fig)
+        return plot_path
+
     def train_one_epoch_with_new_discriminator(self, target_loader):
         start = time.time()
         reg_losses = []
@@ -1153,6 +1220,9 @@ class NN(CardinalityEstimationAlg):
                 "Pass evalqs."
             )
 
+        run_result_dir = kwargs.get("result_dir", "./results")
+        run_plot_dir = os.path.join(run_result_dir, self.get_exp_name())
+
         self.targetds = self.init_dataset(
             target_samples,
             self.load_query_together,
@@ -1183,16 +1253,24 @@ class NN(CardinalityEstimationAlg):
             pct_chngs = []
 
         for self.epoch in range(0, total_epochs):
+            should_eval = (self.epoch % self.eval_epoch == 0)
             if self.epoch % self.eval_epoch == 0:
                 self.periodic_eval()
 
             epoch_metrics = self.train_one_epoch_with_new_discriminator(self.target_loader)
+
+            if should_eval and "val" in self.eval_ds:
+                val_preds, val_ys = self._eval_ds(self.eval_ds["val"], self.samples["val"])
+                val_loss = self._compute_mean_loss_from_numpy(val_preds, val_ys)
+                if val_loss is not None:
+                    epoch_metrics["val_loss"] = val_loss
+
             self.adversarial_train_history.append(epoch_metrics)
             self.model_weights.append(copy.deepcopy(self.net.state_dict()))
 
             if self.epoch % 2 == 0:
                 print(
-                    "Epoch {} took {}s, reg_loss={}, disc_loss={}, gen_loss={}, disc_acc={}, source_acc={}, target_acc={}, fool_acc={}".format(
+                    "Epoch {} took {}s, reg_loss={}, disc_loss={}, gen_loss={}, disc_acc={}, source_acc={}, target_acc={}, fool_acc={}, val_loss={}".format(
                         self.epoch,
                         epoch_metrics["epoch_seconds"],
                         round(epoch_metrics["loss_reg"], 6),
@@ -1202,22 +1280,24 @@ class NN(CardinalityEstimationAlg):
                         round(epoch_metrics["disc_acc_source"], 6),
                         round(epoch_metrics["disc_acc_target"], 6),
                         round(epoch_metrics["gen_fool_acc"], 6),
+                        round(epoch_metrics.get("val_loss", float("nan")), 6),
                     )
                 )
 
             if self.use_wandb:
-                wandb.log(
-                    {
-                        "TrainLoss": epoch_metrics["loss_reg"],
-                        "Adv-Loss-D": epoch_metrics["loss_d"],
-                        "Adv-Loss-G": epoch_metrics["loss_g"],
-                        "Adv-Disc-Acc": epoch_metrics["disc_acc"],
-                        "Adv-Disc-Source-Acc": epoch_metrics["disc_acc_source"],
-                        "Adv-Disc-Target-Acc": epoch_metrics["disc_acc_target"],
-                        "Adv-Gen-Fool-Acc": epoch_metrics["gen_fool_acc"],
-                        "epoch": self.epoch,
-                    }
-                )
+                wandb_payload = {
+                    "TrainLoss": epoch_metrics["loss_reg"],
+                    "Adv-Loss-D": epoch_metrics["loss_d"],
+                    "Adv-Loss-G": epoch_metrics["loss_g"],
+                    "Adv-Disc-Acc": epoch_metrics["disc_acc"],
+                    "Adv-Disc-Source-Acc": epoch_metrics["disc_acc_source"],
+                    "Adv-Disc-Target-Acc": epoch_metrics["disc_acc_target"],
+                    "Adv-Gen-Fool-Acc": epoch_metrics["gen_fool_acc"],
+                    "epoch": self.epoch,
+                }
+                if "val_loss" in epoch_metrics:
+                    wandb_payload["ValLoss"] = epoch_metrics["val_loss"]
+                wandb.log(wandb_payload)
 
             if self.early_stopping == 1:
                 if "val" in self.eval_ds:
@@ -1260,6 +1340,10 @@ class NN(CardinalityEstimationAlg):
             print("training done, will update our model based on validation set")
             assert len(self.model_weights) > 0
             self.net.load_state_dict(self.model_weights[self.best_model_epoch])
+
+        adv_plot_path = self._save_adversarial_training_plot(run_plot_dir)
+        if adv_plot_path is not None:
+            print("Saved adversarial training plot to:", adv_plot_path)
 
         self.save_model(save_dir="./saved_models", suffix_name="_epoch" + str(self.epoch))
 

@@ -128,7 +128,7 @@ model:
   enable_latent_interface : 1
   enable_discriminator : 1
   enable_decoder : 0
-  adv_regression_lr : 0.0001
+  adv_regression_lr : 0.001
   adv_discriminator_lr : 0.0001
   adv_generator_lr : 0.0001
 
