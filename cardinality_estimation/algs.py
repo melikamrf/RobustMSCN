@@ -765,7 +765,8 @@ class NN(CardinalityEstimationAlg):
             z_source_det = z_source_det.detach()
             z_target_det = z_target_det.detach()
 
-            labels_source = torch.ones(current_batch_size, 1, device=device)
+          
+            labels_source = torch.full((current_batch_size, 1), 0.9, device=device)
             labels_target = torch.zeros(current_batch_size, 1, device=device)
 
             pred_source_disc = self.net.discriminate(z_source_det)
@@ -777,19 +778,28 @@ class NN(CardinalityEstimationAlg):
             loss_d.backward()
             self.opt_discriminator.step()
 
+
             # Phase 3: train encoder to fool discriminator on target.
-            self.opt_generator.zero_grad()
-            _, z_target_gen = self.net.forward_with_latent(xbatch_target)
-            trick_labels = torch.ones(current_batch_size, 1, device=device)
-            pred_target_gen = self.net.discriminate(z_target_gen)
-            loss_g = self.bce_loss(pred_target_gen, trick_labels)
-            loss_g.backward()
-            if self.clip_gradient is not None:
-                clip_grad_norm_(
-                    self.opt_generator.param_groups[0]["params"],
-                    self.clip_gradient,
-                )
-            self.opt_generator.step()
+            # Run this multiple times (e.g., 2) to let the generator catch up!
+            for _ in range(2):
+                self.opt_generator.zero_grad()
+                
+                # Forward pass to get the latent vector
+                _, z_target_gen = self.net.forward_with_latent(xbatch_target)
+                
+                # Trick labels (1.0)
+                trick_labels = torch.ones(current_batch_size, 1, device=device)
+                pred_target_gen = self.net.discriminate(z_target_gen)
+                
+                loss_g = self.bce_loss(pred_target_gen, trick_labels)
+                loss_g.backward()
+                
+                if self.clip_gradient is not None:
+                    clip_grad_norm_(
+                        self.opt_generator.param_groups[0]["params"],
+                        self.clip_gradient,
+                    )
+                self.opt_generator.step()
 
             with torch.no_grad():
                 disc_pred_source_cls = (pred_source_disc >= 0.5).float()
