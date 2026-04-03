@@ -125,9 +125,17 @@ model:
 
   # new latent adversarial training path (keeps original train() untouched)
   use_new_discriminator_train : 1
+  use_generator_adversarial_train : 0
   enable_latent_interface : 1
   enable_discriminator : 1
-  enable_decoder : 0
+  enable_generator : 0
+  enable_decoder : 1
+  decoder_loss_weight : 1.0
+  decoder_hidden_dims : null
+  decoder_dropout : 0.0
+  generator_noise_dim : null
+  generator_hidden_dims : null
+  generator_dropout : 0.1
   adv_regression_lr : 0.001
   adv_discriminator_lr : 0.0001
   adv_generator_lr : 0.0001

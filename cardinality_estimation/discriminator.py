@@ -7,7 +7,7 @@ class LatentDiscriminator(nn.Module):
         super(LatentDiscriminator, self).__init__()
 
         if hidden_dims is None:
-            hidden_dims = [64, 32]
+            hidden_dims = [128, 64, 32]
 
         dims = [input_dim] + list(hidden_dims) + [1]
         layers = []
@@ -24,3 +24,34 @@ class LatentDiscriminator(nn.Module):
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         return self.net(z)
+
+
+class LatentGenerator(nn.Module):
+    def __init__(
+            self,
+            noise_dim,
+            output_dim,
+            hidden_dims=None,
+            dropout=0.1):
+        super(LatentGenerator, self).__init__()
+
+        if hidden_dims is None:
+            hidden_dims = [32, 64, 128]
+
+        dims = [noise_dim] + list(hidden_dims) + [output_dim]
+        layers = []
+        for i in range(len(dims) - 2):
+            layers.append(nn.Linear(dims[i], dims[i + 1]))
+            layers.append(nn.ReLU())
+            if dropout > 0.0:
+                layers.append(nn.Dropout(p=dropout))
+
+        layers.append(nn.Linear(dims[-2], dims[-1]))
+        # Encoder latents use ReLU in MSCN, so keep generated latents non-negative.
+        layers.append(nn.ReLU())
+        self.net = nn.Sequential(*layers)
+        self.noise_dim = noise_dim
+        self.output_dim = output_dim
+
+    def forward(self, noise: torch.Tensor) -> torch.Tensor:
+        return self.net(noise)

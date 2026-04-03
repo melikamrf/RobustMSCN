@@ -6,7 +6,7 @@ import time
 import math
 from .set_transformer import SetTransformer
 from .decoder import Decoder
-from .discriminator import LatentDiscriminator
+from .discriminator import LatentDiscriminator, LatentGenerator
 import pdb
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -59,9 +59,13 @@ class SetConv(nn.Module):
             dropouts=[0.0, 0.0, 0.0], use_sigmoid=True,
             enable_latent_interface=False,
             enable_discriminator=False,
+            enable_generator=False,
             enable_decoder=False,
             discriminator_hidden_dims=None,
             discriminator_dropout=0.1,
+            generator_noise_dim=None,
+            generator_hidden_dims=None,
+            generator_dropout=0.1,
             decoder_output_dim=None,
             decoder_hidden_dims=None,
             decoder_dropout=0.0):
@@ -77,11 +81,16 @@ class SetConv(nn.Module):
         self.use_sigmoid = use_sigmoid
         self.enable_latent_interface = enable_latent_interface
         self.enable_discriminator = enable_discriminator
+        self.enable_generator = enable_generator
         self.enable_decoder = enable_decoder
         self.discriminator = None
+        self.generator = None
         self.decoder = None
         self.discriminator_hidden_dims = discriminator_hidden_dims
         self.discriminator_dropout = discriminator_dropout
+        self.generator_noise_dim = generator_noise_dim
+        self.generator_hidden_dims = generator_hidden_dims
+        self.generator_dropout = generator_dropout
         self.decoder_output_dim = decoder_output_dim
         self.decoder_hidden_dims = decoder_hidden_dims
         self.decoder_dropout = decoder_dropout
@@ -170,6 +179,16 @@ class SetConv(nn.Module):
                     hidden_dims=self.discriminator_hidden_dims,
                     dropout=self.discriminator_dropout).to(device)
 
+        if self.enable_generator:
+            noise_dim = self.generator_noise_dim
+            if noise_dim is None:
+                noise_dim = self.latent_dim
+            self.generator = LatentGenerator(
+                    noise_dim,
+                    self.latent_dim,
+                    hidden_dims=self.generator_hidden_dims,
+                    dropout=self.generator_dropout).to(device)
+
         if self.enable_decoder and self.decoder_output_dim is not None:
             self.decoder = Decoder(self.latent_dim,
                     self.decoder_output_dim,
@@ -177,17 +196,23 @@ class SetConv(nn.Module):
                     dropout=self.decoder_dropout).to(device)
 
     def configure_auxiliary_components(self, enable_latent_interface=None,
-            enable_discriminator=None, enable_decoder=None):
+            enable_discriminator=None, enable_generator=None,
+            enable_decoder=None):
         if enable_latent_interface is not None:
             self.enable_latent_interface = enable_latent_interface
         if enable_discriminator is not None:
             self.enable_discriminator = enable_discriminator
+        if enable_generator is not None:
+            self.enable_generator = enable_generator
         if enable_decoder is not None:
             self.enable_decoder = enable_decoder
 
-    def register_auxiliary_modules(self, discriminator=None, decoder=None):
+    def register_auxiliary_modules(self, discriminator=None, generator=None,
+            decoder=None):
         if discriminator is not None:
             self.discriminator = discriminator
+        if generator is not None:
+            self.generator = generator
         if decoder is not None:
             self.decoder = decoder
 
@@ -220,6 +245,18 @@ class SetConv(nn.Module):
             raise RuntimeError(
                 "Discriminator is not initialized. Register a discriminator "
                 "module explicitly or enable the built-in latent discriminator."
+            )
+
+    def _require_generator(self):
+        if not self.enable_generator:
+            raise RuntimeError(
+                "Generator is disabled. Set enable_generator=True to use "
+                "the generator head."
+            )
+        if self.generator is None:
+            raise RuntimeError(
+                "Generator is not initialized. Register a generator module "
+                "explicitly or enable the built-in latent generator."
             )
 
     def _compute_combined_hidden(self, xbatch):
@@ -339,6 +376,15 @@ class SetConv(nn.Module):
         self._require_discriminator()
         return self.discriminator(z)
 
+    def generate(self, noise):
+        self._require_generator()
+        return self.generator(noise)
+
+    def sample_noise(self, batch_size, device_override=None):
+        self._require_generator()
+        cur_device = device if device_override is None else device_override
+        return torch.randn(batch_size, self.generator.noise_dim, device=cur_device)
+
     def predict_from_latent(self, z, flows=None):
         hid = z
         if self.flow_feats:
@@ -371,6 +417,9 @@ class SetConv(nn.Module):
         domain_probs = self.discriminate(z)
         return out, z, domain_probs
 
+    def forward_with_generator(self, noise):
+        return self.generate(noise)
+
     def forward(self, xbatch):
         '''
         #TODO: describe shapes
@@ -393,9 +442,13 @@ class SetConvFlow(nn.Module):
             dropouts=[0.0, 0.0, 0.0], use_sigmoid=True,
             enable_latent_interface=False,
             enable_discriminator=False,
+            enable_generator=False,
             enable_decoder=False,
             discriminator_hidden_dims=None,
             discriminator_dropout=0.1,
+            generator_noise_dim=None,
+            generator_hidden_dims=None,
+            generator_dropout=0.1,
             decoder_output_dim=None,
             decoder_hidden_dims=None,
             decoder_dropout=0.0):
@@ -403,11 +456,16 @@ class SetConvFlow(nn.Module):
         self.use_sigmoid = use_sigmoid
         self.enable_latent_interface = enable_latent_interface
         self.enable_discriminator = enable_discriminator
+        self.enable_generator = enable_generator
         self.enable_decoder = enable_decoder
         self.discriminator = None
+        self.generator = None
         self.decoder = None
         self.discriminator_hidden_dims = discriminator_hidden_dims
         self.discriminator_dropout = discriminator_dropout
+        self.generator_noise_dim = generator_noise_dim
+        self.generator_hidden_dims = generator_hidden_dims
+        self.generator_dropout = generator_dropout
         self.decoder_output_dim = decoder_output_dim
         self.decoder_hidden_dims = decoder_hidden_dims
         self.decoder_dropout = decoder_dropout
@@ -472,6 +530,16 @@ class SetConvFlow(nn.Module):
                     hidden_dims=self.discriminator_hidden_dims,
                     dropout=self.discriminator_dropout).to(device)
 
+        if self.enable_generator:
+            noise_dim = self.generator_noise_dim
+            if noise_dim is None:
+                noise_dim = self.latent_dim
+            self.generator = LatentGenerator(
+                    noise_dim,
+                    self.latent_dim,
+                    hidden_dims=self.generator_hidden_dims,
+                    dropout=self.generator_dropout).to(device)
+
         if self.enable_decoder and self.decoder_output_dim is not None:
             self.decoder = Decoder(self.latent_dim,
                     self.decoder_output_dim,
@@ -479,17 +547,23 @@ class SetConvFlow(nn.Module):
                     dropout=self.decoder_dropout).to(device)
 
     def configure_auxiliary_components(self, enable_latent_interface=None,
-            enable_discriminator=None, enable_decoder=None):
+            enable_discriminator=None, enable_generator=None,
+            enable_decoder=None):
         if enable_latent_interface is not None:
             self.enable_latent_interface = enable_latent_interface
         if enable_discriminator is not None:
             self.enable_discriminator = enable_discriminator
+        if enable_generator is not None:
+            self.enable_generator = enable_generator
         if enable_decoder is not None:
             self.enable_decoder = enable_decoder
 
-    def register_auxiliary_modules(self, discriminator=None, decoder=None):
+    def register_auxiliary_modules(self, discriminator=None, generator=None,
+            decoder=None):
         if discriminator is not None:
             self.discriminator = discriminator
+        if generator is not None:
+            self.generator = generator
         if decoder is not None:
             self.decoder = decoder
 
@@ -522,6 +596,18 @@ class SetConvFlow(nn.Module):
             raise RuntimeError(
                 "Discriminator is not initialized. Register a discriminator "
                 "module explicitly or enable the built-in latent discriminator."
+            )
+
+    def _require_generator(self):
+        if not self.enable_generator:
+            raise RuntimeError(
+                "Generator is disabled. Set enable_generator=True to use "
+                "the generator head."
+            )
+        if self.generator is None:
+            raise RuntimeError(
+                "Generator is not initialized. Register a generator module "
+                "explicitly or enable the built-in latent generator."
             )
 
     def _compute_combined_hidden(self, xbatch):
@@ -642,6 +728,15 @@ class SetConvFlow(nn.Module):
         self._require_discriminator()
         return self.discriminator(z)
 
+    def generate(self, noise):
+        self._require_generator()
+        return self.generator(noise)
+
+    def sample_noise(self, batch_size, device_override=None):
+        self._require_generator()
+        cur_device = device if device_override is None else device_override
+        return torch.randn(batch_size, self.generator.noise_dim, device=cur_device)
+
     def predict_from_latent(self, z):
         if self.use_sigmoid:
             return torch.sigmoid(self.out_mlp2(z))
@@ -664,6 +759,9 @@ class SetConvFlow(nn.Module):
         out, z = self.forward_with_latent(xbatch)
         domain_probs = self.discriminate(z)
         return out, z, domain_probs
+
+    def forward_with_generator(self, noise):
+        return self.generate(noise)
 
     def forward(self, xbatch):
         '''

@@ -425,11 +425,13 @@ def main():
     # main_logger.info(f"Result feature stats: {result['feature_stats']}")
 
     use_new_discriminator_train = bool(cfg["model"].get("use_new_discriminator_train", 0))
+    use_generator_adversarial_train = bool(cfg["model"].get("use_generator_adversarial_train", 0))
+    use_alt_adversarial_train = use_new_discriminator_train or use_generator_adversarial_train
 
-    if use_new_discriminator_train:
+    if use_alt_adversarial_train:
         main_logger.info(
-            "Using train_with_new_discriminator: skipping standalone feature-space "
-            "discriminator weighting."
+            "Using in-model adversarial training path: skipping standalone "
+            "feature-space discriminator weighting."
         )
         disc_weights = None
         mscn_evalqs = evalqs
@@ -451,7 +453,23 @@ def main():
         alg.load_model(args.load_model, sample=dummy_ds[0])
 
     elif cfg["model"]["eval_epoch"] < cfg["model"]["max_epochs"]:
-        if use_new_discriminator_train:
+        if use_generator_adversarial_train:
+            if not hasattr(alg, "train_with_latent_generator"):
+                raise RuntimeError(
+                    f"{args.alg} does not support train_with_latent_generator"
+                )
+            alg.train_with_latent_generator(
+                trainqs,
+                valqs=valqs,
+                testqs=testqs,
+                evalqs=mscn_evalqs,
+                eval_qdirs=mscn_eval_qdirs,
+                featurizer=featurizer,
+                result_dir=args.result_dir,
+                adv_weights=disc_weights,
+                adv_weight_level="dataset",
+            )
+        elif use_new_discriminator_train:
             if not hasattr(alg, "train_with_new_discriminator"):
                 raise RuntimeError(
                     f"{args.alg} does not support train_with_new_discriminator"
@@ -472,7 +490,23 @@ def main():
                     eval_qdirs = mscn_eval_qdirs, featurizer=featurizer,
                     adv_weights=disc_weights, adv_weight_level="dataset")
     else:
-        if use_new_discriminator_train:
+        if use_generator_adversarial_train:
+            if not hasattr(alg, "train_with_latent_generator"):
+                raise RuntimeError(
+                    f"{args.alg} does not support train_with_latent_generator"
+                )
+            alg.train_with_latent_generator(
+                trainqs,
+                valqs=valqs,
+                testqs=None,
+                evalqs=mscn_evalqs,
+                eval_qdirs=mscn_eval_qdirs,
+                featurizer=featurizer,
+                result_dir=args.result_dir,
+                adv_weights=disc_weights,
+                adv_weight_level="dataset",
+            )
+        elif use_new_discriminator_train:
             if not hasattr(alg, "train_with_new_discriminator"):
                 raise RuntimeError(
                     f"{args.alg} does not support train_with_new_discriminator"

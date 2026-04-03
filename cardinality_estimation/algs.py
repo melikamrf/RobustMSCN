@@ -17,9 +17,10 @@ from .dataset import QueryDataset, pad_sets, to_variable,\
         mscn_collate_fn,mscn_collate_fn_together
 
 from .nets import *
+from .decoder import Decoder
 from evaluation.flow_loss import FlowLoss, \
         get_optimization_variables, get_subsetg_vectors
-from .discriminator import LatentDiscriminator
+from .discriminator import LatentDiscriminator, LatentGenerator
 
 from torch.utils import data
 from torch.nn.utils.clip_grad import clip_grad_norm_
@@ -542,11 +543,12 @@ class NN(CardinalityEstimationAlg):
         return xbatch
 
     def _ensure_latent_discriminator_ready(self):
+        enable_decoder = bool(getattr(self, "enable_decoder", False))
         if hasattr(self.net, "configure_auxiliary_components"):
             self.net.configure_auxiliary_components(
                 enable_latent_interface=True,
                 enable_discriminator=True,
-                enable_decoder=False,
+                enable_decoder=enable_decoder,
             )
 
         if getattr(self.net, "discriminator", None) is None:
@@ -559,6 +561,86 @@ class NN(CardinalityEstimationAlg):
                     dropout=dropout,
                 ).to(device)
             )
+
+        self._ensure_decoder_ready()
+
+    def _ensure_latent_generator_ready(self):
+        enable_decoder = bool(getattr(self, "enable_decoder", False))
+        if hasattr(self.net, "configure_auxiliary_components"):
+            self.net.configure_auxiliary_components(
+                enable_latent_interface=True,
+                enable_discriminator=True,
+                enable_generator=True,
+                enable_decoder=enable_decoder,
+            )
+
+        if getattr(self.net, "generator", None) is None:
+            noise_dim = getattr(self.net, "generator_noise_dim", None)
+            if noise_dim is None:
+                noise_dim = self.net.latent_dim
+            hidden_dims = getattr(self.net, "generator_hidden_dims", None)
+            dropout = getattr(self.net, "generator_dropout", 0.1)
+            self.net.register_auxiliary_modules(
+                generator=LatentGenerator(
+                    noise_dim,
+                    self.net.latent_dim,
+                    hidden_dims=hidden_dims,
+                    dropout=dropout,
+                ).to(device)
+            )
+
+        self._ensure_decoder_ready()
+
+    def _ensure_decoder_ready(self):
+        if not bool(getattr(self, "enable_decoder", False)):
+            return
+
+        if hasattr(self.net, "configure_auxiliary_components"):
+            self.net.configure_auxiliary_components(
+                enable_latent_interface=True,
+                enable_decoder=True,
+            )
+
+        if getattr(self.net, "decoder", None) is not None:
+            return
+
+        decoder_output_dim = getattr(self.net, "decoder_output_dim", None)
+        if decoder_output_dim is None:
+            raise RuntimeError(
+                "Decoder output dimension is undefined. Set decoder_output_dim "
+                "or enable load_padded_mscn_feats so it can be inferred."
+            )
+
+        hidden_dims = getattr(self.net, "decoder_hidden_dims", None)
+        dropout = getattr(self.net, "decoder_dropout", 0.0)
+        self.net.register_auxiliary_modules(
+            decoder=Decoder(
+                self.net.latent_dim,
+                decoder_output_dim,
+                hidden_dims=hidden_dims,
+                dropout=dropout,
+            ).to(device)
+        )
+
+    def _decoder_loss_enabled(self):
+        return bool(getattr(self, "enable_decoder", False)) and \
+            hasattr(self.net, "decode") and getattr(self.net, "decoder", None) is not None
+
+    def _compute_decoder_reconstruction_loss(self, z_source, xbatch_source,
+            z_target, xbatch_target):
+        target_source = self.net.get_decoder_target(xbatch_source).detach()
+        target_target = self.net.get_decoder_target(xbatch_target).detach()
+
+        recon_source = self.net.decode(z_source)
+        recon_target = self.net.decode(z_target)
+
+        loss_recon_source = torch.nn.functional.mse_loss(
+            recon_source, target_source)
+        loss_recon_target = torch.nn.functional.mse_loss(
+            recon_target, target_target)
+        loss_recon = loss_recon_source + loss_recon_target
+
+        return loss_recon, loss_recon_source, loss_recon_target
 
     def _build_optimizer_for_params(self, params, lr):
         if len(params) == 0:
@@ -583,6 +665,7 @@ class NN(CardinalityEstimationAlg):
                 if param.requires_grad]
 
         discriminator_params = [p for n, p in named_params if n.startswith("discriminator.")]
+        decoder_params = [p for n, p in named_params if n.startswith("decoder.")]
         regressor_params = [p for n, p in named_params
                 if n.startswith("out_mlp2.") and not n.startswith("discriminator.")]
         encoder_params = [p for n, p in named_params
@@ -605,11 +688,65 @@ class NN(CardinalityEstimationAlg):
         gen_lr = getattr(self, "adv_generator_lr", self.lr)
 
         self.opt_regression = self._build_optimizer_for_params(
-            encoder_params + regressor_params, reg_lr)
+            encoder_params + regressor_params + decoder_params, reg_lr)
         self.opt_discriminator = self._build_optimizer_for_params(
             discriminator_params, disc_lr)
         self.opt_generator = self._build_optimizer_for_params(
             encoder_params, gen_lr)
+
+        self.optimizer = self.opt_regression
+        self.bce_loss = torch.nn.BCELoss()
+
+    def _init_latent_generator_optimizers(self):
+        named_params = [
+            (name, param) for name, param in self.net.named_parameters()
+            if param.requires_grad
+        ]
+
+        discriminator_params = [p for n, p in named_params if n.startswith("discriminator.")]
+        generator_params = [p for n, p in named_params if n.startswith("generator.")]
+        decoder_params = [p for n, p in named_params if n.startswith("decoder.")]
+        regressor_params = [
+            p for n, p in named_params
+            if n.startswith("out_mlp2.") and not n.startswith("discriminator.")
+        ]
+        encoder_params = [
+            p for n, p in named_params
+            if not n.startswith("discriminator.")
+            and not n.startswith("generator.")
+            and not n.startswith("out_mlp2.")
+            and not n.startswith("decoder.")
+        ]
+
+        if len(discriminator_params) == 0:
+            raise RuntimeError(
+                "Latent discriminator parameters were not found. "
+                "Make sure enable_discriminator is active."
+            )
+        if len(generator_params) == 0:
+            raise RuntimeError(
+                "Latent generator parameters were not found. "
+                "Make sure enable_generator is active."
+            )
+        if len(regressor_params) == 0:
+            raise RuntimeError("Regressor parameters (out_mlp2.*) were not found.")
+        if len(encoder_params) == 0:
+            raise RuntimeError("Encoder parameters were not found.")
+
+        reg_lr = getattr(self, "adv_regression_lr", self.lr)
+        disc_lr = getattr(self, "adv_discriminator_lr", self.lr)
+        # Per request: generator learning rate matches discriminator learning rate.
+        gen_lr = disc_lr
+
+        self.opt_regression = self._build_optimizer_for_params(
+            encoder_params + regressor_params + decoder_params, reg_lr
+        )
+        self.opt_discriminator = self._build_optimizer_for_params(
+            discriminator_params, disc_lr
+        )
+        self.opt_latent_generator = self._build_optimizer_for_params(
+            generator_params, gen_lr
+        )
 
         self.optimizer = self.opt_regression
         self.bce_loss = torch.nn.BCELoss()
@@ -658,6 +795,8 @@ class NN(CardinalityEstimationAlg):
 
         epochs = np.arange(len(self.adversarial_train_history))
         reg_loss = [m["loss_reg"] for m in self.adversarial_train_history]
+        recon_loss = [m.get("loss_recon", np.nan) for m in self.adversarial_train_history]
+        phase1_loss = [m.get("loss_phase1", np.nan) for m in self.adversarial_train_history]
         disc_loss = [m["loss_d"] for m in self.adversarial_train_history]
         gen_loss = [m["loss_g"] for m in self.adversarial_train_history]
         val_loss = [m.get("val_loss", np.nan) for m in self.adversarial_train_history]
@@ -669,10 +808,21 @@ class NN(CardinalityEstimationAlg):
         fig, axes = plt.subplots(1, 2, figsize=(12, 4))
 
         axes[0].plot(epochs, reg_loss, label="Regression Loss")
+        if np.isfinite(np.asarray(recon_loss)).any():
+            axes[0].plot(epochs, recon_loss, label="Reconstruction Loss")
+        if np.isfinite(np.asarray(phase1_loss)).any():
+            axes[0].plot(epochs, phase1_loss, label="Phase 1 Total Loss")
         axes[0].plot(epochs, disc_loss, label="Discriminator Loss")
         axes[0].plot(epochs, gen_loss, label="Generator Loss")
         if np.isfinite(np.asarray(val_loss)).any():
-            axes[0].plot(epochs, val_loss, label="Validation Loss")
+            axes[0].plot(
+                epochs,
+                val_loss,
+                label="Validation Loss",
+                linestyle="--",
+                marker="o",
+                markersize=3,
+            )
         axes[0].set_title("Adversarial Training Losses")
         axes[0].set_xlabel("Epoch")
         axes[0].set_ylabel("Loss")
@@ -699,6 +849,8 @@ class NN(CardinalityEstimationAlg):
     def train_one_epoch_with_new_discriminator(self, target_loader):
         start = time.time()
         reg_losses = []
+        recon_losses = []
+        phase1_losses = []
         disc_losses = []
         gen_losses = []
         disc_accs = []
@@ -737,8 +889,14 @@ class NN(CardinalityEstimationAlg):
 
             # Phase 1: regression on source only.
             self.opt_regression.zero_grad()
-            if self.subplan_level_outputs:
+            if self._decoder_loss_enabled():
+                pred_source, z_source = self.net.forward_with_latent(xbatch_source)
+                _, z_target = self.net.forward_with_latent(xbatch_target)
+                pred = pred_source.squeeze(1)
+            else:
                 pred = self.net(xbatch_source).squeeze(1)
+
+            if self.subplan_level_outputs:
                 idxs = torch.zeros(pred.shape, dtype=torch.bool)
                 for i, nt in enumerate(info_source["num_tables"]):
                     if nt >= 10:
@@ -746,11 +904,16 @@ class NN(CardinalityEstimationAlg):
                     nt -= 1
                     idxs[i, nt] = True
                 pred = pred[idxs]
-            else:
-                pred = self.net(xbatch_source).squeeze(1)
 
             loss_reg = self._compute_regression_loss(pred, ybatch_source, info_source)
-            loss_reg.backward()
+            loss_recon = torch.tensor(0.0, device=device)
+            if self._decoder_loss_enabled():
+                loss_recon, _, _ = self._compute_decoder_reconstruction_loss(
+                    z_source, xbatch_source, z_target, xbatch_target)
+
+            decoder_loss_weight = getattr(self, "decoder_loss_weight", 1.0)
+            phase1_loss = loss_reg + (decoder_loss_weight * loss_recon)
+            phase1_loss.backward()
             if self.clip_gradient is not None:
                 clip_grad_norm_(
                     self.opt_regression.param_groups[0]["params"],
@@ -812,6 +975,8 @@ class NN(CardinalityEstimationAlg):
                 fool_acc = (pred_target_gen >= 0.5).float().mean().item()
 
             reg_losses.append(loss_reg.item())
+            recon_losses.append(loss_recon.item())
+            phase1_losses.append(phase1_loss.item())
             disc_losses.append(loss_d.item())
             gen_losses.append(loss_g.item())
             disc_accs.append(disc_acc)
@@ -826,6 +991,122 @@ class NN(CardinalityEstimationAlg):
             "disc_acc": float(np.mean(disc_accs)) if len(disc_accs) > 0 else 0.0,
             "disc_acc_source": float(np.mean(disc_acc_source)) if len(disc_acc_source) > 0 else 0.0,
             "disc_acc_target": float(np.mean(disc_acc_target)) if len(disc_acc_target) > 0 else 0.0,
+            "gen_fool_acc": float(np.mean(gen_fool_accs)) if len(gen_fool_accs) > 0 else 0.0,
+            "epoch_seconds": round(time.time() - start, 2),
+        }
+        return metrics
+
+    def train_one_epoch_with_latent_generator(self):
+        start = time.time()
+        reg_losses = []
+        recon_losses = []
+        phase1_losses = []
+        disc_losses = []
+        gen_losses = []
+        disc_accs = []
+        disc_acc_source = []
+        disc_acc_fake = []
+        gen_fool_accs = []
+
+        for _, (xbatch_source, ybatch_source, info_source) in enumerate(self.trainloader):
+            ybatch_source = ybatch_source.to(device, non_blocking=True)
+            current_batch_size = ybatch_source.shape[0]
+            if current_batch_size <= 0:
+                continue
+
+            xbatch_source = self._slice_batch_inputs(xbatch_source, current_batch_size)
+            ybatch_source = ybatch_source[:current_batch_size]
+            info_source = self._slice_batch_info(info_source, current_batch_size)
+
+            xbatch_source = self._apply_training_batch_transforms(xbatch_source)
+
+            # Phase 1: regression on source only.
+            self.opt_regression.zero_grad()
+            if self.subplan_level_outputs:
+                pred = self.net(xbatch_source).squeeze(1)
+                idxs = torch.zeros(pred.shape, dtype=torch.bool)
+                for i, nt in enumerate(info_source["num_tables"]):
+                    if nt >= 10:
+                        nt = 10
+                    nt -= 1
+                    idxs[i, nt] = True
+                pred = pred[idxs]
+            else:
+                pred = self.net(xbatch_source).squeeze(1)
+
+            loss_reg = self._compute_regression_loss(pred, ybatch_source, info_source)
+            loss_reg.backward()
+            if self.clip_gradient is not None:
+                clip_grad_norm_(
+                    self.opt_regression.param_groups[0]["params"],
+                    self.clip_gradient,
+                )
+            self.opt_regression.step()
+
+            # Phase 2: train discriminator on source vs generated fake target.
+            self.opt_discriminator.zero_grad()
+            _, z_source_det = self.net.forward_with_latent(xbatch_source)
+            z_source_det = z_source_det.detach()
+
+            noise_det = self.net.sample_noise(current_batch_size, device_override=z_source_det.device)
+            z_fake_det = self.net.generate(noise_det).detach()
+
+            labels_source = torch.ones(current_batch_size, 1, device=device)
+            labels_fake = torch.zeros(current_batch_size, 1, device=device)
+
+            pred_source_disc = self.net.discriminate(z_source_det)
+            pred_fake_disc = self.net.discriminate(z_fake_det)
+
+            loss_d_source = self.bce_loss(pred_source_disc, labels_source)
+            loss_d_fake = self.bce_loss(pred_fake_disc, labels_fake)
+            loss_d = 0.5 * (loss_d_source + loss_d_fake)
+            loss_d.backward()
+            self.opt_discriminator.step()
+
+            # Phase 3: train generator only to fool discriminator.
+            self.opt_latent_generator.zero_grad()
+            noise_gen = self.net.sample_noise(current_batch_size, device_override=z_source_det.device)
+            z_fake_gen = self.net.generate(noise_gen)
+            trick_labels = torch.ones(current_batch_size, 1, device=device)
+            pred_fake_gen = self.net.discriminate(z_fake_gen)
+            loss_g = self.bce_loss(pred_fake_gen, trick_labels)
+            loss_g.backward()
+            if self.clip_gradient is not None:
+                clip_grad_norm_(
+                    self.opt_latent_generator.param_groups[0]["params"],
+                    self.clip_gradient,
+                )
+            self.opt_latent_generator.step()
+
+            with torch.no_grad():
+                disc_pred_source_cls = (pred_source_disc >= 0.5).float()
+                disc_pred_fake_cls = (pred_fake_disc >= 0.5).float()
+                source_acc = (disc_pred_source_cls == labels_source).float().mean().item()
+                fake_acc = (disc_pred_fake_cls == labels_fake).float().mean().item()
+                combined_preds = torch.cat([disc_pred_source_cls, disc_pred_fake_cls], dim=0)
+                combined_labels = torch.cat([labels_source, labels_fake], dim=0)
+                disc_acc = (combined_preds == combined_labels).float().mean().item()
+                fool_acc = (pred_fake_gen >= 0.5).float().mean().item()
+
+            reg_losses.append(loss_reg.item())
+            disc_losses.append(loss_d.item())
+            gen_losses.append(loss_g.item())
+            disc_accs.append(disc_acc)
+            disc_acc_source.append(source_acc)
+            disc_acc_fake.append(fake_acc)
+            gen_fool_accs.append(fool_acc)
+
+        metrics = {
+            "loss_reg": float(np.mean(reg_losses)) if len(reg_losses) > 0 else 0.0,
+            "loss_recon": float(np.mean(recon_losses)) if len(recon_losses) > 0 else 0.0,
+            "loss_phase1": float(np.mean(phase1_losses)) if len(phase1_losses) > 0 else 0.0,
+            "loss_d": float(np.mean(disc_losses)) if len(disc_losses) > 0 else 0.0,
+            "loss_g": float(np.mean(gen_losses)) if len(gen_losses) > 0 else 0.0,
+            "disc_acc": float(np.mean(disc_accs)) if len(disc_accs) > 0 else 0.0,
+            "disc_acc_source": float(np.mean(disc_acc_source)) if len(disc_acc_source) > 0 else 0.0,
+            "disc_acc_fake": float(np.mean(disc_acc_fake)) if len(disc_acc_fake) > 0 else 0.0,
+            # Keep existing key so plotting/reporting stays compatible.
+            "disc_acc_target": float(np.mean(disc_acc_fake)) if len(disc_acc_fake) > 0 else 0.0,
             "gen_fool_acc": float(np.mean(gen_fool_accs)) if len(gen_fool_accs) > 0 else 0.0,
             "epoch_seconds": round(time.time() - start, 2),
         }
@@ -1280,10 +1561,12 @@ class NN(CardinalityEstimationAlg):
 
             if self.epoch % 2 == 0:
                 print(
-                    "Epoch {} took {}s, reg_loss={}, disc_loss={}, gen_loss={}, disc_acc={}, source_acc={}, target_acc={}, fool_acc={}, val_loss={}".format(
+                    "Epoch {} took {}s, reg_loss={}, recon_loss={}, phase1_loss={}, disc_loss={}, gen_loss={}, disc_acc={}, source_acc={}, target_acc={}, fool_acc={}, val_loss={}".format(
                         self.epoch,
                         epoch_metrics["epoch_seconds"],
                         round(epoch_metrics["loss_reg"], 6),
+                        round(epoch_metrics.get("loss_recon", 0.0), 6),
+                        round(epoch_metrics.get("loss_phase1", epoch_metrics["loss_reg"]), 6),
                         round(epoch_metrics["loss_d"], 6),
                         round(epoch_metrics["loss_g"], 6),
                         round(epoch_metrics["disc_acc"], 6),
@@ -1302,6 +1585,267 @@ class NN(CardinalityEstimationAlg):
                     "Adv-Disc-Acc": epoch_metrics["disc_acc"],
                     "Adv-Disc-Source-Acc": epoch_metrics["disc_acc_source"],
                     "Adv-Disc-Target-Acc": epoch_metrics["disc_acc_target"],
+                    "Adv-Gen-Fool-Acc": epoch_metrics["gen_fool_acc"],
+                    "epoch": self.epoch,
+                }
+                if "val_loss" in epoch_metrics:
+                    wandb_payload["ValLoss"] = epoch_metrics["val_loss"]
+                wandb.log(wandb_payload)
+
+            if self.early_stopping == 1:
+                if "val" in self.eval_ds:
+                    ds = self.eval_ds["val"]
+                else:
+                    ds = self.eval_ds["train"]
+
+                preds, ys = self._eval_ds(ds)
+                losses = self.loss_func(torch.from_numpy(preds), torch.from_numpy(ys))
+                eploss = torch.mean(losses).item()
+                if len(eplosses) >= 1:
+                    pct = 100 * ((eploss - eplosses[-1]) / eplosses[-1])
+                    pct_chngs.append(pct)
+
+                eplosses.append(eploss)
+                if len(pct_chngs) > 5:
+                    trailing_chng = np.mean(pct_chngs[-5:-1])
+                    if trailing_chng > -0.1:
+                        print("Going to exit training at epoch: ", self.epoch)
+                        break
+
+            elif self.early_stopping == 2:
+                self.periodic_eval()
+                ppc_rel = self.all_errs[-1]["PostgresPlanCost-C-Relative-val"]
+
+                if len(eplosses) >= 1:
+                    pct = 100 * ((ppc_rel - eplosses[-1]) / eplosses[-1])
+                    pct_chngs.append(pct)
+
+                eplosses.append(ppc_rel)
+
+                if self.epoch > 2 and pct_chngs[-1] > 1:
+                    print(eplosses)
+                    print(pct_chngs)
+                    print("Going to exit training at epoch: ", self.epoch)
+                    self.best_model_epoch = self.epoch - 1
+                    break
+
+        if self.best_model_epoch != -1:
+            print("training done, will update our model based on validation set")
+            assert len(self.model_weights) > 0
+            self.net.load_state_dict(self.model_weights[self.best_model_epoch])
+
+        adv_plot_path = self._save_adversarial_training_plot(run_plot_dir)
+        if adv_plot_path is not None:
+            print("Saved adversarial training plot to:", adv_plot_path)
+
+        self.save_model(save_dir="./saved_models", suffix_name="_epoch" + str(self.epoch))
+
+    def train_with_latent_generator(self, training_samples, **kwargs):
+        self.all_errs = []
+        self.best_model_epoch = -1
+        self.model_weights = []
+        self.adv_weights = None
+        self.adv_weight_level = kwargs.get("adv_weight_level", "dataset")
+        self.adversarial_train_history = []
+
+        if self.loss_func_name == "flowloss" or self.load_query_together:
+            raise RuntimeError(
+                "train_with_latent_generator currently supports non-flowloss training only."
+            )
+
+        self.true_costs = {}
+        self.true_costs["val"] = 0.0
+        self.true_costs["test"] = 0.0
+
+        assert isinstance(training_samples[0], dict)
+        self.featurizer = kwargs["featurizer"]
+        self.training_samples = training_samples
+
+        self.seen_subplans = set()
+        for sample in training_samples:
+            for node in sample["subset_graph"].nodes():
+                self.seen_subplans.add(str(node))
+
+        if "subplan_mask" in kwargs:
+            subplan_mask = kwargs["subplan_mask"]
+        else:
+            subplan_mask = None
+
+        self.trainds = self.init_dataset(
+            training_samples,
+            self.load_query_together,
+            max_num_tables=self.max_num_tables,
+            load_padded_mscn_feats=self.load_padded_mscn_feats,
+            subplan_mask=subplan_mask,
+        )
+
+        if "adv_weights" in kwargs and kwargs["adv_weights"] is not None:
+            self.adv_weights = np.asarray(kwargs["adv_weights"], dtype=np.float32)
+            if self.adv_weight_level == "dataset":
+                expected = len(self.trainds)
+            elif self.adv_weight_level == "query":
+                expected = len(training_samples)
+            else:
+                raise ValueError(f"Unsupported adv_weight_level: {self.adv_weight_level}")
+
+            if len(self.adv_weights) != expected:
+                raise ValueError(
+                    f"Expected {expected} adversarial weights for level "
+                    f"{self.adv_weight_level}, got {len(self.adv_weights)}"
+                )
+
+        self.trainloader = data.DataLoader(
+            self.trainds,
+            batch_size=self.mb_size,
+            shuffle=True,
+            collate_fn=self.collate_fn,
+        )
+
+        self.eval_ds = {}
+        self.samples = {}
+
+        if self.eval_epoch < self.max_epochs:
+            if "valqs" in kwargs and len(kwargs["valqs"]) > 0:
+                self.eval_ds["val"] = self.init_dataset(
+                    kwargs["valqs"], False,
+                    load_padded_mscn_feats=self.load_padded_mscn_feats,
+                )
+                self.samples["val"] = kwargs["valqs"]
+
+            if "testqs" in kwargs and len(kwargs["testqs"]) > 0:
+                if len(kwargs["testqs"]) > 400:
+                    ns = int(len(kwargs["testqs"]) / 10)
+                    random.seed(42)
+                    testqs = random.sample(kwargs["testqs"], ns)
+                else:
+                    testqs = kwargs["testqs"]
+
+                self.eval_ds["test"] = self.init_dataset(
+                    testqs, False,
+                    load_padded_mscn_feats=self.load_padded_mscn_feats,
+                )
+                self.samples["test"] = testqs
+
+            if "evalqs" in kwargs and len(kwargs["eval_qdirs"]) > 0:
+                eval_qdirs = kwargs["eval_qdirs"]
+                for ei, cur_evalqs in enumerate(kwargs["evalqs"]):
+                    evalqname = eval_qdirs[ei]
+                    if "job" in evalqname:
+                        evalqname = "JOB"
+                        print("Going to remove JOB Q29 from evaluation because it takes too long for computing PPC")
+                        cur_evalqs = [q for q in cur_evalqs if "29" not in q["name"]]
+                    elif "imdb" in evalqname:
+                        group_evalqs = [q for q in cur_evalqs if "group" in q["sql"].lower()]
+                        not_group_evalqs = [q for q in cur_evalqs if "group" not in q["sql"].lower()]
+                        gqname = "CEB-IMDb-Complex"
+                        not_gqname = "CEB-IMDb-NoGroupNoLike"
+                        self.eval_ds[gqname] = self.init_dataset(
+                            group_evalqs, False,
+                            load_padded_mscn_feats=self.load_padded_mscn_feats,
+                        )
+                        self.true_costs[gqname] = 0.0
+                        self.samples[gqname] = group_evalqs
+
+                        self.eval_ds[not_gqname] = self.init_dataset(
+                            not_group_evalqs, False,
+                            load_padded_mscn_feats=self.load_padded_mscn_feats,
+                        )
+                        self.true_costs[not_gqname] = 0.0
+                        self.samples[not_gqname] = not_group_evalqs
+                        continue
+                    elif "stats" in evalqname:
+                        evalqname = "Stats-CEB"
+
+                    print("{}, num eval queries: {}".format(evalqname, len(cur_evalqs)))
+                    if len(cur_evalqs) == 0:
+                        continue
+
+                    self.eval_ds[evalqname] = self.init_dataset(
+                        cur_evalqs, False,
+                        load_padded_mscn_feats=self.load_padded_mscn_feats,
+                    )
+                    self.true_costs[evalqname] = 0.0
+                    self.samples[evalqname] = cur_evalqs
+
+        self.net, self.optimizer = self.init_net(self.trainds[0])
+        if not hasattr(self.net, "forward_with_latent") or \
+                not hasattr(self.net, "discriminate") or \
+                not hasattr(self.net, "generate"):
+            raise RuntimeError(
+                "train_with_latent_generator requires an MSCN-style network "
+                "with forward_with_latent(), discriminate(), and generate()."
+            )
+
+        self._ensure_latent_discriminator_ready()
+        self._ensure_latent_generator_ready()
+        self._init_latent_generator_optimizers()
+
+        if self.training_opt == "swa":
+            raise RuntimeError(
+                "SWA training is not supported in train_with_latent_generator."
+            )
+
+        run_result_dir = kwargs.get("result_dir", "./results")
+        run_plot_dir = os.path.join(run_result_dir, self.get_exp_name())
+
+        model_size = self.num_parameters()
+        print(
+            "Training samples: {}, Model size: {}".format(
+                len(self.trainds), model_size
+            )
+        )
+
+        if self.max_epochs == -1:
+            total_epochs = 1000
+        else:
+            total_epochs = self.max_epochs
+
+        if self.early_stopping:
+            eplosses = []
+            pct_chngs = []
+
+        for self.epoch in range(0, total_epochs):
+            should_eval = (self.epoch % self.eval_epoch == 0)
+            if should_eval:
+                self.periodic_eval()
+
+            epoch_metrics = self.train_one_epoch_with_latent_generator()
+
+            if should_eval and "val" in self.eval_ds:
+                val_preds, val_ys = self._eval_ds(self.eval_ds["val"], self.samples["val"])
+                val_loss = self._compute_mean_loss_from_numpy(val_preds, val_ys)
+                if val_loss is not None:
+                    epoch_metrics["val_loss"] = val_loss
+
+            self.adversarial_train_history.append(epoch_metrics)
+            self.model_weights.append(copy.deepcopy(self.net.state_dict()))
+
+            if self.epoch % 2 == 0:
+                print(
+                    "Epoch {} took {}s, reg_loss={}, disc_loss={}, gen_loss={}, disc_acc={}, source_acc={}, fake_acc={}, fool_acc={}, val_loss={}".format(
+                        self.epoch,
+                        epoch_metrics["epoch_seconds"],
+                        round(epoch_metrics["loss_reg"], 6),
+                        round(epoch_metrics["loss_d"], 6),
+                        round(epoch_metrics["loss_g"], 6),
+                        round(epoch_metrics["disc_acc"], 6),
+                        round(epoch_metrics["disc_acc_source"], 6),
+                        round(epoch_metrics["disc_acc_fake"], 6),
+                        round(epoch_metrics["gen_fool_acc"], 6),
+                        round(epoch_metrics.get("val_loss", float("nan")), 6),
+                    )
+                )
+
+            if self.use_wandb:
+                wandb_payload = {
+                    "TrainLoss": epoch_metrics["loss_reg"],
+                    "ReconLoss": epoch_metrics.get("loss_recon", 0.0),
+                    "Phase1Loss": epoch_metrics.get("loss_phase1", epoch_metrics["loss_reg"]),
+                    "Adv-Loss-D": epoch_metrics["loss_d"],
+                    "Adv-Loss-G": epoch_metrics["loss_g"],
+                    "Adv-Disc-Acc": epoch_metrics["disc_acc"],
+                    "Adv-Disc-Source-Acc": epoch_metrics["disc_acc_source"],
+                    "Adv-Disc-Fake-Acc": epoch_metrics["disc_acc_fake"],
                     "Adv-Gen-Fool-Acc": epoch_metrics["gen_fool_acc"],
                     "epoch": self.epoch,
                 }
