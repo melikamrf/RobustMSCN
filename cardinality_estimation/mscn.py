@@ -28,7 +28,7 @@ class MSCN(NN):
             )
 
         output_dim = 0
-        for key in ["table", "pred", "join", "flow"]:
+        for key in ["table", "pred", "join", "flow", "tmask", "pmask", "jmask"]:
             output_dim += int(sample_x[key].numel())
         return output_dim
 
@@ -142,7 +142,7 @@ class MSCN_JoinKeyCards(NN):
             )
 
         output_dim = 0
-        for key in ["table", "pred", "join", "flow"]:
+        for key in ["table", "pred", "join", "flow", "tmask", "pmask", "jmask"]:
             output_dim += int(sample_x[key].numel())
         return output_dim
 

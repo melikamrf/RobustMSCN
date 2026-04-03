@@ -805,15 +805,13 @@ class NN(CardinalityEstimationAlg):
         target_acc = [m["disc_acc_target"] for m in self.adversarial_train_history]
         fool_acc = [m["gen_fool_acc"] for m in self.adversarial_train_history]
 
-        fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+        fig, axes = plt.subplots(1, 3, figsize=(18, 4))
 
         axes[0].plot(epochs, reg_loss, label="Regression Loss")
         if np.isfinite(np.asarray(recon_loss)).any():
             axes[0].plot(epochs, recon_loss, label="Reconstruction Loss")
         if np.isfinite(np.asarray(phase1_loss)).any():
             axes[0].plot(epochs, phase1_loss, label="Phase 1 Total Loss")
-        axes[0].plot(epochs, disc_loss, label="Discriminator Loss")
-        axes[0].plot(epochs, gen_loss, label="Generator Loss")
         if np.isfinite(np.asarray(val_loss)).any():
             axes[0].plot(
                 epochs,
@@ -823,22 +821,30 @@ class NN(CardinalityEstimationAlg):
                 marker="o",
                 markersize=3,
             )
-        axes[0].set_title("Adversarial Training Losses")
+        axes[0].set_title("Regression And Reconstruction")
         axes[0].set_xlabel("Epoch")
         axes[0].set_ylabel("Loss")
         axes[0].grid(True, alpha=0.3)
         axes[0].legend()
 
-        axes[1].plot(epochs, disc_acc, label="Disc Acc")
-        axes[1].plot(epochs, source_acc, label="Source Acc")
-        axes[1].plot(epochs, target_acc, label="Target Acc")
-        axes[1].plot(epochs, fool_acc, label="Fool Acc")
-        axes[1].set_title("Adversarial Training Accuracy")
+        axes[1].plot(epochs, disc_loss, label="Discriminator Loss")
+        axes[1].plot(epochs, gen_loss, label="Generator Loss")
+        axes[1].set_title("Adversarial Losses")
         axes[1].set_xlabel("Epoch")
-        axes[1].set_ylabel("Accuracy")
-        axes[1].set_ylim(0.0, 1.0)
+        axes[1].set_ylabel("Loss")
         axes[1].grid(True, alpha=0.3)
         axes[1].legend()
+
+        axes[2].plot(epochs, disc_acc, label="Disc Acc")
+        axes[2].plot(epochs, source_acc, label="Source Acc")
+        axes[2].plot(epochs, target_acc, label="Target Acc")
+        axes[2].plot(epochs, fool_acc, label="Fool Acc")
+        axes[2].set_title("Adversarial Accuracy")
+        axes[2].set_xlabel("Epoch")
+        axes[2].set_ylabel("Accuracy")
+        axes[2].set_ylim(0.0, 1.0)
+        axes[2].grid(True, alpha=0.3)
+        axes[2].legend()
 
         plt.tight_layout()
         plot_path = os.path.join(save_dir, "adversarial_training_curves.png")
@@ -908,6 +914,7 @@ class NN(CardinalityEstimationAlg):
             loss_reg = self._compute_regression_loss(pred, ybatch_source, info_source)
             loss_recon = torch.tensor(0.0, device=device)
             if self._decoder_loss_enabled():
+                print("Computing decoder reconstruction loss...")
                 loss_recon, _, _ = self._compute_decoder_reconstruction_loss(
                     z_source, xbatch_source, z_target, xbatch_target)
 
@@ -944,7 +951,7 @@ class NN(CardinalityEstimationAlg):
 
             # Phase 3: train encoder to fool discriminator on target.
             # Run this multiple times (e.g., 2) to let the generator catch up!
-            for _ in range(2):
+            for _ in range(4):
                 self.opt_generator.zero_grad()
                 
                 # Forward pass to get the latent vector

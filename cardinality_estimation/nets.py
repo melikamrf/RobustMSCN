@@ -360,7 +360,7 @@ class SetConv(nn.Module):
 
     def get_decoder_target(self, xbatch):
         flat_inputs = []
-        for key in ["table", "pred", "join"]:
+        for key in ["table", "pred", "join", "tmask", "pmask", "jmask"]:
             feats = xbatch[key].to(device, non_blocking=True)
             flat_inputs.append(feats.reshape(feats.shape[0], -1))
 
@@ -712,7 +712,7 @@ class SetConvFlow(nn.Module):
 
     def get_decoder_target(self, xbatch):
         flat_inputs = []
-        for key in ["table", "pred", "join"]:
+        for key in ["table", "pred", "join", "tmask", "pmask", "jmask"]:
             feats = xbatch[key].to(device, non_blocking=True)
             flat_inputs.append(feats.reshape(feats.shape[0], -1))
 

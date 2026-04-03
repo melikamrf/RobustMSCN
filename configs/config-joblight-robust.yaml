@@ -113,7 +113,7 @@ model:
   normalize_flow_loss : 1
 
   # important training / optimization flags
-  max_epochs : 10
+  max_epochs : 100
   eval_epoch : 2 # how often to evaluate on eval_fns during training
   eval_fns : "qerr,ppc" # logging things during training
   lr : 0.0001
@@ -137,7 +137,7 @@ model:
   generator_hidden_dims : null
   generator_dropout : 0.1
   adv_regression_lr : 0.001
-  adv_discriminator_lr : 0.0001
+  adv_discriminator_lr : 0.00001
   adv_generator_lr : 0.0001
 
   cost_model : "C"
