@@ -930,72 +930,82 @@ class NN(CardinalityEstimationAlg):
             self.opt_regression.step()
 
             # Phase 2: train discriminator (source vs target).
-            train_disc = (batch_idx % 2 == 0)
-            if train_disc:
-                self.opt_discriminator.zero_grad()
-                _, z_source_det = self.net.forward_with_latent(xbatch_source)
-                _, z_target_det = self.net.forward_with_latent(xbatch_target)
-                z_source_det = z_source_det.detach()
-                z_target_det = z_target_det.detach()
+            if self.epoch < getattr(self, "discriminator_warmup_epochs", 0):
+                train_disc = (batch_idx % 2 == 0)
+                if train_disc:
+                    self.opt_discriminator.zero_grad()
+                    _, z_source_det = self.net.forward_with_latent(xbatch_source)
+                    _, z_target_det = self.net.forward_with_latent(xbatch_target)
+                    z_source_det = z_source_det.detach()
+                    z_target_det = z_target_det.detach()
 
-                #Label smoothing          
-                labels_source = torch.full((current_batch_size, 1), 0.9, device=device)
-                labels_target = torch.full((current_batch_size, 1), 0.1, device=device)
-                #labels_source = torch.ones(current_batch_size, 1, device=device)
-                #labels_target = torch.zeros(current_batch_size, 1, device=device)
+                    #Label smoothing          
+                    labels_source = torch.full((current_batch_size, 1), 0.9, device=device)
+                    labels_target = torch.full((current_batch_size, 1), 0.1, device=device)
+                    #labels_source = torch.ones(current_batch_size, 1, device=device)
+                    #labels_target = torch.zeros(current_batch_size, 1, device=device)
 
-                pred_source_disc = self.net.discriminate(z_source_det)
-                pred_target_disc = self.net.discriminate(z_target_det)
+                    pred_source_disc = self.net.discriminate(z_source_det)
+                    pred_target_disc = self.net.discriminate(z_target_det)
 
-                loss_d_source = self.bce_loss(pred_source_disc, labels_source)
-                loss_d_target = self.bce_loss(pred_target_disc, labels_target)
-                loss_d = 0.5 * (loss_d_source + loss_d_target)
-                loss_d.backward()
-                self.opt_discriminator.step()
+                    loss_d_source = self.bce_loss(pred_source_disc, labels_source)
+                    loss_d_target = self.bce_loss(pred_target_disc, labels_target)
+                    loss_d = 0.5 * (loss_d_source + loss_d_target)
+                    loss_d.backward()
+                    self.opt_discriminator.step()
 
 
-            # Phase 3: train encoder to fool discriminator on target.
-            # Run this multiple times (e.g., 2) to let the generator catch up!
-            for _ in range(1):
-                self.opt_generator.zero_grad()
-                
-                # Forward pass to get the latent vector
-                _, z_target_gen = self.net.forward_with_latent(xbatch_target)
-                
-                # Trick labels (1.0)
-                trick_labels = torch.ones(current_batch_size, 1, device=device)
-                pred_target_gen = self.net.discriminate(z_target_gen)
-                
-                loss_g = self.bce_loss(pred_target_gen, trick_labels)
-                #loss_g = lambda_adv * self.bce_loss(pred_target_gen, trick_labels)
-                loss_g.backward()
-                
-                if self.clip_gradient is not None:
-                    clip_grad_norm_(
-                        self.opt_generator.param_groups[0]["params"],
-                        self.clip_gradient,
-                    )
-                self.opt_generator.step()
+                # Phase 3: train encoder to fool discriminator on target.
+                # Run this multiple times (e.g., 2) to let the generator catch up!
+                for _ in range(1):
+                    self.opt_generator.zero_grad()
+                    
+                    # Forward pass to get the latent vector
+                    _, z_target_gen = self.net.forward_with_latent(xbatch_target)
+                    
+                    # Trick labels (1.0)
+                    trick_labels = torch.ones(current_batch_size, 1, device=device)
+                    pred_target_gen = self.net.discriminate(z_target_gen)
+                    
+                    loss_g = self.bce_loss(pred_target_gen, trick_labels)
+                    #loss_g = lambda_adv * self.bce_loss(pred_target_gen, trick_labels)
+                    loss_g.backward()
+                    
+                    if self.clip_gradient is not None:
+                        clip_grad_norm_(
+                            self.opt_generator.param_groups[0]["params"],
+                            self.clip_gradient,
+                        )
+                    self.opt_generator.step()
 
-            with torch.no_grad():
-                disc_pred_source_cls = (pred_source_disc >= 0.5).float()
-                disc_pred_target_cls = (pred_target_disc >= 0.5).float()
-                source_acc = (disc_pred_source_cls == labels_source).float().mean().item()
-                target_acc = (disc_pred_target_cls == labels_target).float().mean().item()
-                combined_preds = torch.cat([disc_pred_source_cls, disc_pred_target_cls], dim=0)
-                combined_labels = torch.cat([labels_source, labels_target], dim=0)
-                disc_acc = (combined_preds == combined_labels).float().mean().item()
-                fool_acc = (pred_target_gen >= 0.5).float().mean().item()
+                with torch.no_grad():
+                    disc_pred_source_cls = (pred_source_disc >= 0.5).float()
+                    disc_pred_target_cls = (pred_target_disc >= 0.5).float()
+                    # Compare against hard 1.0 and 0.0 for accurate logging, ignoring the 0.9/0.1 smoothing
+                    hard_labels_source = torch.ones_like(labels_source)
+                    hard_labels_target = torch.zeros_like(labels_target)
+                    
+                    source_acc = (disc_pred_source_cls == hard_labels_source).float().mean().item()
+                    target_acc = (disc_pred_target_cls == hard_labels_target).float().mean().item()
+                    
 
+                    combined_preds = torch.cat([disc_pred_source_cls, disc_pred_target_cls], dim=0)
+                    #combined_labels = torch.cat([labels_source, labels_target], dim=0)
+                    combined_labels = torch.cat([hard_labels_source, hard_labels_target], dim=0)
+
+                    disc_acc = (combined_preds == combined_labels).float().mean().item()
+                    fool_acc = (pred_target_gen >= 0.5).float().mean().item()
+
+            
+                disc_losses.append(loss_d.item())
+                gen_losses.append(loss_g.item())
+                disc_accs.append(disc_acc)
+                disc_acc_source.append(source_acc)
+                disc_acc_target.append(target_acc)
+                gen_fool_accs.append(fool_acc)
             reg_losses.append(loss_reg.item())
             recon_losses.append(loss_recon.item())
             phase1_losses.append(phase1_loss.item())
-            disc_losses.append(loss_d.item())
-            gen_losses.append(loss_g.item())
-            disc_accs.append(disc_acc)
-            disc_acc_source.append(source_acc)
-            disc_acc_target.append(target_acc)
-            gen_fool_accs.append(fool_acc)
 
         metrics = {
             "loss_reg": float(np.mean(reg_losses)) if len(reg_losses) > 0 else 0.0,
