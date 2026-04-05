@@ -930,7 +930,7 @@ class NN(CardinalityEstimationAlg):
             self.opt_regression.step()
 
             # Phase 2: train discriminator (source vs target).
-            if self.epoch < getattr(self, "discriminator_warmup_epochs", 0):
+            if self.epoch > getattr(self, "discriminator_warmup_epochs", 5):
                 train_disc = (batch_idx % 2 == 0)
                 if train_disc:
                     self.opt_discriminator.zero_grad()
@@ -967,8 +967,8 @@ class NN(CardinalityEstimationAlg):
                     trick_labels = torch.ones(current_batch_size, 1, device=device)
                     pred_target_gen = self.net.discriminate(z_target_gen)
                     
-                    loss_g = self.bce_loss(pred_target_gen, trick_labels)
-                    #loss_g = lambda_adv * self.bce_loss(pred_target_gen, trick_labels)
+                    #loss_g = self.bce_loss(pred_target_gen, trick_labels)
+                    loss_g = lambda_adv * self.bce_loss(pred_target_gen, trick_labels)
                     loss_g.backward()
                     
                     if self.clip_gradient is not None:
