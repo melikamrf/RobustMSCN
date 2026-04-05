@@ -866,7 +866,9 @@ class NN(CardinalityEstimationAlg):
 
         target_iter = iter(target_loader)
 
-        for _, (xbatch_source, ybatch_source, info_source) in enumerate(self.trainloader):
+        lambda_adv = getattr(self, "lambda_adv", 0.01)
+        
+        for batch_idx, (xbatch_source, ybatch_source, info_source) in enumerate(self.trainloader):
             ybatch_source = ybatch_source.to(device, non_blocking=True)
 
             try:
@@ -914,7 +916,6 @@ class NN(CardinalityEstimationAlg):
             loss_reg = self._compute_regression_loss(pred, ybatch_source, info_source)
             loss_recon = torch.tensor(0.0, device=device)
             if self._decoder_loss_enabled():
-                print("Computing decoder reconstruction loss...")
                 loss_recon, _, _ = self._compute_decoder_reconstruction_loss(
                     z_source, xbatch_source, z_target, xbatch_target)
 
@@ -929,29 +930,33 @@ class NN(CardinalityEstimationAlg):
             self.opt_regression.step()
 
             # Phase 2: train discriminator (source vs target).
-            self.opt_discriminator.zero_grad()
-            _, z_source_det = self.net.forward_with_latent(xbatch_source)
-            _, z_target_det = self.net.forward_with_latent(xbatch_target)
-            z_source_det = z_source_det.detach()
-            z_target_det = z_target_det.detach()
+            train_disc = (batch_idx % 2 == 0)
+            if train_disc:
+                self.opt_discriminator.zero_grad()
+                _, z_source_det = self.net.forward_with_latent(xbatch_source)
+                _, z_target_det = self.net.forward_with_latent(xbatch_target)
+                z_source_det = z_source_det.detach()
+                z_target_det = z_target_det.detach()
 
-          
-            labels_source = torch.full((current_batch_size, 1), 0.9, device=device)
-            labels_target = torch.zeros(current_batch_size, 1, device=device)
+                #Label smoothing          
+                labels_source = torch.full((current_batch_size, 1), 0.9, device=device)
+                labels_target = torch.full((current_batch_size, 1), 0.1, device=device)
+                #labels_source = torch.ones(current_batch_size, 1, device=device)
+                #labels_target = torch.zeros(current_batch_size, 1, device=device)
 
-            pred_source_disc = self.net.discriminate(z_source_det)
-            pred_target_disc = self.net.discriminate(z_target_det)
+                pred_source_disc = self.net.discriminate(z_source_det)
+                pred_target_disc = self.net.discriminate(z_target_det)
 
-            loss_d_source = self.bce_loss(pred_source_disc, labels_source)
-            loss_d_target = self.bce_loss(pred_target_disc, labels_target)
-            loss_d = 0.5 * (loss_d_source + loss_d_target)
-            loss_d.backward()
-            self.opt_discriminator.step()
+                loss_d_source = self.bce_loss(pred_source_disc, labels_source)
+                loss_d_target = self.bce_loss(pred_target_disc, labels_target)
+                loss_d = 0.5 * (loss_d_source + loss_d_target)
+                loss_d.backward()
+                self.opt_discriminator.step()
 
 
             # Phase 3: train encoder to fool discriminator on target.
             # Run this multiple times (e.g., 2) to let the generator catch up!
-            for _ in range(4):
+            for _ in range(1):
                 self.opt_generator.zero_grad()
                 
                 # Forward pass to get the latent vector
@@ -962,6 +967,7 @@ class NN(CardinalityEstimationAlg):
                 pred_target_gen = self.net.discriminate(z_target_gen)
                 
                 loss_g = self.bce_loss(pred_target_gen, trick_labels)
+                #loss_g = lambda_adv * self.bce_loss(pred_target_gen, trick_labels)
                 loss_g.backward()
                 
                 if self.clip_gradient is not None:
