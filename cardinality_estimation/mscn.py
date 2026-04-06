@@ -20,17 +20,7 @@ class MSCN(NN):
         if not getattr(self, "enable_decoder", False):
             return None
 
-        if not getattr(self, "load_padded_mscn_feats", False):
-            raise RuntimeError(
-                "enable_decoder requires load_padded_mscn_feats=1 or an "
-                "explicit decoder_output_dim so the reconstruction target has "
-                "a stable size."
-            )
-
-        output_dim = 0
-        for key in ["table", "pred", "join", "flow", "tmask", "pmask", "jmask"]:
-            output_dim += int(sample_x[key].numel())
-        return output_dim
+        return None
 
     def _get_auxiliary_component_kwargs(self, sample_x):
         return {
@@ -134,17 +124,7 @@ class MSCN_JoinKeyCards(NN):
         if not getattr(self, "enable_decoder", False):
             return None
 
-        if not getattr(self, "load_padded_mscn_feats", False):
-            raise RuntimeError(
-                "enable_decoder requires load_padded_mscn_feats=1 or an "
-                "explicit decoder_output_dim so the reconstruction target has "
-                "a stable size."
-            )
-
-        output_dim = 0
-        for key in ["table", "pred", "join", "flow", "tmask", "pmask", "jmask"]:
-            output_dim += int(sample_x[key].numel())
-        return output_dim
+        return None
 
     def _get_auxiliary_component_kwargs(self, sample_x):
         return {
