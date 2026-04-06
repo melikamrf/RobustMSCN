@@ -7,8 +7,7 @@ class Decoder(nn.Module):
         super(Decoder, self).__init__()
 
         if hidden_dims is None:
-            hidden_dims = [max(input_dim * 2, input_dim),
-                    max(input_dim * 4, input_dim)]
+            hidden_dims = []
 
         dims = [input_dim] + list(hidden_dims) + [output_dim]
         layers = []

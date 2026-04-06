@@ -930,7 +930,7 @@ class NN(CardinalityEstimationAlg):
             self.opt_regression.step()
 
             # Phase 2: train discriminator (source vs target).
-            if self.epoch > getattr(self, "discriminator_warmup_epochs", 5):
+            if self.epoch >= getattr(self, "discriminator_warmup_epochs", 5):
                 train_disc = (batch_idx % 2 == 0)
                 if train_disc:
                     self.opt_discriminator.zero_grad()
@@ -940,10 +940,10 @@ class NN(CardinalityEstimationAlg):
                     z_target_det = z_target_det.detach()
 
                     #Label smoothing          
-                    labels_source = torch.full((current_batch_size, 1), 0.9, device=device)
-                    labels_target = torch.full((current_batch_size, 1), 0.1, device=device)
-                    #labels_source = torch.ones(current_batch_size, 1, device=device)
-                    #labels_target = torch.zeros(current_batch_size, 1, device=device)
+                    # labels_source = torch.full((current_batch_size, 1), 0.9, device=device)
+                    # labels_target = torch.full((current_batch_size, 1), 0.1, device=device)
+                    labels_source = torch.ones(current_batch_size, 1, device=device)
+                    labels_target = torch.zeros(current_batch_size, 1, device=device)
 
                     pred_source_disc = self.net.discriminate(z_source_det)
                     pred_target_disc = self.net.discriminate(z_target_det)
@@ -967,8 +967,8 @@ class NN(CardinalityEstimationAlg):
                     trick_labels = torch.ones(current_batch_size, 1, device=device)
                     pred_target_gen = self.net.discriminate(z_target_gen)
                     
-                    #loss_g = self.bce_loss(pred_target_gen, trick_labels)
-                    loss_g = lambda_adv * self.bce_loss(pred_target_gen, trick_labels)
+                    loss_g = self.bce_loss(pred_target_gen, trick_labels)
+                    #loss_g = lambda_adv * self.bce_loss(pred_target_gen, trick_labels)
                     loss_g.backward()
                     
                     if self.clip_gradient is not None:
@@ -1584,19 +1584,19 @@ class NN(CardinalityEstimationAlg):
 
             if self.epoch % 2 == 0:
                 print(
-                    "Epoch {} took {}s, reg_loss={}, recon_loss={}, phase1_loss={}, disc_loss={}, gen_loss={}, disc_acc={}, source_acc={}, target_acc={}, fool_acc={}, val_loss={}".format(
+                    "Epoch {} took {}s, reg_loss={:.6f}, recon_loss={:.12e}, phase1_loss={:.12e}, disc_loss={:.6f}, gen_loss={:.6f}, disc_acc={:.6f}, source_acc={:.6f}, target_acc={:.6f}, fool_acc={:.6f}, val_loss={:.6f}".format(
                         self.epoch,
                         epoch_metrics["epoch_seconds"],
-                        round(epoch_metrics["loss_reg"], 6),
-                        round(epoch_metrics.get("loss_recon", 0.0), 6),
-                        round(epoch_metrics.get("loss_phase1", epoch_metrics["loss_reg"]), 6),
-                        round(epoch_metrics["loss_d"], 6),
-                        round(epoch_metrics["loss_g"], 6),
-                        round(epoch_metrics["disc_acc"], 6),
-                        round(epoch_metrics["disc_acc_source"], 6),
-                        round(epoch_metrics["disc_acc_target"], 6),
-                        round(epoch_metrics["gen_fool_acc"], 6),
-                        round(epoch_metrics.get("val_loss", float("nan")), 6),
+                        epoch_metrics["loss_reg"],
+                        epoch_metrics.get("loss_recon", 0.0),
+                        epoch_metrics.get("loss_phase1", epoch_metrics["loss_reg"]),
+                        epoch_metrics["loss_d"],
+                        epoch_metrics["loss_g"],
+                        epoch_metrics["disc_acc"],
+                        epoch_metrics["disc_acc_source"],
+                        epoch_metrics["disc_acc_target"],
+                        epoch_metrics["gen_fool_acc"],
+                        epoch_metrics.get("val_loss", float("nan")),
                     )
                 )
 
