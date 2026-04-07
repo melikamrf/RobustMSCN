@@ -640,6 +640,24 @@ class NN(CardinalityEstimationAlg):
             recon_target, target_target)
         loss_recon = loss_recon_source + loss_recon_target
 
+        if not hasattr(self, "_decoder_debug_printed"):
+            print(
+                "[DECODER DEBUG] enabled={}, decoder_is_none={}, "
+                "z_source_shape={}, recon_source_shape={}, target_source_shape={}, "
+                "loss_recon_source={:.12e}, loss_recon_target={:.12e}, "
+                "loss_recon_total={:.12e}".format(
+                    bool(getattr(self, "enable_decoder", False)),
+                    getattr(self.net, "decoder", None) is None,
+                    tuple(z_source.shape),
+                    tuple(recon_source.shape),
+                    tuple(target_source.shape),
+                    loss_recon_source.item(),
+                    loss_recon_target.item(),
+                    loss_recon.item(),
+                )
+            )
+            self._decoder_debug_printed = True
+
         return loss_recon, loss_recon_source, loss_recon_target
 
     def _build_optimizer_for_params(self, params, lr):
@@ -696,6 +714,15 @@ class NN(CardinalityEstimationAlg):
 
         self.optimizer = self.opt_regression
         self.bce_loss = torch.nn.BCELoss()
+
+        if bool(getattr(self, "enable_decoder", False)):
+            print(
+                "[DECODER DEBUG] optimizer setup: decoder_param_tensors={}, "
+                "decoder_output_dim={}".format(
+                    len(decoder_params),
+                    getattr(self.net, "decoder_output_dim", None),
+                )
+            )
 
     def _init_latent_generator_optimizers(self):
         named_params = [
@@ -1009,6 +1036,8 @@ class NN(CardinalityEstimationAlg):
 
         metrics = {
             "loss_reg": float(np.mean(reg_losses)) if len(reg_losses) > 0 else 0.0,
+            "loss_recon": float(np.mean(recon_losses)) if len(recon_losses) > 0 else 0.0,
+            "loss_phase1": float(np.mean(phase1_losses)) if len(phase1_losses) > 0 else 0.0,
             "loss_d": float(np.mean(disc_losses)) if len(disc_losses) > 0 else 0.0,
             "loss_g": float(np.mean(gen_losses)) if len(gen_losses) > 0 else 0.0,
             "disc_acc": float(np.mean(disc_accs)) if len(disc_accs) > 0 else 0.0,
@@ -1521,6 +1550,12 @@ class NN(CardinalityEstimationAlg):
             )
         self._ensure_latent_discriminator_ready()
         self._init_new_discriminator_optimizers()
+        if bool(getattr(self, "enable_decoder", False)) and \
+                not self._decoder_loss_enabled():
+            raise RuntimeError(
+                "Decoder is enabled in config but decoder loss path is not active. "
+                "The run would otherwise log recon_loss=0.0 silently."
+            )
 
         if self.training_opt == "swa":
             raise RuntimeError(
@@ -1584,7 +1619,7 @@ class NN(CardinalityEstimationAlg):
 
             if self.epoch % 2 == 0:
                 print(
-                    "Epoch {} took {}s, reg_loss={:.6f}, recon_loss={:.12e}, phase1_loss={:.12e}, disc_loss={:.6f}, gen_loss={:.6f}, disc_acc={:.6f}, source_acc={:.6f}, target_acc={:.6f}, fool_acc={:.6f}, val_loss={:.6f}".format(
+                    "Epoch {} took {}s, reg_loss={:.6f}, recon_loss={:.6f}, phase1_loss={:.6f}, disc_loss={:.6f}, gen_loss={:.6f}, disc_acc={:.6f}, source_acc={:.6f}, target_acc={:.6f}, fool_acc={:.6f}, val_loss={:.6f}".format(
                         self.epoch,
                         epoch_metrics["epoch_seconds"],
                         epoch_metrics["loss_reg"],
