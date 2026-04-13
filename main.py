@@ -426,7 +426,21 @@ def main():
 
     use_new_discriminator_train = bool(cfg["model"].get("use_new_discriminator_train", 0))
     use_generator_adversarial_train = bool(cfg["model"].get("use_generator_adversarial_train", 0))
-    use_alt_adversarial_train = use_new_discriminator_train or use_generator_adversarial_train
+    use_dann_train = bool(cfg["model"].get("use_dann_train", 0))
+    selected_adv_modes = (
+        int(use_new_discriminator_train)
+        + int(use_generator_adversarial_train)
+        + int(use_dann_train)
+    )
+    if selected_adv_modes > 1:
+        raise ValueError(
+            "Only one adversarial training mode can be enabled at a time: "
+            "use_new_discriminator_train, use_generator_adversarial_train, use_dann_train."
+        )
+
+    use_alt_adversarial_train = (
+        use_new_discriminator_train or use_generator_adversarial_train or use_dann_train
+    )
 
     if use_alt_adversarial_train:
         main_logger.info(
@@ -469,6 +483,22 @@ def main():
                 adv_weights=disc_weights,
                 adv_weight_level="dataset",
             )
+        elif use_dann_train:
+            if not hasattr(alg, "train_with_dann"):
+                raise RuntimeError(
+                    f"{args.alg} does not support train_with_dann"
+                )
+            alg.train_with_dann(
+                trainqs,
+                valqs=valqs,
+                testqs=testqs,
+                evalqs=mscn_evalqs,
+                eval_qdirs=mscn_eval_qdirs,
+                featurizer=featurizer,
+                result_dir=args.result_dir,
+                adv_weights=disc_weights,
+                adv_weight_level="dataset",
+            )
         elif use_new_discriminator_train:
             if not hasattr(alg, "train_with_new_discriminator"):
                 raise RuntimeError(
@@ -496,6 +526,22 @@ def main():
                     f"{args.alg} does not support train_with_latent_generator"
                 )
             alg.train_with_latent_generator(
+                trainqs,
+                valqs=valqs,
+                testqs=None,
+                evalqs=mscn_evalqs,
+                eval_qdirs=mscn_eval_qdirs,
+                featurizer=featurizer,
+                result_dir=args.result_dir,
+                adv_weights=disc_weights,
+                adv_weight_level="dataset",
+            )
+        elif use_dann_train:
+            if not hasattr(alg, "train_with_dann"):
+                raise RuntimeError(
+                    f"{args.alg} does not support train_with_dann"
+                )
+            alg.train_with_dann(
                 trainqs,
                 valqs=valqs,
                 testqs=None,

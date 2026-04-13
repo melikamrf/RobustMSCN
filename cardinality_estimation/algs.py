@@ -21,6 +21,7 @@ from .decoder import Decoder
 from evaluation.flow_loss import FlowLoss, \
         get_optimization_variables, get_subsetg_vectors
 from .discriminator import LatentDiscriminator, LatentGenerator
+from .DANN import train_one_epoch_dann as _train_one_epoch_dann
 
 from torch.utils import data
 from torch.nn.utils.clip_grad import clip_grad_norm_
@@ -1048,6 +1049,9 @@ class NN(CardinalityEstimationAlg):
         }
         return metrics
 
+    def train_one_epoch_dann(self, target_loader):
+        return _train_one_epoch_dann(self, target_loader)
+
     def train_one_epoch_with_latent_generator(self):
         start = time.time()
         reg_losses = []
@@ -1601,12 +1605,16 @@ class NN(CardinalityEstimationAlg):
             eplosses = []
             pct_chngs = []
 
+        train_epoch_fn = getattr(
+            self, "_adversarial_epoch_train_fn", self.train_one_epoch_with_new_discriminator
+        )
+
         for self.epoch in range(0, total_epochs):
             should_eval = (self.epoch % self.eval_epoch == 0)
             if self.epoch % self.eval_epoch == 0:
                 self.periodic_eval()
 
-            epoch_metrics = self.train_one_epoch_with_new_discriminator(self.target_loader)
+            epoch_metrics = train_epoch_fn(self.target_loader)
 
             if should_eval and "val" in self.eval_ds:
                 val_preds, val_ys = self._eval_ds(self.eval_ds["val"], self.samples["val"])
@@ -1697,6 +1705,14 @@ class NN(CardinalityEstimationAlg):
             print("Saved adversarial training plot to:", adv_plot_path)
 
         self.save_model(save_dir="./saved_models", suffix_name="_epoch" + str(self.epoch))
+
+    def train_with_dann(self, training_samples, **kwargs):
+        self._adversarial_epoch_train_fn = self.train_one_epoch_dann
+        try:
+            self.train_with_new_discriminator(training_samples, **kwargs)
+        finally:
+            if hasattr(self, "_adversarial_epoch_train_fn"):
+                del self._adversarial_epoch_train_fn
 
     def train_with_latent_generator(self, training_samples, **kwargs):
         self.all_errs = []
