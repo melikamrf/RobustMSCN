@@ -113,7 +113,7 @@ model:
   normalize_flow_loss : 1
 
   # important training / optimization flags
-  max_epochs : 100
+  max_epochs : 10
   eval_epoch : 2 # how often to evaluate on eval_fns during training
   eval_fns : "qerr,ppc" # logging things during training
   lr : 0.0001
@@ -124,23 +124,41 @@ model:
   load_padded_mscn_feats : 1
 
   # new latent adversarial training path (keeps original train() untouched)
-  use_new_discriminator_train : 1
-  use_generator_adversarial_train : 0
+  use_new_discriminator_train : 0
+  
+  use_dann_train: 1
   enable_latent_interface : 1
   enable_discriminator : 1
+
+  # Generator
+  use_generator_adversarial_train : 0
   enable_generator : 0
-  enable_decoder : 1
-  decoder_loss_weight : 1.0
-  decoder_hidden_dims : null
-  decoder_dropout : 0.0
   generator_noise_dim : null
   generator_hidden_dims : null
   generator_dropout : 0.1
-  adv_regression_lr : 0.001
-  adv_discriminator_lr : 0.00001
+
+  # Decoder for 3 Phase
+  enable_decoder : 0
+  decoder_loss_weight : 1.0
+  decoder_hidden_dims : null
+  decoder_dropout : 0.0
+ 
+  adv_regression_lr : 0.0001
+  adv_discriminator_lr : 0.0001
   adv_generator_lr : 0.0001
+
   lambda_adv : 0.01
-  discriminator_warmup_epochs : 5
+  discriminator_warmup_epochs : 0
+  discriminator_source_label : 1.0
+  discriminator_target_label : 0.0
+  generator_steps_per_batch : 1
+  discriminator_update_interval : 2
+
+
+  visualize_latents: 1
+  latent_viz_method: "tsne"  # or "pca" (default)
+  latent_viz_every_epochs: 5
+  latent_viz_max_points: 2000
 
   cost_model : "C"
 

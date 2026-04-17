@@ -6,6 +6,7 @@ import pandas as pd
 import json
 import sys
 import torch
+import os
 from collections import defaultdict
 import random
 import copy
@@ -32,6 +33,7 @@ import wandb
 import random
 import pickle
 import matplotlib.pyplot as plt
+from sklearn.manifold import TSNE
 
 QERR_MIN_EPS=0.0000001
 DEBUG_TIMES=False
@@ -480,6 +482,251 @@ class NN(CardinalityEstimationAlg):
 
         return target_samples
 
+    def _latent_visualization_enabled(self):
+        return bool(getattr(self, "visualize_latents", False))
+
+    def _latent_visualization_epoch_frequency(self):
+        return int(getattr(self, "latent_viz_every_epochs", 0) or 0)
+
+    def _latent_visualization_sample_limit(self):
+        return max(1, int(getattr(self, "latent_viz_max_points", 2000) or 2000))
+
+    def _latent_visualization_method(self):
+        """Get the dimensionality reduction method for latent visualization.
+        
+        Options: 'pca' or 'tsne'. Defaults to 'pca'.
+        """
+        method = str(getattr(self, "latent_viz_method", "pca") or "pca").lower()
+        if method not in ["pca", "tsne"]:
+            method = "pca"
+        return method
+
+    def _prepare_run_plot_dir(self, kwargs):
+        run_result_dir = kwargs.get("result_dir", "./results")
+        return os.path.join(run_result_dir, self.get_exp_name())
+
+    def _ensure_latent_visualization_ready(self):
+        if not self._latent_visualization_enabled():
+            return False
+
+        if hasattr(self.net, "configure_auxiliary_components"):
+            self.net.configure_auxiliary_components(enable_latent_interface=True)
+
+        if not hasattr(self.net, "get_latent_visualization_tensors"):
+            raise RuntimeError(
+                "Latent visualization requires an MSCN-style network with "
+                "get_latent_visualization_tensors()."
+            )
+        return True
+
+    def _build_latent_visualization_loader(self, samples):
+        if samples is None or len(samples) == 0:
+            return None
+
+        ds = self.init_dataset(
+            samples,
+            self.load_query_together,
+            max_num_tables=self.max_num_tables,
+            load_padded_mscn_feats=self.load_padded_mscn_feats,
+        )
+        batch_size = 1 if self.load_query_together else self.mb_size
+        return data.DataLoader(
+            ds,
+            batch_size=batch_size,
+            shuffle=False,
+            collate_fn=self.collate_fn,
+        )
+
+    def _setup_latent_visualization_loaders(self, target_samples=None):
+        self.latent_viz_source_loader = getattr(self, "trainloader", None)
+
+        target_loader = getattr(self, "target_loader", None)
+        if target_loader is None and target_samples is not None and len(target_samples) > 0:
+            target_loader = self._build_latent_visualization_loader(target_samples)
+        self.latent_viz_target_loader = target_loader
+
+    def _collect_latent_visualization_views(self, loader, max_points):
+        if loader is None:
+            return {}
+
+        net = self.net
+        # Visualization should not change the model's training mode permanently.
+        # We switch to eval() only for deterministic feature extraction, then
+        # restore train() if the caller was in training mode.
+        was_training = net.training
+        net.eval()
+        collected = defaultdict(list)
+        num_rows = 0
+
+        with torch.no_grad():
+            for xbatch, _, _ in loader:
+                views = net.get_latent_visualization_tensors(xbatch)
+                batch_rows = None
+                converted = {}
+                for key, tensor in views.items():
+                    arr = tensor.detach().cpu().numpy()
+                    if arr.ndim == 1:
+                        arr = arr.reshape(1, -1)
+                    converted[key] = arr
+                    if batch_rows is None:
+                        batch_rows = arr.shape[0]
+
+                if batch_rows is None or batch_rows == 0:
+                    continue
+
+                remaining = max_points - num_rows
+                if remaining <= 0:
+                    break
+
+                take = min(remaining, batch_rows)
+                for key, arr in converted.items():
+                    collected[key].append(arr[:take])
+                num_rows += take
+
+                if num_rows >= max_points:
+                    break
+
+        if was_training:
+            net.train()
+
+        return {
+            key: np.concatenate(val, axis=0)
+            for key, val in collected.items() if len(val) > 0
+        }
+
+    def _project_latent_view(self, source_view, target_view):
+        arrays = []
+        source_count = 0
+        target_count = 0
+
+        if source_view is not None and len(source_view) > 0:
+            arrays.append(source_view)
+            source_count = len(source_view)
+        if target_view is not None and len(target_view) > 0:
+            arrays.append(target_view)
+            target_count = len(target_view)
+
+        if len(arrays) == 0:
+            return None, None
+
+        combined = np.concatenate(arrays, axis=0).astype(np.float32, copy=False)
+        combined = combined - combined.mean(axis=0, keepdims=True)
+
+        method = self._latent_visualization_method()
+        
+        if method == "tsne":
+            projected = self._project_with_tsne(combined)
+        else:  # default to pca
+            projected = self._project_with_pca(combined)
+
+        source_proj = projected[:source_count] if source_count > 0 else None
+        target_proj = projected[source_count:source_count + target_count] \
+            if target_count > 0 else None
+        return source_proj, target_proj
+    
+    def _project_with_pca(self, combined):
+        """Project data to 2D using PCA (SVD)."""
+        if combined.shape[1] == 1:
+            projected = np.concatenate(
+                [combined, np.zeros((combined.shape[0], 1), dtype=combined.dtype)],
+                axis=1,
+            )
+        else:
+            _, _, vt = np.linalg.svd(combined, full_matrices=False)
+            basis = vt[:2].T
+            projected = combined @ basis
+            if projected.shape[1] == 1:
+                projected = np.concatenate(
+                    [projected, np.zeros((projected.shape[0], 1), dtype=projected.dtype)],
+                    axis=1,
+                )
+        return projected
+    
+    def _project_with_tsne(self, combined):
+        """Project data to 2D using t-SNE."""
+        try:
+            tsne = TSNE(n_components=2, perplexity=30.0, random_state=42)
+            projected = tsne.fit_transform(combined)
+            return projected.astype(np.float32)
+        except Exception as e:
+            print(f"Warning: t-SNE projection failed ({e}). Falling back to PCA.")
+            return self._project_with_pca(combined)
+
+    def _save_latent_visualization(self, save_dir, tag="final"):
+        if not self._latent_visualization_enabled():
+            return None
+        if not self._ensure_latent_visualization_ready():
+            return None
+
+        max_points = self._latent_visualization_sample_limit()
+        source_views = self._collect_latent_visualization_views(
+            getattr(self, "latent_viz_source_loader", None), max_points)
+        target_views = self._collect_latent_visualization_views(
+            getattr(self, "latent_viz_target_loader", None), max_points)
+
+        keys = ["out_mlp1_output", "discriminator_input", "regressor_input"]
+        if all(key not in source_views and key not in target_views for key in keys):
+            return None
+
+        os.makedirs(save_dir, exist_ok=True)
+        fig, axes = plt.subplots(1, len(keys), figsize=(18, 5))
+        title_map = {
+            "out_mlp1_output": "Output Of out_mlp1",
+            "discriminator_input": "Discriminator Input",
+            "regressor_input": "Regressor Input",
+        }
+
+        for ax, key in zip(axes, keys):
+            source_proj, target_proj = self._project_latent_view(
+                source_views.get(key),
+                target_views.get(key),
+            )
+
+            if source_proj is not None and len(source_proj) > 0:
+                ax.scatter(
+                    source_proj[:, 0], source_proj[:, 1],
+                    s=10, alpha=0.55, label="source", color="#1f77b4",
+                )
+            if target_proj is not None and len(target_proj) > 0:
+                ax.scatter(
+                    target_proj[:, 0], target_proj[:, 1],
+                    s=10, alpha=0.55, label="target", color="#ff7f0e",
+                )
+
+            ax.set_title(title_map[key])
+            ax.set_xlabel("Dimension 1")
+            ax.set_ylabel("Dimension 2")
+            ax.grid(True, alpha=0.2)
+            if source_proj is not None or target_proj is not None:
+                ax.legend()
+
+        plt.tight_layout()
+        plot_path = os.path.join(save_dir, f"latent_views_{tag}.png")
+        fig.savefig(plot_path, dpi=200, bbox_inches="tight")
+        plt.close(fig)
+        return plot_path
+
+    def _maybe_save_latent_visualization(self, save_dir, force=False, tag=None):
+        if not self._latent_visualization_enabled():
+            return None
+
+        if not force:
+            freq = self._latent_visualization_epoch_frequency()
+            if freq <= 0 or self.epoch % freq != 0:
+                return None
+            if tag is None:
+                tag = "epoch{:04d}".format(self.epoch)
+        elif tag is None:
+            tag = "final_epoch{:04d}".format(self.epoch)
+
+        plot_path = self._save_latent_visualization(
+            save_dir,
+            tag=tag,
+        )
+        if plot_path is not None:
+            print("Saved latent visualization to:", plot_path)
+        return plot_path
+
     def _slice_batch_inputs(self, xbatch, batch_size):
         if torch.is_tensor(xbatch):
             return xbatch[:batch_size]
@@ -813,6 +1060,32 @@ class NN(CardinalityEstimationAlg):
             return float(torch.mean(losses).item())
         return float(np.mean(losses))
 
+    def _compute_loss_metrics_from_numpy(self, preds, ys):
+        """Compute mean, median, and 99th percentile of loss/Q-Error."""
+        if self.loss_func_name == "flowloss":
+            return {"mean": None, "median": None, "p99": None}
+
+        pred_t = torch.from_numpy(preds).float()
+        y_t = torch.from_numpy(ys).float()
+
+        if self.loss_func_name == "qloss" and self.featurizer.ynormalization == "log":
+            pred_t = self.featurizer.unnormalize_torch(pred_t, None)
+            y_t = self.featurizer.unnormalize_torch(y_t, None)
+
+        losses = self.loss_func(pred_t, y_t)
+        if torch.is_tensor(losses):
+            if losses.ndim == 0:
+                losses = torch.tensor([losses.item()])
+            losses_np = losses.detach().cpu().numpy()
+        else:
+            losses_np = np.asarray(losses)
+        
+        return {
+            "mean": float(np.mean(losses_np)) if len(losses_np) > 0 else None,
+            "median": float(np.median(losses_np)) if len(losses_np) > 0 else None,
+            "p99": float(np.percentile(losses_np, 99)) if len(losses_np) > 0 else None,
+        }
+
     def _save_adversarial_training_plot(self, save_dir):
         if not hasattr(self, "adversarial_train_history"):
             return None
@@ -959,19 +1232,45 @@ class NN(CardinalityEstimationAlg):
 
             # Phase 2: train discriminator (source vs target).
             if self.epoch >= getattr(self, "discriminator_warmup_epochs", 5):
-                train_disc = (batch_idx % 2 == 0)
+                disc_update_interval = max(
+                    1, int(getattr(self, "discriminator_update_interval", 2))
+                )
+                generator_steps_per_batch = max(
+                    1, int(getattr(self, "generator_steps_per_batch", 1))
+                )
+                source_label_value = float(
+                    getattr(self, "discriminator_source_label", 1.0)
+                )
+                target_label_value = float(
+                    getattr(self, "discriminator_target_label", 0.0)
+                )
+
+                train_disc = (batch_idx % disc_update_interval == 0)
+                labels_source = torch.full(
+                    (current_batch_size, 1),
+                    source_label_value,
+                    device=device,
+                )
+                labels_target = torch.full(
+                    (current_batch_size, 1),
+                    target_label_value,
+                    device=device,
+                )
+                hard_labels_source = torch.ones_like(labels_source)
+                hard_labels_target = torch.zeros_like(labels_target)
+                loss_d = torch.tensor(0.0, device=device)
+                pred_source_disc = torch.full(
+                    (current_batch_size, 1), 0.5, device=device
+                )
+                pred_target_disc = torch.full(
+                    (current_batch_size, 1), 0.5, device=device
+                )
                 if train_disc:
                     self.opt_discriminator.zero_grad()
                     _, z_source_det = self.net.forward_with_latent(xbatch_source)
                     _, z_target_det = self.net.forward_with_latent(xbatch_target)
                     z_source_det = z_source_det.detach()
                     z_target_det = z_target_det.detach()
-
-                    #Label smoothing          
-                    # labels_source = torch.full((current_batch_size, 1), 0.9, device=device)
-                    # labels_target = torch.full((current_batch_size, 1), 0.1, device=device)
-                    labels_source = torch.ones(current_batch_size, 1, device=device)
-                    labels_target = torch.zeros(current_batch_size, 1, device=device)
 
                     pred_source_disc = self.net.discriminate(z_source_det)
                     pred_target_disc = self.net.discriminate(z_target_det)
@@ -984,8 +1283,8 @@ class NN(CardinalityEstimationAlg):
 
 
                 # Phase 3: train encoder to fool discriminator on target.
-                # Run this multiple times (e.g., 2) to let the generator catch up!
-                for _ in range(1):
+                # Run this multiple times to let the encoder catch up.
+                for _ in range(generator_steps_per_batch):
                     self.opt_generator.zero_grad()
                     
                     # Forward pass to get the latent vector
@@ -1009,9 +1308,6 @@ class NN(CardinalityEstimationAlg):
                 with torch.no_grad():
                     disc_pred_source_cls = (pred_source_disc >= 0.5).float()
                     disc_pred_target_cls = (pred_target_disc >= 0.5).float()
-                    # Compare against hard 1.0 and 0.0 for accurate logging, ignoring the 0.9/0.1 smoothing
-                    hard_labels_source = torch.ones_like(labels_source)
-                    hard_labels_target = torch.zeros_like(labels_target)
                     
                     source_acc = (disc_pred_source_cls == hard_labels_source).float().mean().item()
                     target_acc = (disc_pred_target_cls == hard_labels_target).float().mean().item()
@@ -1185,6 +1481,7 @@ class NN(CardinalityEstimationAlg):
         assert isinstance(training_samples[0], dict)
         self.featurizer = kwargs["featurizer"]
         self.training_samples = training_samples
+        target_samples = self._collect_target_queries(kwargs)
 
         self.seen_subplans = set()
         for sample in training_samples:
@@ -1310,6 +1607,9 @@ class NN(CardinalityEstimationAlg):
 
         # TODO: initialize self.num_features
         self.net, self.optimizer = self.init_net(self.trainds[0])
+        run_plot_dir = self._prepare_run_plot_dir(kwargs)
+        self._ensure_latent_visualization_ready()
+        self._setup_latent_visualization_loaders(target_samples=target_samples)
 
         model_size = self.num_parameters()
         print("""Training samples: {}, Model size: {}""".
@@ -1360,6 +1660,7 @@ class NN(CardinalityEstimationAlg):
                 self.periodic_eval()
 
             self.train_one_epoch()
+            self._maybe_save_latent_visualization(run_plot_dir)
 
             self.model_weights.append(copy.deepcopy(self.net.state_dict()))
 
@@ -1416,6 +1717,7 @@ class NN(CardinalityEstimationAlg):
 
             # self.nets[0].load_state_dict(self.best_model_dict)
             # self.nets[0].eval()
+        self._maybe_save_latent_visualization(run_plot_dir, force=True)
         self.save_model(save_dir='./saved_models', suffix_name="_epoch"+str(self.epoch))
 
     def train_with_new_discriminator(self, training_samples, **kwargs):
@@ -1438,6 +1740,7 @@ class NN(CardinalityEstimationAlg):
         assert isinstance(training_samples[0], dict)
         self.featurizer = kwargs["featurizer"]
         self.training_samples = training_samples
+        target_samples = self._collect_target_queries(kwargs)
 
         self.seen_subplans = set()
         for sample in training_samples:
@@ -1573,8 +1876,7 @@ class NN(CardinalityEstimationAlg):
                 "Pass evalqs."
             )
 
-        run_result_dir = kwargs.get("result_dir", "./results")
-        run_plot_dir = os.path.join(run_result_dir, self.get_exp_name())
+        run_plot_dir = self._prepare_run_plot_dir(kwargs)
 
         self.targetds = self.init_dataset(
             target_samples,
@@ -1588,6 +1890,7 @@ class NN(CardinalityEstimationAlg):
             shuffle=True,
             collate_fn=self.collate_fn,
         )
+        self._setup_latent_visualization_loaders(target_samples=target_samples)
 
         model_size = self.num_parameters()
         print(
@@ -1615,31 +1918,37 @@ class NN(CardinalityEstimationAlg):
                 self.periodic_eval()
 
             epoch_metrics = train_epoch_fn(self.target_loader)
+            self._maybe_save_latent_visualization(run_plot_dir)
 
             if should_eval and "val" in self.eval_ds:
                 val_preds, val_ys = self._eval_ds(self.eval_ds["val"], self.samples["val"])
-                val_loss = self._compute_mean_loss_from_numpy(val_preds, val_ys)
-                if val_loss is not None:
-                    epoch_metrics["val_loss"] = val_loss
+                val_loss_metrics = self._compute_loss_metrics_from_numpy(val_preds, val_ys)
+                if val_loss_metrics["mean"] is not None:
+                    epoch_metrics["val_loss"] = val_loss_metrics["mean"]
+                    epoch_metrics["val_loss_median"] = val_loss_metrics["median"]
+                    epoch_metrics["val_loss_p99"] = val_loss_metrics["p99"]
 
             self.adversarial_train_history.append(epoch_metrics)
             self.model_weights.append(copy.deepcopy(self.net.state_dict()))
 
             if self.epoch % 2 == 0:
                 print(
-                    "Epoch {} took {}s, reg_loss={:.6f}, recon_loss={:.6f}, phase1_loss={:.6f}, disc_loss={:.6f}, gen_loss={:.6f}, disc_acc={:.6f}, source_acc={:.6f}, target_acc={:.6f}, fool_acc={:.6f}, val_loss={:.6f}".format(
+                    "Epoch {} took {}s, reg_loss={:.6f}, recon_loss={:.6f}, phase1_loss={:.6f}, disc_loss={:.6f}, disc_grad_norm={:.6f}, gen_loss={:.6f}, disc_acc={:.6f}, source_acc={:.6f}, target_acc={:.6f}, fool_acc={:.6f}, val_loss={:.6f}(median={:.6f}, 99p={:.6f})".format(
                         self.epoch,
                         epoch_metrics["epoch_seconds"],
                         epoch_metrics["loss_reg"],
                         epoch_metrics.get("loss_recon", 0.0),
                         epoch_metrics.get("loss_phase1", epoch_metrics["loss_reg"]),
                         epoch_metrics["loss_d"],
+                        epoch_metrics.get("disc_grad_norm", float("nan")),
                         epoch_metrics["loss_g"],
                         epoch_metrics["disc_acc"],
                         epoch_metrics["disc_acc_source"],
                         epoch_metrics["disc_acc_target"],
                         epoch_metrics["gen_fool_acc"],
                         epoch_metrics.get("val_loss", float("nan")),
+                        epoch_metrics.get("val_loss_median", float("nan")),
+                        epoch_metrics.get("val_loss_p99", float("nan")),
                     )
                 )
 
@@ -1654,8 +1963,14 @@ class NN(CardinalityEstimationAlg):
                     "Adv-Gen-Fool-Acc": epoch_metrics["gen_fool_acc"],
                     "epoch": self.epoch,
                 }
+                if "disc_grad_norm" in epoch_metrics:
+                    wandb_payload["Adv-Disc-Grad-Norm"] = epoch_metrics["disc_grad_norm"]
                 if "val_loss" in epoch_metrics:
                     wandb_payload["ValLoss"] = epoch_metrics["val_loss"]
+                if "val_loss_median" in epoch_metrics:
+                    wandb_payload["ValLoss-Median"] = epoch_metrics["val_loss_median"]
+                if "val_loss_p99" in epoch_metrics:
+                    wandb_payload["ValLoss-99p"] = epoch_metrics["val_loss_p99"]
                 wandb.log(wandb_payload)
 
             if self.early_stopping == 1:
@@ -1703,6 +2018,7 @@ class NN(CardinalityEstimationAlg):
         adv_plot_path = self._save_adversarial_training_plot(run_plot_dir)
         if adv_plot_path is not None:
             print("Saved adversarial training plot to:", adv_plot_path)
+        self._maybe_save_latent_visualization(run_plot_dir, force=True)
 
         self.save_model(save_dir="./saved_models", suffix_name="_epoch" + str(self.epoch))
 
@@ -1734,6 +2050,7 @@ class NN(CardinalityEstimationAlg):
         assert isinstance(training_samples[0], dict)
         self.featurizer = kwargs["featurizer"]
         self.training_samples = training_samples
+        target_samples = self._collect_target_queries(kwargs)
 
         self.seen_subplans = set()
         for sample in training_samples:
@@ -1859,8 +2176,8 @@ class NN(CardinalityEstimationAlg):
                 "SWA training is not supported in train_with_latent_generator."
             )
 
-        run_result_dir = kwargs.get("result_dir", "./results")
-        run_plot_dir = os.path.join(run_result_dir, self.get_exp_name())
+        run_plot_dir = self._prepare_run_plot_dir(kwargs)
+        self._setup_latent_visualization_loaders(target_samples=target_samples)
 
         model_size = self.num_parameters()
         print(
@@ -1884,19 +2201,22 @@ class NN(CardinalityEstimationAlg):
                 self.periodic_eval()
 
             epoch_metrics = self.train_one_epoch_with_latent_generator()
+            self._maybe_save_latent_visualization(run_plot_dir)
 
             if should_eval and "val" in self.eval_ds:
                 val_preds, val_ys = self._eval_ds(self.eval_ds["val"], self.samples["val"])
-                val_loss = self._compute_mean_loss_from_numpy(val_preds, val_ys)
-                if val_loss is not None:
-                    epoch_metrics["val_loss"] = val_loss
+                val_loss_metrics = self._compute_loss_metrics_from_numpy(val_preds, val_ys)
+                if val_loss_metrics["mean"] is not None:
+                    epoch_metrics["val_loss"] = val_loss_metrics["mean"]
+                    epoch_metrics["val_loss_median"] = val_loss_metrics["median"]
+                    epoch_metrics["val_loss_p99"] = val_loss_metrics["p99"]
 
             self.adversarial_train_history.append(epoch_metrics)
             self.model_weights.append(copy.deepcopy(self.net.state_dict()))
 
             if self.epoch % 2 == 0:
                 print(
-                    "Epoch {} took {}s, reg_loss={}, disc_loss={}, gen_loss={}, disc_acc={}, source_acc={}, fake_acc={}, fool_acc={}, val_loss={}".format(
+                    "Epoch {} took {}s, reg_loss={}, disc_loss={}, gen_loss={}, disc_acc={}, source_acc={}, fake_acc={}, fool_acc={}, val_loss={}(median={}, 99p={})".format(
                         self.epoch,
                         epoch_metrics["epoch_seconds"],
                         round(epoch_metrics["loss_reg"], 6),
@@ -1907,6 +2227,8 @@ class NN(CardinalityEstimationAlg):
                         round(epoch_metrics["disc_acc_fake"], 6),
                         round(epoch_metrics["gen_fool_acc"], 6),
                         round(epoch_metrics.get("val_loss", float("nan")), 6),
+                        round(epoch_metrics.get("val_loss_median", float("nan")), 6),
+                        round(epoch_metrics.get("val_loss_p99", float("nan")), 6),
                     )
                 )
 
@@ -1925,6 +2247,10 @@ class NN(CardinalityEstimationAlg):
                 }
                 if "val_loss" in epoch_metrics:
                     wandb_payload["ValLoss"] = epoch_metrics["val_loss"]
+                if "val_loss_median" in epoch_metrics:
+                    wandb_payload["ValLoss-Median"] = epoch_metrics["val_loss_median"]
+                if "val_loss_p99" in epoch_metrics:
+                    wandb_payload["ValLoss-99p"] = epoch_metrics["val_loss_p99"]
                 wandb.log(wandb_payload)
 
             if self.early_stopping == 1:
@@ -1972,6 +2298,7 @@ class NN(CardinalityEstimationAlg):
         adv_plot_path = self._save_adversarial_training_plot(run_plot_dir)
         if adv_plot_path is not None:
             print("Saved adversarial training plot to:", adv_plot_path)
+        self._maybe_save_latent_visualization(run_plot_dir, force=True)
 
         self.save_model(save_dir="./saved_models", suffix_name="_epoch" + str(self.epoch))
 

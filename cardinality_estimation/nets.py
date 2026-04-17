@@ -395,6 +395,21 @@ class SetConv(nn.Module):
             return torch.sigmoid(self.out_mlp2(hid))
         return self.out_mlp2(hid)
 
+    def get_latent_visualization_tensors(self, xbatch):
+        self._require_latent_interface()
+        hid, flows, _, _ = self._compute_combined_hidden(xbatch)
+        out_mlp1_output = self.out_mlp1(hid)
+        discriminator_input = F.relu(out_mlp1_output)
+        regressor_input = discriminator_input
+        if self.flow_feats:
+            regressor_input = torch.cat([discriminator_input, flows], 1)
+
+        return {
+            "out_mlp1_output": out_mlp1_output,
+            "discriminator_input": discriminator_input,
+            "regressor_input": regressor_input,
+        }
+
     def forward_with_latent(self, xbatch):
         self._require_latent_interface()
         hid, flows, _, _ = self._compute_combined_hidden(xbatch)
@@ -732,6 +747,19 @@ class SetConvFlow(nn.Module):
         if self.use_sigmoid:
             return torch.sigmoid(self.out_mlp2(z))
         return self.out_mlp2(z)
+
+    def get_latent_visualization_tensors(self, xbatch):
+        self._require_latent_interface()
+        hid = self._compute_combined_hidden(xbatch)
+        out_mlp1_output = self.out_mlp1(hid)
+        discriminator_input = F.relu(out_mlp1_output)
+        regressor_input = discriminator_input
+
+        return {
+            "out_mlp1_output": out_mlp1_output,
+            "discriminator_input": discriminator_input,
+            "regressor_input": regressor_input,
+        }
 
     def forward_with_latent(self, xbatch):
         self._require_latent_interface()

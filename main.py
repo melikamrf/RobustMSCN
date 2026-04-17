@@ -518,6 +518,7 @@ def main():
         else:
             alg.train(trainqs, valqs=valqs, testqs=testqs, evalqs = mscn_evalqs,
                     eval_qdirs = mscn_eval_qdirs, featurizer=featurizer,
+                    result_dir=args.result_dir,
                     adv_weights=disc_weights, adv_weight_level="dataset")
     else:
         if use_generator_adversarial_train:
@@ -569,8 +570,9 @@ def main():
                 adv_weight_level="dataset",
             )
         else:
-            alg.train(trainqs, valqs=valqs, testqs=None, evalqs = None,
+            alg.train(trainqs, valqs=valqs, testqs=None, evalqs = mscn_evalqs,
                     eval_qdirs = mscn_eval_qdirs, featurizer=featurizer,
+                    result_dir=args.result_dir,
                     adv_weights=disc_weights, adv_weight_level="dataset")
 
     # start_time = time.time()

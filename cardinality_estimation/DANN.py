@@ -9,18 +9,16 @@ from .nets import device
 
 
 class GradientReversalFunction(torch.autograd.Function):
-
     @staticmethod
     def forward(ctx, x, lambda_):
-        ctx.save_for_backward(torch.tensor(lambda_, dtype=torch.float32))
-        return x.clone()
+        # Store float directly in ctx instead of creating a tensor
+        ctx.lambda_ = lambda_ 
+        return x.view_as(x)
 
     @staticmethod
     def backward(ctx, grad_output):
-        lambda_ = ctx.saved_tensors[0].item()
-        # Reverse gradient for encoder; return None for the scalar lambda_ argument.
-        return -lambda_ * grad_output, None
-
+        # Multiply by negative lambda
+        return grad_output.neg() * ctx.lambda_, None
 
 def grad_reverse(x, lambda_):
     return GradientReversalFunction.apply(x, lambda_)
@@ -47,6 +45,7 @@ def train_one_epoch_dann(self, target_loader):
     recon_losses = []
     phase1_losses = []
     disc_losses = []
+    disc_grad_norms = []
     gen_losses = []
     disc_accs = []
     disc_acc_source = []
@@ -145,6 +144,13 @@ def train_one_epoch_dann(self, target_loader):
         total_loss = loss_reg + loss_d
         total_loss.backward()
 
+        disc_grad_sq = 0.0
+        for param in self.net.discriminator.parameters():
+            if param.grad is None:
+                continue
+            disc_grad_sq += param.grad.detach().pow(2).sum().item()
+        disc_grad_norm = math.sqrt(disc_grad_sq)
+
         if self.clip_gradient is not None:
             clip_grad_norm_(
                 self.opt_regression.param_groups[0]["params"],
@@ -172,6 +178,7 @@ def train_one_epoch_dann(self, target_loader):
 
         reg_losses.append(loss_reg.item())
         disc_losses.append(loss_d.item())
+        disc_grad_norms.append(disc_grad_norm)
         gen_losses.append(loss_d.item())   # same signal seen by encoder
         disc_accs.append(d_acc)
         disc_acc_source.append(src_acc)
@@ -183,6 +190,7 @@ def train_one_epoch_dann(self, target_loader):
         "loss_recon":     float(np.mean(recon_losses)) if recon_losses else 0.0,
         "loss_phase1":    float(np.mean(phase1_losses)) if phase1_losses else 0.0,
         "loss_d":         float(np.mean(disc_losses))  if disc_losses  else 0.0,
+        "disc_grad_norm": float(np.mean(disc_grad_norms)) if disc_grad_norms else 0.0,
         "loss_g":         float(np.mean(gen_losses))   if gen_losses   else 0.0,
         "disc_acc":       float(np.mean(disc_accs))    if disc_accs    else 0.0,
         "disc_acc_source":float(np.mean(disc_acc_source)) if disc_acc_source else 0.0,
