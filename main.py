@@ -136,7 +136,7 @@ def prepare_discriminator_weights(trainqs, evalqs, eval_qdirs, featurizer):
 
 def extract_cardinalities(qreps, ests):
     """
-    Extract true, postgres estimated, and model estimated cardinalities.
+    Extract true, postgres estimated, model estimated cardinalities, and q-error.
     """
     card_data = []
     
@@ -148,6 +148,12 @@ def extract_cardinalities(qreps, ests):
             
                 true_card = data["cardinality"]["actual"]
                 postgres_card = data["cardinality"]["expected"]
+                model_card = est[node] if node in est else None
+
+                if model_card is not None and true_card not in (None, 0) and model_card != 0:
+                    qerror = np.maximum((true_card / model_card), (model_card / true_card))
+                else:
+                    qerror = np.nan
                 
                 # Calculate the ratio to verify update_labels was applied
                 # If update_labels was applied: new_actual = old_actual / old_expected
@@ -159,7 +165,8 @@ def extract_cardinalities(qreps, ests):
                     "node": node,
                     "true_cardinality": true_card,
                     "postgres_estimated": postgres_card,
-                    "model_estimated": est[node] if node in est else None,  # Model estimates the root query
+                    "model_estimated": model_card,  # Model estimates the root query
+                    "qerror": qerror,
                     "actual_expected_ratio": ratio,
                     # Add original values before update if available
                     "is_ratio_close_to_1": abs(ratio - 1.0) < 0.01 if ratio else False
@@ -202,6 +209,9 @@ def eval_alg(alg, eval_funcs, qreps, cfg,
     start = time.time()
     alg_name = alg.__str__()
     exp_name = alg.get_exp_name()
+    samples_label = str(samples_type).strip() if samples_type is not None else ""
+    if not samples_label:
+        samples_label = "eval"
 
     ests = alg.test(qreps)
     rdir = None
@@ -214,12 +224,12 @@ def eval_alg(alg, eval_funcs, qreps, cfg,
             json.dump(cfg, f, ensure_ascii=False, indent=4)
             
     df = extract_cardinalities(qreps, ests)
-    card_path = os.path.join(args.result_dir, exp_name, f"cardinality_distributions_{samples_type}.csv")
+    card_path = os.path.join(args.result_dir, exp_name, f"cardinality_distributions_{samples_label}.csv")
     df.to_csv(card_path, index=False)
     print(f"Saved {len(df)} query cardinalities to CSV")
 
-    if samples_type != "train" and cfg["eval"]["save_test_preds"]:
-        preds_dir = os.path.join(rdir, samples_type + "-preds")
+    if samples_label != "train" and cfg["eval"]["save_test_preds"]:
+        preds_dir = os.path.join(rdir, samples_label + "-preds")
         make_dir(preds_dir)
         for i,qrep in enumerate(qreps):
             newfn = os.path.basename(qrep["name"])
@@ -237,7 +247,7 @@ def eval_alg(alg, eval_funcs, qreps, cfg,
                 user = cfg["db"]["user"], pwd = cfg["db"]["pwd"],
                 port = cfg["db"]["port"], db_name = cfg["db"]["db_name"],
                 db_host = cfg["db"]["db_host"],
-                samples_type = samples_type,
+                samples_type = samples_label,
                 num_processes = cfg["eval"]["num_processes"],
                 alg_name = alg_name,
                 save_pdf_plans= cfg["eval"]["save_pdf_plans"],
@@ -247,14 +257,14 @@ def eval_alg(alg, eval_funcs, qreps, cfg,
                 featurizer = featurizer, alg=alg)
 
         print("{}, {}, {}, #samples: {}, {}: mean: {}, median: {}, 99p: {}, max: {}"\
-                .format(cfg["db"]["db_name"], samples_type, alg, len(errors),
+                .format(cfg["db"]["db_name"], samples_label, alg, len(errors),
                     efunc.__str__(), np.round(np.mean(errors),3),
                     np.round(np.median(errors),3),
                     np.round(np.percentile(errors,99),3),
                     np.round(np.max(errors))))
 
         if cfg["eval"]["use_wandb"]:
-            loss_key = "Final-{}-{}-{}".format(str(efunc), samples_type,
+            loss_key = "Final-{}-{}-{}".format(str(efunc), samples_label,
                     "mean")
             wandb.run.summary[loss_key] = np.round(np.mean(errors),3)
 
@@ -392,6 +402,16 @@ def main():
     eqs = [len(eq) for eq in evalqs]
     print("""Selected Queries: {} train, {} test, {} val, {} eval"""\
             .format(len(trainqs), len(testqs), len(valqs), sum(eqs)))
+
+    # Undersample source (trainqs) to match target (evalqs) size
+    total_evalqs_count = sum(eqs)
+    if len(trainqs) > total_evalqs_count:
+        np.random.seed(args.random_seed)
+        indices = np.random.choice(len(trainqs), size=total_evalqs_count, replace=False)
+        trainqs = [trainqs[i] for i in sorted(indices)]
+        print(f"Undersampled trainqs to {len(trainqs)} to match evalqs size ({total_evalqs_count})")
+    elif len(trainqs) < total_evalqs_count:
+        print(f"WARNING: trainqs size ({len(trainqs)}) is already smaller than evalqs size ({total_evalqs_count}). No undersampling performed.")
 
     # only needs featurizer for learned models
     if args.alg in ["xgb", "fcnn", "mscn", "mscn_joinkey", "mstn"]:
@@ -597,7 +617,10 @@ def main():
     if len(mscn_evalqs) > 0 and len(mscn_evalqs[0]) > 0:
         for ei, evalq in enumerate(mscn_evalqs):
             start_time = time.time()
-            eval_alg(alg, eval_fns, evalq, cfg, os.path.basename(mscn_eval_qdirs[ei]), featurizer=featurizer)
+            eval_dir_name = os.path.basename(os.path.normpath(mscn_eval_qdirs[ei]))
+            if not eval_dir_name:
+                eval_dir_name = f"eval_{ei}"
+            eval_alg(alg, eval_fns, evalq, cfg, eval_dir_name, featurizer=featurizer)
             execution_time = time.time() - start_time
             print(f"Evaluation time on held-out eval set {ei}: {execution_time:.2f} seconds")
             del evalq[:]
