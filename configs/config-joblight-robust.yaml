@@ -113,7 +113,7 @@ model:
   normalize_flow_loss : 1
 
   # important training / optimization flags
-  max_epochs : 10
+  max_epochs : 20
   eval_epoch : 2 # how often to evaluate on eval_fns during training
   eval_fns : "qerr,ppc" # logging things during training
   lr : 0.0001
@@ -126,9 +126,9 @@ model:
   # new latent adversarial training path (keeps original train() untouched)
   use_new_discriminator_train : 0
   
-  use_dann_train: 1
+  use_dann_train: 0
   enable_latent_interface : 1
-  enable_discriminator : 1
+  enable_discriminator : 0
 
   # Generator
   use_generator_adversarial_train : 0

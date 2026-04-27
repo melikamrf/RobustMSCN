@@ -174,6 +174,68 @@ def extract_cardinalities(qreps, ests):
     
     return pd.DataFrame(card_data)
 
+def undersample_train_queries(trainqs, eqs):
+    """
+    Undersample source (trainqs) to match target (evalqs) size.
+    """
+    total_evalqs_count = sum(eqs)
+    if len(trainqs) > total_evalqs_count:
+        np.random.seed(args.random_seed)
+        indices = np.random.choice(len(trainqs), size=total_evalqs_count, replace=False)
+        trainqs = [trainqs[i] for i in sorted(indices)]
+        print(f"Undersampled trainqs to {len(trainqs)} to match evalqs size ({total_evalqs_count})")
+    elif len(trainqs) < total_evalqs_count:
+        print(f"WARNING: trainqs size ({len(trainqs)}) is already smaller than evalqs size ({total_evalqs_count}). No undersampling performed.")
+    
+    return trainqs
+
+def undersample_train_queries_by_subquery_count(trainqs, evalqs):
+    """
+    Undersample source (trainqs) to match target (evalqs) by total subquery count.
+    
+    Args:
+        trainqs: List of training queries
+        evalqs: List of lists of eval queries
+        
+    Returns:
+        Undersampled trainqs list with approximately same subquery count as evalqs
+    """
+    # Count total subqueries in evalqs
+    total_eval_subqueries = 0
+    for evalq_set in evalqs:
+        for qrep in evalq_set:
+            if "subset_graph" in qrep:
+                total_eval_subqueries += len(qrep["subset_graph"].nodes())
+    
+    # Count subqueries per training query
+    train_subquery_counts = []
+    for qrep in trainqs:
+        if "subset_graph" in qrep:
+            count = len(qrep["subset_graph"].nodes())
+        else:
+            count = 1
+        train_subquery_counts.append(count)
+    
+    # Undersample trainqs to match eval subquery count
+    np.random.seed(args.random_seed)
+    indices = np.random.permutation(len(trainqs))
+    selected_indices = []
+    total_train_subqueries = 0
+    
+    for idx in indices:
+        subquery_count = train_subquery_counts[idx]
+        if total_train_subqueries + subquery_count <= total_eval_subqueries:
+            selected_indices.append(idx)
+            total_train_subqueries += subquery_count
+    
+    # Sort to preserve original order
+    selected_indices = sorted(selected_indices)
+    trainqs = [trainqs[i] for i in selected_indices]
+    
+    print(f"Undersampled trainqs: {len(trainqs)} queries with {total_train_subqueries} subqueries to match evalqs ({total_eval_subqueries} subqueries)")
+    
+    return trainqs
+
 def update_labels(qreps):
     """
     Add residual labels to qreps without overwriting true cardinalities.
@@ -404,14 +466,10 @@ def main():
             .format(len(trainqs), len(testqs), len(valqs), sum(eqs)))
 
     # Undersample source (trainqs) to match target (evalqs) size
-    total_evalqs_count = sum(eqs)
-    if len(trainqs) > total_evalqs_count:
-        np.random.seed(args.random_seed)
-        indices = np.random.choice(len(trainqs), size=total_evalqs_count, replace=False)
-        trainqs = [trainqs[i] for i in sorted(indices)]
-        print(f"Undersampled trainqs to {len(trainqs)} to match evalqs size ({total_evalqs_count})")
-    elif len(trainqs) < total_evalqs_count:
-        print(f"WARNING: trainqs size ({len(trainqs)}) is already smaller than evalqs size ({total_evalqs_count}). No undersampling performed.")
+    # Use undersample_train_queries() to match query count
+    # OR use undersample_train_queries_by_subquery_count() to match total subquery count
+   # trainqs = undersample_train_queries_by_subquery_count(trainqs, evalqs)
+    #trainqs = undersample_train_queries(trainqs, eqs)
 
     # only needs featurizer for learned models
     if args.alg in ["xgb", "fcnn", "mscn", "mscn_joinkey", "mstn"]:
