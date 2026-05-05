@@ -1,17 +1,24 @@
 import torch
 from torch import nn
 import torch.nn.functional as F
-import torch.nn.functional as F
 import time
 import math
 from .set_transformer import SetTransformer
 from .decoder import Decoder
 from .discriminator import LatentDiscriminator, LatentGenerator
+from .losses import MK_MMD_Loss
 import pdb
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 print(f'device used in experiemnt: {device}')
 DEBUG_TIMES=False
+
+
+def _compute_latent_mmd(mmd_loss_module, z_source, z_target, detach=False):
+    if detach:
+        z_source = z_source.detach()
+        z_target = z_target.detach()
+    return mmd_loss_module(z_source, z_target)
 
 class SimpleRegression(torch.nn.Module):
     def __init__(self, input_width, n_output,
@@ -86,6 +93,7 @@ class SetConv(nn.Module):
         self.discriminator = None
         self.generator = None
         self.decoder = None
+        self.mmd_loss = MK_MMD_Loss()
         self.discriminator_hidden_dims = discriminator_hidden_dims
         self.discriminator_dropout = discriminator_dropout
         self.generator_noise_dim = generator_noise_dim
@@ -381,6 +389,29 @@ class SetConv(nn.Module):
         cur_device = device if device_override is None else device_override
         return torch.randn(batch_size, self.generator.noise_dim, device=cur_device)
 
+    def compute_mmd(self, z_source, z_target, detach=False, as_float=False):
+        mmd = _compute_latent_mmd(
+            self.mmd_loss,
+            z_source,
+            z_target,
+            detach=detach,
+        )
+        if as_float:
+            return float(mmd.item())
+        return mmd
+
+    def forward_with_mmd(self, xbatch_source, xbatch_target,
+            detach_mmd=False, mmd_as_float=False):
+        out_source, z_source = self.forward_with_latent(xbatch_source)
+        out_target, z_target = self.forward_with_latent(xbatch_target)
+        mmd = self.compute_mmd(
+            z_source,
+            z_target,
+            detach=detach_mmd,
+            as_float=mmd_as_float,
+        )
+        return out_source, z_source, out_target, z_target, mmd
+
     def predict_from_latent(self, z, flows=None):
         hid = z
         if self.flow_feats:
@@ -472,6 +503,7 @@ class SetConvFlow(nn.Module):
         self.discriminator = None
         self.generator = None
         self.decoder = None
+        self.mmd_loss = MK_MMD_Loss()
         self.discriminator_hidden_dims = discriminator_hidden_dims
         self.discriminator_dropout = discriminator_dropout
         self.generator_noise_dim = generator_noise_dim
@@ -742,6 +774,29 @@ class SetConvFlow(nn.Module):
         self._require_generator()
         cur_device = device if device_override is None else device_override
         return torch.randn(batch_size, self.generator.noise_dim, device=cur_device)
+
+    def compute_mmd(self, z_source, z_target, detach=False, as_float=False):
+        mmd = _compute_latent_mmd(
+            self.mmd_loss,
+            z_source,
+            z_target,
+            detach=detach,
+        )
+        if as_float:
+            return float(mmd.item())
+        return mmd
+
+    def forward_with_mmd(self, xbatch_source, xbatch_target,
+            detach_mmd=False, mmd_as_float=False):
+        out_source, z_source = self.forward_with_latent(xbatch_source)
+        out_target, z_target = self.forward_with_latent(xbatch_target)
+        mmd = self.compute_mmd(
+            z_source,
+            z_target,
+            detach=detach_mmd,
+            as_float=mmd_as_float,
+        )
+        return out_source, z_source, out_target, z_target, mmd
 
     def predict_from_latent(self, z):
         if self.use_sigmoid:
