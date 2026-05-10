@@ -181,8 +181,8 @@ class SetConv(nn.Module):
         combined_hid_size += flow_feats
         self.out_mlp2 = nn.Linear(combined_hid_size, n_out).to(device)
         self.latent_dim = self.out_mlp1.out_features
-        if self.decoder_output_dim is None:
-            self.decoder_output_dim = self.out_mlp1.in_features
+        # if self.decoder_output_dim is None:
+        #     self.decoder_output_dim = self.out_mlp1.in_features
 
         if self.enable_discriminator:
             self.discriminator = LatentDiscriminator(self.latent_dim,
@@ -369,8 +369,14 @@ class SetConv(nn.Module):
         return F.relu(self.out_mlp1(hid))
 
     def get_decoder_target(self, xbatch):
-        hid, _, _, _ = self._compute_combined_hidden(xbatch)
-        return hid
+        flat_inputs = []
+        for key in ["table", "pred", "join", "tmask", "pmask", "jmask"]:
+            feats = xbatch[key].to(device, non_blocking=True)
+            flat_inputs.append(feats.reshape(feats.shape[0], -1))
+        
+        flows = xbatch["flow"].to(device, non_blocking=True)
+        flat_inputs.append(flows.reshape(flows.shape[0], -1))
+        return torch.cat(flat_inputs, 1)
 
     def decode(self, z):
         self._require_decoder()
@@ -567,8 +573,8 @@ class SetConvFlow(nn.Module):
 
         self.out_mlp2 = nn.Linear(hid_units, n_out).to(device)
         self.latent_dim = self.out_mlp1.out_features
-        if self.decoder_output_dim is None:
-            self.decoder_output_dim = self.out_mlp1.in_features
+        # if self.decoder_output_dim is None:
+        #     self.decoder_output_dim = self.out_mlp1.in_features
 
         if self.enable_discriminator:
             self.discriminator = LatentDiscriminator(self.latent_dim,
@@ -756,7 +762,15 @@ class SetConvFlow(nn.Module):
         return F.relu(self.out_mlp1(hid))
 
     def get_decoder_target(self, xbatch):
-        return self._compute_combined_hidden(xbatch)
+        flat_inputs = []
+        for key in ["table", "pred", "join", "tmask", "pmask", "jmask"]:
+            feats = xbatch[key].to(device, non_blocking=True)
+            flat_inputs.append(feats.reshape(feats.shape[0], -1))
+        
+        flows = xbatch["flow"].to(device, non_blocking=True)
+        flat_inputs.append(flows.reshape(flows.shape[0], -1))
+        return torch.cat(flat_inputs, 1)
+        #return self._compute_combined_hidden(xbatch)
 
     def decode(self, z):
         self._require_decoder()
