@@ -577,6 +577,10 @@ class NN(CardinalityEstimationAlg):
         collected = []
         num_rows = 0
 
+        # Set fixed seed for deterministic sampling across epochs
+        if hasattr(loader, 'sampler') and hasattr(loader.sampler, 'set_epoch'):
+            loader.sampler.set_epoch(42)  # Fixed seed for reproducibility
+
         with torch.no_grad():
             for xbatch, _, _ in loader:
                 _, z = net.forward_with_latent(xbatch)
@@ -643,6 +647,10 @@ class NN(CardinalityEstimationAlg):
         net.eval()
         collected = defaultdict(list)
         num_rows = 0
+
+        # Set fixed seed for deterministic sampling across epochs
+        if hasattr(loader, 'sampler') and hasattr(loader.sampler, 'set_epoch'):
+            loader.sampler.set_epoch(42)  # Fixed seed for reproducibility
 
         with torch.no_grad():
             for xbatch, _, _ in loader:
