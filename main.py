@@ -12,6 +12,8 @@ from cardinality_estimation.featurizer import *
 from cardinality_estimation.dataset import QueryDataset, load_qdata
 from cardinality_estimation import get_alg
 from evaluation.eval_fns import get_eval_fn
+# Distribution table utilities
+from compute_dist_table import compute_distributions_for_files, compute_distributions_for_qreps
 # import glob
 import argparse
 # import random
@@ -174,14 +176,15 @@ def extract_cardinalities(qreps, ests):
     
     return pd.DataFrame(card_data)
 
-def undersample_train_queries(trainqs, eqs):
+def undersample_train_queries(trainqs, eqs, seed=None):
     """
     Undersample source (trainqs) to match target (evalqs) size.
     """
     total_evalqs_count = sum(eqs)
     if len(trainqs) > total_evalqs_count:
-        np.random.seed(args.random_seed)
-        indices = np.random.choice(len(trainqs), size=total_evalqs_count, replace=False)
+        seed = args.random_seed if seed is None else seed
+        rng = np.random.RandomState(seed)
+        indices = rng.choice(len(trainqs), size=total_evalqs_count, replace=False)
         trainqs = [trainqs[i] for i in sorted(indices)]
         print(f"Undersampled trainqs to {len(trainqs)} to match evalqs size ({total_evalqs_count})")
     elif len(trainqs) < total_evalqs_count:
@@ -189,7 +192,7 @@ def undersample_train_queries(trainqs, eqs):
     
     return trainqs
 
-def undersample_train_queries_by_subquery_count(trainqs, evalqs):
+def undersample_train_queries_by_subquery_count(trainqs, evalqs, seed=None):
     """
     Undersample source (trainqs) to match target (evalqs) by total subquery count.
     
@@ -217,8 +220,9 @@ def undersample_train_queries_by_subquery_count(trainqs, evalqs):
         train_subquery_counts.append(count)
     
     # Undersample trainqs to match eval subquery count
-    np.random.seed(args.random_seed)
-    indices = np.random.permutation(len(trainqs))
+    seed = args.random_seed if seed is None else seed
+    rng = np.random.RandomState(seed)
+    indices = rng.permutation(len(trainqs))
     selected_indices = []
     total_train_subqueries = 0
     
@@ -441,6 +445,11 @@ def main():
                 tags=wandb_tags)
 
     train_qfns, test_qfns, val_qfns, eval_qfns = get_query_splits(cfg["data"])
+    # compute_distributions_for_files("test",test_qfns,10)
+    # compute_distributions_for_files("train",train_qfns,10)
+    # compute_distributions_for_files("val",val_qfns,10)
+    # compute_distributions_for_files("eval",eval_qfns[0])
+
     trainqs = load_qdata(train_qfns)
     # Note: can be quite memory intensive to load them all; might want to just
     # keep around the qfns and load them as needed
@@ -465,11 +474,19 @@ def main():
     print("""Selected Queries: {} train, {} test, {} val, {} eval"""\
             .format(len(trainqs), len(testqs), len(valqs), sum(eqs)))
 
+    # compute_distributions_for_qreps("train", trainqs)
+    # compute_distributions_for_qreps("val", valqs)
+    # compute_distributions_for_qreps("test", testqs)
+    # for idx, evalq in enumerate(evalqs):
+    #     raw_label = eval_qdirs[idx] if idx < len(eval_qdirs) else f"eval_{idx}"
+    #     label = os.path.basename(os.path.normpath(raw_label)) or f"eval_{idx}"
+    #     compute_distributions_for_qreps(f"eval_{label}", evalq)
+
     # Undersample source (trainqs) to match target (evalqs) size
     # Use undersample_train_queries() to match query count
     # OR use undersample_train_queries_by_subquery_count() to match total subquery count
-   # trainqs = undersample_train_queries_by_subquery_count(trainqs, evalqs)
-    #trainqs = undersample_train_queries(trainqs, eqs)
+    # trainqs = undersample_train_queries_by_subquery_count(trainqs, evalqs, seed=args.undersample_seed)
+    trainqs = undersample_train_queries(trainqs, eqs, seed=args.undersample_seed)
 
     # only needs featurizer for learned models
     if args.alg in ["xgb", "fcnn", "mscn", "mscn_joinkey", "mstn"]:
@@ -681,6 +698,44 @@ def main():
             eval_alg(alg, eval_fns, evalq, cfg, eval_dir_name, featurizer=featurizer)
             execution_time = time.time() - start_time
             print(f"Evaluation time on held-out eval set {ei}: {execution_time:.2f} seconds")
+
+            if args.baselines is not None:
+                baseline_modes = [
+                    b.strip().lower() for b in args.baselines.split(",") if b.strip()
+                ]
+            else:
+                baseline_modes = []
+
+            source_mean = None
+            if "mean_source" in baseline_modes:
+                source_mean = compute_mean_cardinality(trainqs)
+                main_logger.info(f"Baseline mean_source value: {source_mean:.4f}")
+
+            for baseline in baseline_modes:
+                if baseline == "mean_source":
+                    value = source_mean
+                elif baseline == "constant":
+                    value = args.baseline_constant
+                elif baseline == "target_mean":
+                    fit_qs, eval_qs = split_queries_for_baseline(
+                        evalq,
+                        fit_fraction=args.baseline_target_fit_frac,
+                        seed=args.random_seed,
+                    )
+                    target_mean = compute_mean_cardinality(fit_qs)
+                    main_logger.info(
+                        f"Target baseline for {eval_dir_name}: fit={len(fit_qs)} eval={len(eval_qs)} mean={target_mean:.4f}"
+                    )
+                    ests = make_constant_ests(eval_qs, target_mean)
+                    eval_baseline("target_mean", eval_fns, eval_qs, cfg,
+                                  f"{eval_dir_name}-target", ests, featurizer=featurizer)
+                    continue
+                else:
+                    main_logger.info(f"Unknown baseline '{baseline}', skipping.")
+                    continue
+
+                ests = make_constant_ests(evalq, value)
+                eval_baseline(baseline, eval_fns, evalq, cfg, eval_dir_name, ests, featurizer=featurizer)
             del evalq[:]
 
 def read_flags():
@@ -725,6 +780,9 @@ def read_flags():
             default=1e-3)
     parser.add_argument("--random_seed", type=int, required=False,
             default=42)
+    parser.add_argument("--undersample_seed", type=int, required=False,
+            default=None,
+            help="Optional seed for undersampling (defaults to --random_seed)")
     return parser.parse_args()
 
 if __name__ == "__main__":
