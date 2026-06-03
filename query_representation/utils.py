@@ -74,6 +74,7 @@ def load_rts():
     return rtdf
 
 def load_qdata_onlypg_plan(fns, data_params, skip_timeouts=False):
+    from .query import load_qrep
     qreps = []
     rtdf = load_rts()
 
@@ -128,6 +129,7 @@ def load_qdata_onlypg_plan(fns, data_params, skip_timeouts=False):
     return qreps
 
 def load_qdata(fns):
+    from .query import load_qrep
     qreps = []
     for qfn in fns:
         qrep = load_qrep(qfn)
@@ -1008,8 +1010,8 @@ def extract_predicates(query):
     elif "::int" in query:
         query = query.replace("::int", "")
     # really fucking dumb
-    bad_str1 = "mii2.info ~ '^(?:[1-9]\d*|0)?(?:\.\d+)?$' AND"
-    bad_str2 = "mii1.info ~ '^(?:[1-9]\d*|0)?(?:\.\d+)?$' AND"
+    bad_str1 = r"mii2.info ~ '^(?:[1-9]\d*|0)?(?:\.\d+)?$' AND"
+    bad_str2 = r"mii1.info ~ '^(?:[1-9]\d*|0)?(?:\.\d+)?$' AND"
     if bad_str1 in query:
         query = query.replace(bad_str1, "")
 

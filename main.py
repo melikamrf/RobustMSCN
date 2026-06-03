@@ -1,6 +1,7 @@
 import sys
 sys.path.append(".")
 # from query_representation.query import *
+from compute_dist_table import compute_distributions_for_qreps, compute_jsd
 from query_representation.utils import get_query_splits
 
 import os
@@ -12,6 +13,8 @@ from cardinality_estimation.featurizer import *
 from cardinality_estimation.dataset import QueryDataset, load_qdata
 from cardinality_estimation import get_alg
 from evaluation.eval_fns import get_eval_fn
+# Distribution table utilities
+#from compute_dist_table import compute_distributions_for_files, compute_distributions_for_qreps
 # import glob
 import argparse
 # import random
@@ -41,6 +44,62 @@ import time
 
 import pandas as pd
 import numpy as np
+
+def calc_datasets_jsd(trainqs, valqs, testqs, evalqs, eval_qdirs):
+    """
+    Compute JSD between training and eval query distributions.
+    Optionally filter to only queries with a specific number of joins.
+    """
+
+    print("Calculating dataset distribution similarities (JSD) between train, val, test, and eval query sets...")
+
+    train_dist, train_df = compute_distributions_for_qreps("train", trainqs, return_df=True)
+    val_dist, val_df = compute_distributions_for_qreps("val", valqs, return_df=True)
+    test_dist, test_df = compute_distributions_for_qreps("test", testqs, return_df=True)
+
+    print(f"Joins JSD between train and val: {compute_jsd(train_dist['joins'], val_dist['joins'])}") 
+    print(f"Predicates JSD between train and val: {compute_jsd(train_dist['predicates'], val_dist['predicates'])}")
+
+    print(f"Joins JSD between train and test: {compute_jsd(train_dist['joins'], test_dist['joins'])}") 
+    print(f"Predicates JSD between train and test: {compute_jsd(train_dist['predicates'], test_dist['predicates'])}")
+    
+    
+    eval_dists = []
+    for idx, evalq in enumerate(evalqs):
+        raw_label = eval_qdirs[idx] if idx < len(eval_qdirs) else f"eval_{idx}"
+        label = os.path.basename(os.path.normpath(raw_label)) or f"eval_{idx}"
+        eval_dist, eval_df = compute_distributions_for_qreps(f"eval_{label}", evalq, return_df=True)
+        eval_dists.append(eval_dist)
+        print(f"Joins JSD between train and eval {label}: {compute_jsd(train_dist['joins'], eval_dists[idx]['joins'])}")
+        print(f"Predicates JSD between train and eval {label}: {compute_jsd(train_dist['predicates'], eval_dists[idx]['predicates'])}")
+        print(f"Tables JSD between train and eval {label}: {compute_jsd(train_dist['tables'], eval_dists[idx]['tables'])}")
+
+    print("=="*50)
+
+    for i in range(3):  #TODO: make this configurable or automatically determine based on data
+        print(f"Computing distributions for join count {i}...")
+        train_dist, train_df = compute_distributions_for_qreps("train", trainqs, return_df=True, num_joins=i)
+        val_dist, val_df = compute_distributions_for_qreps("val", valqs, return_df=True, num_joins=i)
+        test_dist, test_df = compute_distributions_for_qreps("test", testqs, return_df=True, num_joins=i)
+
+        print(f"Joins JSD between train and val: {compute_jsd(train_dist['joins'], val_dist['joins'])}") 
+        print(f"Predicates JSD between train and val: {compute_jsd(train_dist['predicates'], val_dist['predicates'])}")
+
+        print(f"Joins JSD between train and test: {compute_jsd(train_dist['joins'], test_dist['joins'])}") 
+        print(f"Predicates JSD between train and test: {compute_jsd(train_dist['predicates'], test_dist['predicates'])}")
+        
+     
+        eval_dists = []
+        for idx, evalq in enumerate(evalqs):
+            raw_label = eval_qdirs[idx] if idx < len(eval_qdirs) else f"eval_{idx}"
+            label = os.path.basename(os.path.normpath(raw_label)) or f"eval_{idx}"
+            eval_dist, eval_df = compute_distributions_for_qreps(f"eval_{label}", evalq, return_df=True, num_joins=i)
+            eval_dists.append(eval_dist)
+            print(f"Joins JSD between train and eval {label}: {compute_jsd(train_dist['joins'], eval_dists[idx]['joins'])}")
+            print(f"Predicates JSD between train and eval {label}: {compute_jsd(train_dist['predicates'], eval_dists[idx]['predicates'])}")
+            print(f"Tables JSD between train and eval {label}: {compute_jsd(train_dist['tables'], eval_dists[idx]['tables'])}")
+
+
 
 
 def split_queries_for_discriminator(target_queries, holdout_fraction=0.5, random_state=42):
@@ -174,6 +233,70 @@ def extract_cardinalities(qreps, ests):
     
     return pd.DataFrame(card_data)
 
+def undersample_train_queries(trainqs, eqs, seed=None):
+    """
+    Undersample source (trainqs) to match target (evalqs) size.
+    """
+    total_evalqs_count = sum(eqs)
+    if len(trainqs) > total_evalqs_count:
+        seed = args.random_seed if seed is None else seed
+        rng = np.random.RandomState(seed)
+        indices = rng.choice(len(trainqs), size=total_evalqs_count, replace=False)
+        trainqs = [trainqs[i] for i in sorted(indices)]
+        print(f"Undersampled trainqs to {len(trainqs)} to match evalqs size ({total_evalqs_count})")
+    elif len(trainqs) < total_evalqs_count:
+        print(f"WARNING: trainqs size ({len(trainqs)}) is already smaller than evalqs size ({total_evalqs_count}). No undersampling performed.")
+    
+    return trainqs
+
+def undersample_train_queries_by_subquery_count(trainqs, evalqs, seed=None):
+    """
+    Undersample source (trainqs) to match target (evalqs) by total subquery count.
+    
+    Args:
+        trainqs: List of training queries
+        evalqs: List of lists of eval queries
+        
+    Returns:
+        Undersampled trainqs list with approximately same subquery count as evalqs
+    """
+    # Count total subqueries in evalqs
+    total_eval_subqueries = 0
+    for evalq_set in evalqs:
+        for qrep in evalq_set:
+            if "subset_graph" in qrep:
+                total_eval_subqueries += len(qrep["subset_graph"].nodes())
+    
+    # Count subqueries per training query
+    train_subquery_counts = []
+    for qrep in trainqs:
+        if "subset_graph" in qrep:
+            count = len(qrep["subset_graph"].nodes())
+        else:
+            count = 1
+        train_subquery_counts.append(count)
+    
+    # Undersample trainqs to match eval subquery count
+    seed = args.random_seed if seed is None else seed
+    rng = np.random.RandomState(seed)
+    indices = rng.permutation(len(trainqs))
+    selected_indices = []
+    total_train_subqueries = 0
+    
+    for idx in indices:
+        subquery_count = train_subquery_counts[idx]
+        if total_train_subqueries + subquery_count <= total_eval_subqueries:
+            selected_indices.append(idx)
+            total_train_subqueries += subquery_count
+    
+    # Sort to preserve original order
+    selected_indices = sorted(selected_indices)
+    trainqs = [trainqs[i] for i in selected_indices]
+    
+    print(f"Undersampled trainqs: {len(trainqs)} queries with {total_train_subqueries} subqueries to match evalqs ({total_eval_subqueries} subqueries)")
+    
+    return trainqs
+
 def update_labels(qreps):
     """
     Add residual labels to qreps without overwriting true cardinalities.
@@ -228,7 +351,7 @@ def eval_alg(alg, eval_funcs, qreps, cfg,
     df.to_csv(card_path, index=False)
     print(f"Saved {len(df)} query cardinalities to CSV")
 
-    if samples_label != "train" and cfg["eval"]["save_test_preds"]:
+    if cfg["eval"]["save_test_preds"]:
         preds_dir = os.path.join(rdir, samples_label + "-preds")
         make_dir(preds_dir)
         for i,qrep in enumerate(qreps):
@@ -256,10 +379,12 @@ def eval_alg(alg, eval_funcs, qreps, cfg,
                 use_wandb = cfg["eval"]["use_wandb"],
                 featurizer = featurizer, alg=alg)
 
-        print("{}, {}, {}, #samples: {}, {}: mean: {}, median: {}, 99p: {}, max: {}"\
+        print("{}, {}, {}, #samples: {}, {}: mean: {}, 25p: {}, median: {}, 75p: {}, 99p: {}, max: {}"\
                 .format(cfg["db"]["db_name"], samples_label, alg, len(errors),
                     efunc.__str__(), np.round(np.mean(errors),3),
+                    np.round(np.percentile(errors,25),3),
                     np.round(np.median(errors),3),
+                    np.round(np.percentile(errors,75),3),
                     np.round(np.percentile(errors,99),3),
                     np.round(np.max(errors))))
 
@@ -391,8 +516,11 @@ def main():
         testqs = update_labels(testqs)
     
     eval_qdirs = cfg["data"]["eval_query_dir"].split(",")
+    print(f"Eval query directories: {eval_qdirs}")
+
     evalqs = []
     for eval_qfn in eval_qfns:
+        print(f"Loading eval queries from: {eval_qfn}")
         temp_evalqs = load_qdata(eval_qfn)
         if args.learn_residual:
             temp_evalqs = update_labels(temp_evalqs)
@@ -402,6 +530,15 @@ def main():
     eqs = [len(eq) for eq in evalqs]
     print("""Selected Queries: {} train, {} test, {} val, {} eval"""\
             .format(len(trainqs), len(testqs), len(valqs), sum(eqs)))
+
+    calc_datasets_jsd(trainqs, valqs, testqs, evalqs, eval_qdirs)
+   
+
+    # Undersample source (trainqs) to match target (evalqs) size
+    # Use undersample_train_queries() to match query count
+    # OR use undersample_train_queries_by_subquery_count() to match total subquery count
+    # trainqs = undersample_train_queries_by_subquery_count(trainqs, evalqs, seed=args.undersample_seed)
+    #trainqs = undersample_train_queries(trainqs, eqs, seed=args.undersample_seed)
 
     # only needs featurizer for learned models
     if args.alg in ["xgb", "fcnn", "mscn", "mscn_joinkey", "mstn"]:
@@ -585,10 +722,10 @@ def main():
                     result_dir=args.result_dir,
                     adv_weights=disc_weights, adv_weight_level="dataset")
 
-    # start_time = time.time()
-    # eval_alg(alg, eval_fns, trainqs, cfg, "train", featurizer=featurizer)
-    # execution_time = time.time() - start_time
-    # print(f"{args.alg} Evaluation time on train set: {execution_time:.2f} seconds")
+    start_time = time.time()
+    eval_alg(alg, eval_fns, trainqs, cfg, "train", featurizer=featurizer)
+    execution_time = time.time() - start_time
+    print(f"{args.alg} Evaluation time on train set: {execution_time:.2f} seconds")
 
     # if len(valqs) > 0:
     #     start_time = time.time()
@@ -657,6 +794,9 @@ def read_flags():
             default=1e-3)
     parser.add_argument("--random_seed", type=int, required=False,
             default=42)
+    parser.add_argument("--undersample_seed", type=int, required=False,
+            default=None,
+            help="Optional seed for undersampling (defaults to --random_seed)")
     return parser.parse_args()
 
 if __name__ == "__main__":
