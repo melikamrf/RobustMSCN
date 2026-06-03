@@ -545,6 +545,96 @@ class NN(CardinalityEstimationAlg):
             target_loader = self._build_latent_visualization_loader(target_samples)
         self.latent_viz_target_loader = target_loader
 
+    def _latent_mmd_enabled(self):
+        return bool(getattr(self, "track_latent_mmd", True))
+
+    def _latent_mmd_sample_limit(self):
+        default_limit = getattr(self, "latent_viz_max_points", 2000)
+        configured_limit = getattr(self, "latent_mmd_max_points", default_limit)
+        return max(1, int(configured_limit or default_limit))
+
+    def _ensure_latent_mmd_ready(self):
+        if not self._latent_mmd_enabled():
+            return False
+        if not hasattr(self, "net"):
+            return False
+
+        if hasattr(self.net, "configure_auxiliary_components"):
+            self.net.configure_auxiliary_components(enable_latent_interface=True)
+
+        return hasattr(self.net, "forward_with_latent") and \
+            hasattr(self.net, "compute_mmd")
+
+    def _collect_latent_embeddings(self, loader, max_points):
+        if loader is None:
+            return None
+        if not self._ensure_latent_mmd_ready():
+            return None
+
+        net = self.net
+        was_training = net.training
+        net.eval()
+        collected = []
+        num_rows = 0
+
+        # Set fixed seed for deterministic sampling across epochs
+        if hasattr(loader, 'sampler') and hasattr(loader.sampler, 'set_epoch'):
+            loader.sampler.set_epoch(42)  # Fixed seed for reproducibility
+
+        with torch.no_grad():
+            for xbatch, _, _ in loader:
+                _, z = net.forward_with_latent(xbatch)
+                if z.ndim == 1:
+                    z = z.reshape(1, -1)
+
+                remaining = max_points - num_rows
+                if remaining <= 0:
+                    break
+
+                take = min(remaining, z.shape[0])
+                collected.append(z[:take].detach().cpu())
+                num_rows += take
+
+                if num_rows >= max_points:
+                    break
+
+        if was_training:
+            net.train()
+
+        if len(collected) == 0:
+            return None
+
+        return torch.cat(collected, dim=0)
+
+    def compute_latent_mmd(self, source_loader=None, target_loader=None):
+        if not self._ensure_latent_mmd_ready():
+            return None
+
+        if source_loader is None:
+            source_loader = getattr(self, "trainloader", None)
+        if target_loader is None:
+            target_loader = getattr(self, "target_loader", None)
+        if target_loader is None:
+            target_loader = getattr(self, "latent_viz_target_loader", None)
+
+        if source_loader is None or target_loader is None:
+            return None
+
+        max_points = self._latent_mmd_sample_limit()
+        z_source = self._collect_latent_embeddings(source_loader, max_points)
+        z_target = self._collect_latent_embeddings(target_loader, max_points)
+        if z_source is None or z_target is None:
+            return None
+        if z_source.shape[0] == 0 or z_target.shape[0] == 0:
+            return None
+
+        return self.net.compute_mmd(
+            z_source,
+            z_target,
+            detach=True,
+            as_float=True,
+        )
+
     def _collect_latent_visualization_views(self, loader, max_points):
         if loader is None:
             return {}
@@ -557,6 +647,10 @@ class NN(CardinalityEstimationAlg):
         net.eval()
         collected = defaultdict(list)
         num_rows = 0
+
+        # Set fixed seed for deterministic sampling across epochs
+        if hasattr(loader, 'sampler') and hasattr(loader.sampler, 'set_epoch'):
+            loader.sampler.set_epoch(42)  # Fixed seed for reproducibility
 
         with torch.no_grad():
             for xbatch, _, _ in loader:
@@ -1101,6 +1195,10 @@ class NN(CardinalityEstimationAlg):
         disc_loss = [m["loss_d"] for m in self.adversarial_train_history]
         gen_loss = [m["loss_g"] for m in self.adversarial_train_history]
         val_loss = [m.get("val_loss", np.nan) for m in self.adversarial_train_history]
+        latent_mmd = [m.get("latent_mmd", np.nan) for m in self.adversarial_train_history]
+        latent_mmd_mask = np.isfinite(np.asarray(latent_mmd))
+        latent_mmd_epochs = epochs[latent_mmd_mask]
+        latent_mmd_vals = np.asarray(latent_mmd)[latent_mmd_mask]
         disc_acc = [m["disc_acc"] for m in self.adversarial_train_history]
         source_acc = [m["disc_acc_source"] for m in self.adversarial_train_history]
         target_acc = [m["disc_acc_target"] for m in self.adversarial_train_history]
@@ -1130,6 +1228,16 @@ class NN(CardinalityEstimationAlg):
 
         axes[1].plot(epochs, disc_loss, label="Discriminator Loss")
         axes[1].plot(epochs, gen_loss, label="Generator Loss")
+        if latent_mmd_mask.any():
+            axes[1].plot(
+                latent_mmd_epochs,
+                latent_mmd_vals,
+                label="Latent MMD",
+                color="#2ca02c",
+                marker="o",
+                linestyle="--",
+                linewidth=2,
+            )
         axes[1].set_title("Adversarial Losses")
         axes[1].set_xlabel("Epoch")
         axes[1].set_ylabel("Loss")
@@ -1149,6 +1257,65 @@ class NN(CardinalityEstimationAlg):
 
         plt.tight_layout()
         plot_path = os.path.join(save_dir, "adversarial_training_curves.png")
+        fig.savefig(plot_path, dpi=200, bbox_inches="tight")
+        plt.close(fig)
+        return plot_path
+
+    def _save_standard_training_plot(self, save_dir):
+        if not hasattr(self, "standard_train_history"):
+            return None
+        if len(self.standard_train_history) == 0:
+            return None
+
+        os.makedirs(save_dir, exist_ok=True)
+
+        epochs = np.arange(len(self.standard_train_history))
+        train_loss = [m.get("train_loss", np.nan) for m in self.standard_train_history]
+        val_loss = [m.get("val_loss", np.nan) for m in self.standard_train_history]
+        latent_mmd = [m.get("latent_mmd", np.nan) for m in self.standard_train_history]
+
+        train_mask = np.isfinite(np.asarray(train_loss))
+        val_mask = np.isfinite(np.asarray(val_loss))
+        latent_mask = np.isfinite(np.asarray(latent_mmd))
+
+        fig, ax = plt.subplots(1, 1, figsize=(9, 4))
+
+        if train_mask.any():
+            ax.plot(
+                epochs[train_mask],
+                np.asarray(train_loss)[train_mask],
+                label="Train Loss",
+                color="#1f77b4",
+            )
+        if val_mask.any():
+            ax.plot(
+                epochs[val_mask],
+                np.asarray(val_loss)[val_mask],
+                label="Validation Loss",
+                color="#ff7f0e",
+                linestyle="--",
+                marker="o",
+                markersize=3,
+            )
+        if latent_mask.any():
+            ax.plot(
+                epochs[latent_mask],
+                np.asarray(latent_mmd)[latent_mask],
+                label="Latent MMD",
+                color="#2ca02c",
+                linestyle="--",
+                marker="o",
+                markersize=3,
+            )
+
+        ax.set_title("Training Curves")
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("Loss")
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+
+        plt.tight_layout()
+        plot_path = os.path.join(save_dir, "standard_training_curves.png")
         fig.savefig(plot_path, dpi=200, bbox_inches="tight")
         plt.close(fig)
         return plot_path
@@ -1469,6 +1636,7 @@ class NN(CardinalityEstimationAlg):
         self.all_errs = []
         self.best_model_epoch = -1
         self.model_weights = []
+        self.standard_train_history = []
         self.adv_weights = None
         self.adv_weight_level = kwargs.get("adv_weight_level", "dataset")
 
@@ -1656,11 +1824,36 @@ class NN(CardinalityEstimationAlg):
         # pdb.set_trace()
 
         for self.epoch in range(0,total_epochs):
-            if self.epoch % self.eval_epoch == 0:
+            should_eval = (self.epoch % self.eval_epoch == 0)
+            if should_eval:
                 self.periodic_eval()
 
-            self.train_one_epoch()
+            train_loss = self.train_one_epoch()
             self._maybe_save_latent_visualization(run_plot_dir)
+
+            epoch_metrics = {"train_loss": train_loss}
+
+            if should_eval and "val" in self.eval_ds:
+                val_preds, val_ys = self._eval_ds(self.eval_ds["val"], self.samples["val"])
+                val_loss_metrics = self._compute_loss_metrics_from_numpy(val_preds, val_ys)
+                if val_loss_metrics["mean"] is not None:
+                    epoch_metrics["val_loss"] = val_loss_metrics["mean"]
+                    epoch_metrics["val_loss_median"] = val_loss_metrics["median"]
+                    epoch_metrics["val_loss_p99"] = val_loss_metrics["p99"]
+
+            if should_eval:
+                latent_mmd = self.compute_latent_mmd()
+                if latent_mmd is not None:
+                    epoch_metrics["latent_mmd"] = latent_mmd
+                    print("Epoch {} latent_mmd={:.6f}".format(
+                        self.epoch, latent_mmd))
+                    if self.use_wandb:
+                        wandb.log({
+                            "LatentMMD": latent_mmd,
+                            "epoch": self.epoch,
+                        })
+
+            self.standard_train_history.append(epoch_metrics)
 
             self.model_weights.append(copy.deepcopy(self.net.state_dict()))
 
@@ -1717,6 +1910,11 @@ class NN(CardinalityEstimationAlg):
 
             # self.nets[0].load_state_dict(self.best_model_dict)
             # self.nets[0].eval()
+
+        std_plot_path = self._save_standard_training_plot(run_plot_dir)
+        if std_plot_path is not None:
+            print("Saved standard training plot to:", std_plot_path)
+
         self._maybe_save_latent_visualization(run_plot_dir, force=True)
         self.save_model(save_dir='./saved_models', suffix_name="_epoch"+str(self.epoch))
 
@@ -1927,13 +2125,17 @@ class NN(CardinalityEstimationAlg):
                     epoch_metrics["val_loss"] = val_loss_metrics["mean"]
                     epoch_metrics["val_loss_median"] = val_loss_metrics["median"]
                     epoch_metrics["val_loss_p99"] = val_loss_metrics["p99"]
+            if should_eval:
+                latent_mmd = self.compute_latent_mmd()
+                if latent_mmd is not None:
+                    epoch_metrics["latent_mmd"] = latent_mmd
 
             self.adversarial_train_history.append(epoch_metrics)
             self.model_weights.append(copy.deepcopy(self.net.state_dict()))
 
             if self.epoch % 2 == 0:
                 print(
-                    "Epoch {} took {}s, reg_loss={:.6f}, recon_loss={:.6f}, phase1_loss={:.6f}, disc_loss={:.6f}, disc_grad_norm={:.6f}, gen_loss={:.6f}, disc_acc={:.6f}, source_acc={:.6f}, target_acc={:.6f}, fool_acc={:.6f}, val_loss={:.6f}(median={:.6f}, 99p={:.6f})".format(
+                    "Epoch {} took {}s, reg_loss={:.6f}, recon_loss={:.6f}, phase1_loss={:.6f}, disc_loss={:.6f}, disc_grad_norm={:.6f}, gen_loss={:.6f}, disc_acc={:.6f}, source_acc={:.6f}, target_acc={:.6f}, fool_acc={:.6f}, latent_mmd={:.6f}, val_loss={:.6f}(median={:.6f}, 99p={:.6f})".format(
                         self.epoch,
                         epoch_metrics["epoch_seconds"],
                         epoch_metrics["loss_reg"],
@@ -1946,6 +2148,7 @@ class NN(CardinalityEstimationAlg):
                         epoch_metrics["disc_acc_source"],
                         epoch_metrics["disc_acc_target"],
                         epoch_metrics["gen_fool_acc"],
+                        epoch_metrics.get("latent_mmd", float("nan")),
                         epoch_metrics.get("val_loss", float("nan")),
                         epoch_metrics.get("val_loss_median", float("nan")),
                         epoch_metrics.get("val_loss_p99", float("nan")),
@@ -1965,6 +2168,8 @@ class NN(CardinalityEstimationAlg):
                 }
                 if "disc_grad_norm" in epoch_metrics:
                     wandb_payload["Adv-Disc-Grad-Norm"] = epoch_metrics["disc_grad_norm"]
+                if "latent_mmd" in epoch_metrics:
+                    wandb_payload["LatentMMD"] = epoch_metrics["latent_mmd"]
                 if "val_loss" in epoch_metrics:
                     wandb_payload["ValLoss"] = epoch_metrics["val_loss"]
                 if "val_loss_median" in epoch_metrics:
@@ -2210,13 +2415,17 @@ class NN(CardinalityEstimationAlg):
                     epoch_metrics["val_loss"] = val_loss_metrics["mean"]
                     epoch_metrics["val_loss_median"] = val_loss_metrics["median"]
                     epoch_metrics["val_loss_p99"] = val_loss_metrics["p99"]
+            if should_eval:
+                latent_mmd = self.compute_latent_mmd()
+                if latent_mmd is not None:
+                    epoch_metrics["latent_mmd"] = latent_mmd
 
             self.adversarial_train_history.append(epoch_metrics)
             self.model_weights.append(copy.deepcopy(self.net.state_dict()))
 
             if self.epoch % 2 == 0:
                 print(
-                    "Epoch {} took {}s, reg_loss={}, disc_loss={}, gen_loss={}, disc_acc={}, source_acc={}, fake_acc={}, fool_acc={}, val_loss={}(median={}, 99p={})".format(
+                    "Epoch {} took {}s, reg_loss={}, disc_loss={}, gen_loss={}, disc_acc={}, source_acc={}, fake_acc={}, fool_acc={}, latent_mmd={}, val_loss={}(median={}, 99p={})".format(
                         self.epoch,
                         epoch_metrics["epoch_seconds"],
                         round(epoch_metrics["loss_reg"], 6),
@@ -2226,6 +2435,7 @@ class NN(CardinalityEstimationAlg):
                         round(epoch_metrics["disc_acc_source"], 6),
                         round(epoch_metrics["disc_acc_fake"], 6),
                         round(epoch_metrics["gen_fool_acc"], 6),
+                        round(epoch_metrics.get("latent_mmd", float("nan")), 6),
                         round(epoch_metrics.get("val_loss", float("nan")), 6),
                         round(epoch_metrics.get("val_loss_median", float("nan")), 6),
                         round(epoch_metrics.get("val_loss_p99", float("nan")), 6),
@@ -2245,6 +2455,8 @@ class NN(CardinalityEstimationAlg):
                     "Adv-Gen-Fool-Acc": epoch_metrics["gen_fool_acc"],
                     "epoch": self.epoch,
                 }
+                if "latent_mmd" in epoch_metrics:
+                    wandb_payload["LatentMMD"] = epoch_metrics["latent_mmd"]
                 if "val_loss" in epoch_metrics:
                     wandb_payload["ValLoss"] = epoch_metrics["val_loss"]
                 if "val_loss_median" in epoch_metrics:
@@ -2671,6 +2883,8 @@ class NN(CardinalityEstimationAlg):
 
         if self.use_wandb:
             wandb.log({"TrainLoss": curloss, "epoch":self.epoch})
+
+        return curloss
 
     def test(self, test_samples, **kwargs):
         '''
