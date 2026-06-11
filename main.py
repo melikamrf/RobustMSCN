@@ -50,54 +50,63 @@ def calc_datasets_jsd(trainqs, valqs, testqs, evalqs, eval_qdirs):
     Compute JSD between training and eval query distributions.
     Optionally filter to only queries with a specific number of joins.
     """
+    def _max_join_count(qreps):
+        max_join_count = 0
+        for qrep in qreps:
+            subset_graph = qrep.get("subset_graph")
+            join_graph = qrep.get("join_graph")
+            if subset_graph is None or join_graph is None:
+                continue
+            for subquery_id in subset_graph.nodes():
+                if not subquery_id:
+                    continue
+                subplan_graph = join_graph.subgraph(subquery_id)
+                max_join_count = max(max_join_count, subplan_graph.number_of_edges())
+        return max_join_count
+
+    def _collect_jsd_rows(rows, source_label, source_qs, target_label, target_qs):
+        source_max_joins = _max_join_count(source_qs)
+        target_max_joins = _max_join_count(target_qs)
+        max_shared_joins = min(source_max_joins, target_max_joins)
+
+        for num_joins in list(range(max_shared_joins + 1)) + [None]:
+            suffix = "all" if num_joins is None else f"joins_{num_joins}"
+            source_dist, _ = compute_distributions_for_qreps(
+                f"{source_label}_{suffix}", source_qs, return_df=True, num_joins=num_joins
+            )
+            target_dist, _ = compute_distributions_for_qreps(
+                f"{target_label}_{suffix}", target_qs, return_df=True, num_joins=num_joins
+            )
+
+            rows.append({
+                "source_split": source_label,
+                "target_split": target_label,
+                "num_joins": num_joins,
+                "jsd_joins": compute_jsd(source_dist["joins"], target_dist["joins"]),
+                "jsd_predicates": compute_jsd(source_dist["predicates"], target_dist["predicates"]),
+                "jsd_tables": compute_jsd(source_dist["tables"], target_dist["tables"]),
+            })
 
     print("Calculating dataset distribution similarities (JSD) between train, val, test, and eval query sets...")
 
-    train_dist, train_df = compute_distributions_for_qreps("train", trainqs, return_df=True)
-    val_dist, val_df = compute_distributions_for_qreps("val", valqs, return_df=True)
-    test_dist, test_df = compute_distributions_for_qreps("test", testqs, return_df=True)
+    rows = []
+    _collect_jsd_rows(rows, "train", trainqs, "val", valqs)
+    _collect_jsd_rows(rows, "train", trainqs, "test", testqs)
 
-    print(f"Joins JSD between train and val: {compute_jsd(train_dist['joins'], val_dist['joins'])}") 
-    print(f"Predicates JSD between train and val: {compute_jsd(train_dist['predicates'], val_dist['predicates'])}")
-
-    print(f"Joins JSD between train and test: {compute_jsd(train_dist['joins'], test_dist['joins'])}") 
-    print(f"Predicates JSD between train and test: {compute_jsd(train_dist['predicates'], test_dist['predicates'])}")
-    
-    
-    eval_dists = []
     for idx, evalq in enumerate(evalqs):
         raw_label = eval_qdirs[idx] if idx < len(eval_qdirs) else f"eval_{idx}"
         label = os.path.basename(os.path.normpath(raw_label)) or f"eval_{idx}"
-        eval_dist, eval_df = compute_distributions_for_qreps(f"eval_{label}", evalq, return_df=True)
-        eval_dists.append(eval_dist)
-        print(f"Joins JSD between train and eval {label}: {compute_jsd(train_dist['joins'], eval_dists[idx]['joins'])}")
-        print(f"Predicates JSD between train and eval {label}: {compute_jsd(train_dist['predicates'], eval_dists[idx]['predicates'])}")
-        print(f"Tables JSD between train and eval {label}: {compute_jsd(train_dist['tables'], eval_dists[idx]['tables'])}")
+        _collect_jsd_rows(rows, "train", trainqs, label, evalq)
 
-    print("=="*50)
+    jsd_df = pd.DataFrame(rows)
+    for _, row in jsd_df.iterrows():
+        join_scope = "all joins" if pd.isna(row["num_joins"]) else f"join count {int(row['num_joins'])}"
+        print(
+            f"{row['source_split']} vs {row['target_split']} ({join_scope}): "
+            f"joins={row['jsd_joins']:.6f}, predicates={row['jsd_predicates']:.6f}, tables={row['jsd_tables']:.6f}"
+        )
 
-    for i in range(3):  #TODO: make this configurable or automatically determine based on data
-        print(f"Computing distributions for join count {i}...")
-        train_dist, train_df = compute_distributions_for_qreps("train", trainqs, return_df=True, num_joins=i)
-        val_dist, val_df = compute_distributions_for_qreps("val", valqs, return_df=True, num_joins=i)
-        test_dist, test_df = compute_distributions_for_qreps("test", testqs, return_df=True, num_joins=i)
-
-        print(f"Joins JSD between train and val: {compute_jsd(train_dist['joins'], val_dist['joins'])}") 
-        print(f"Predicates JSD between train and val: {compute_jsd(train_dist['predicates'], val_dist['predicates'])}")
-
-        print(f"Joins JSD between train and test: {compute_jsd(train_dist['joins'], test_dist['joins'])}") 
-        print(f"Predicates JSD between train and test: {compute_jsd(train_dist['predicates'], test_dist['predicates'])}")
-        
-     
-        eval_dists = []
-        for idx, evalq in enumerate(evalqs):
-            raw_label = eval_qdirs[idx] if idx < len(eval_qdirs) else f"eval_{idx}"
-            label = os.path.basename(os.path.normpath(raw_label)) or f"eval_{idx}"
-            eval_dist, eval_df = compute_distributions_for_qreps(f"eval_{label}", evalq, return_df=True, num_joins=i)
-            eval_dists.append(eval_dist)
-            print(f"Joins JSD between train and eval {label}: {compute_jsd(train_dist['joins'], eval_dists[idx]['joins'])}")
-            print(f"Predicates JSD between train and eval {label}: {compute_jsd(train_dist['predicates'], eval_dists[idx]['predicates'])}")
-            print(f"Tables JSD between train and eval {label}: {compute_jsd(train_dist['tables'], eval_dists[idx]['tables'])}")
+    return jsd_df
 
 
 
@@ -516,11 +525,9 @@ def main():
         testqs = update_labels(testqs)
     
     eval_qdirs = cfg["data"]["eval_query_dir"].split(",")
-    print(f"Eval query directories: {eval_qdirs}")
 
     evalqs = []
     for eval_qfn in eval_qfns:
-        print(f"Loading eval queries from: {eval_qfn}")
         temp_evalqs = load_qdata(eval_qfn)
         if args.learn_residual:
             temp_evalqs = update_labels(temp_evalqs)
@@ -530,8 +537,6 @@ def main():
     eqs = [len(eq) for eq in evalqs]
     print("""Selected Queries: {} train, {} test, {} val, {} eval"""\
             .format(len(trainqs), len(testqs), len(valqs), sum(eqs)))
-
-    calc_datasets_jsd(trainqs, valqs, testqs, evalqs, eval_qdirs)
    
 
     # Undersample source (trainqs) to match target (evalqs) size
@@ -540,6 +545,15 @@ def main():
     # trainqs = undersample_train_queries_by_subquery_count(trainqs, evalqs, seed=args.undersample_seed)
     #trainqs = undersample_train_queries(trainqs, eqs, seed=args.undersample_seed)
 
+    # dataset_jsd_df = calc_datasets_jsd(trainqs, valqs, testqs, evalqs, eval_qdirs)
+    # if args.result_dir is not None:
+    #     os.makedirs(args.result_dir, exist_ok=True)
+    #     train_dataset = cfg["data"]["query_dir"].rstrip("/").split("/")[-1]
+    #     dataset_jsd_path = os.path.join(args.result_dir, f"dataset_jsd_{train_dataset}.csv")
+    #     dataset_jsd_df.to_csv(dataset_jsd_path, index=False)
+    #     print(f"Saved dataset JSD summary to {dataset_jsd_path}")
+
+        
     # only needs featurizer for learned models
     if args.alg in ["xgb", "fcnn", "mscn", "mscn_joinkey", "mstn"]:
         featurizer = get_featurizer(trainqs, valqs, testqs, evalqs)
@@ -795,7 +809,7 @@ def read_flags():
     parser.add_argument("--random_seed", type=int, required=False,
             default=42)
     parser.add_argument("--undersample_seed", type=int, required=False,
-            default=None,
+            default=42,
             help="Optional seed for undersampling (defaults to --random_seed)")
     return parser.parse_args()
 

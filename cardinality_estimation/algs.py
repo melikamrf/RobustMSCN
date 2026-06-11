@@ -545,6 +545,18 @@ class NN(CardinalityEstimationAlg):
             target_loader = self._build_latent_visualization_loader(target_samples)
         self.latent_viz_target_loader = target_loader
 
+    def _build_eval_dataset_loader(self, ds):
+        if ds is None:
+            return None
+
+        batch_size = 1 if self.load_query_together else self.mb_size
+        return data.DataLoader(
+            ds,
+            batch_size=batch_size,
+            shuffle=False,
+            collate_fn=self.collate_fn,
+        )
+
     def _latent_mmd_enabled(self):
         return bool(getattr(self, "track_latent_mmd", True))
 
@@ -634,6 +646,27 @@ class NN(CardinalityEstimationAlg):
             detach=True,
             as_float=True,
         )
+
+    def compute_eval_latent_mmds(self, source_loader=None):
+        if source_loader is None:
+            source_loader = getattr(self, "trainloader", None)
+        if source_loader is None:
+            return {}
+
+        eval_mmds = {}
+        for eval_name, eval_ds in self.eval_ds.items():
+            target_loader = self._build_eval_dataset_loader(eval_ds)
+            if target_loader is None:
+                continue
+
+            latent_mmd = self.compute_latent_mmd(
+                source_loader=source_loader,
+                target_loader=target_loader,
+            )
+            if latent_mmd is not None:
+                eval_mmds[eval_name] = latent_mmd
+
+        return eval_mmds
 
     def _collect_latent_visualization_views(self, loader, max_points):
         if loader is None:
@@ -1195,10 +1228,6 @@ class NN(CardinalityEstimationAlg):
         disc_loss = [m["loss_d"] for m in self.adversarial_train_history]
         gen_loss = [m["loss_g"] for m in self.adversarial_train_history]
         val_loss = [m.get("val_loss", np.nan) for m in self.adversarial_train_history]
-        latent_mmd = [m.get("latent_mmd", np.nan) for m in self.adversarial_train_history]
-        latent_mmd_mask = np.isfinite(np.asarray(latent_mmd))
-        latent_mmd_epochs = epochs[latent_mmd_mask]
-        latent_mmd_vals = np.asarray(latent_mmd)[latent_mmd_mask]
         disc_acc = [m["disc_acc"] for m in self.adversarial_train_history]
         source_acc = [m["disc_acc_source"] for m in self.adversarial_train_history]
         target_acc = [m["disc_acc_target"] for m in self.adversarial_train_history]
@@ -1228,16 +1257,6 @@ class NN(CardinalityEstimationAlg):
 
         axes[1].plot(epochs, disc_loss, label="Discriminator Loss")
         axes[1].plot(epochs, gen_loss, label="Generator Loss")
-        if latent_mmd_mask.any():
-            axes[1].plot(
-                latent_mmd_epochs,
-                latent_mmd_vals,
-                label="Latent MMD",
-                color="#2ca02c",
-                marker="o",
-                linestyle="--",
-                linewidth=2,
-            )
         axes[1].set_title("Adversarial Losses")
         axes[1].set_xlabel("Epoch")
         axes[1].set_ylabel("Loss")
@@ -1272,11 +1291,9 @@ class NN(CardinalityEstimationAlg):
         epochs = np.arange(len(self.standard_train_history))
         train_loss = [m.get("train_loss", np.nan) for m in self.standard_train_history]
         val_loss = [m.get("val_loss", np.nan) for m in self.standard_train_history]
-        latent_mmd = [m.get("latent_mmd", np.nan) for m in self.standard_train_history]
 
         train_mask = np.isfinite(np.asarray(train_loss))
         val_mask = np.isfinite(np.asarray(val_loss))
-        latent_mask = np.isfinite(np.asarray(latent_mmd))
 
         fig, ax = plt.subplots(1, 1, figsize=(9, 4))
 
@@ -1297,16 +1314,6 @@ class NN(CardinalityEstimationAlg):
                 marker="o",
                 markersize=3,
             )
-        if latent_mask.any():
-            ax.plot(
-                epochs[latent_mask],
-                np.asarray(latent_mmd)[latent_mask],
-                label="Latent MMD",
-                color="#2ca02c",
-                linestyle="--",
-                marker="o",
-                markersize=3,
-            )
 
         ax.set_title("Training Curves")
         ax.set_xlabel("Epoch")
@@ -1316,6 +1323,57 @@ class NN(CardinalityEstimationAlg):
 
         plt.tight_layout()
         plot_path = os.path.join(save_dir, "standard_training_curves.png")
+        fig.savefig(plot_path, dpi=200, bbox_inches="tight")
+        plt.close(fig)
+        return plot_path
+
+    def _save_latent_mmd_plot(self, history, save_dir, plot_name, title):
+        if history is None or len(history) == 0:
+            return None
+
+        series_names = []
+        for metrics in history:
+            eval_mmds = metrics.get("eval_latent_mmds", {})
+            for name in eval_mmds.keys():
+                if name not in series_names:
+                    series_names.append(name)
+
+        if len(series_names) == 0:
+            return None
+
+        os.makedirs(save_dir, exist_ok=True)
+        epochs = np.arange(len(history))
+        fig, ax = plt.subplots(1, 1, figsize=(10, 4))
+
+        for series_name in series_names:
+            values = []
+            for metrics in history:
+                eval_mmds = metrics.get("eval_latent_mmds", {})
+                values.append(eval_mmds.get(series_name, np.nan))
+
+            values = np.asarray(values, dtype=np.float64)
+            mask = np.isfinite(values)
+            if not mask.any():
+                continue
+
+            ax.plot(
+                epochs[mask],
+                values[mask],
+                marker="o",
+                linestyle="--",
+                linewidth=2,
+                markersize=3,
+                label=series_name,
+            )
+
+        ax.set_title(title)
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("MMD")
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+
+        plt.tight_layout()
+        plot_path = os.path.join(save_dir, plot_name)
         fig.savefig(plot_path, dpi=200, bbox_inches="tight")
         plt.close(fig)
         return plot_path
@@ -1842,14 +1900,22 @@ class NN(CardinalityEstimationAlg):
                     epoch_metrics["val_loss_p99"] = val_loss_metrics["p99"]
 
             if should_eval:
-                latent_mmd = self.compute_latent_mmd()
-                if latent_mmd is not None:
-                    epoch_metrics["latent_mmd"] = latent_mmd
-                    print("Epoch {} latent_mmd={:.6f}".format(
-                        self.epoch, latent_mmd))
+                eval_latent_mmds = self.compute_eval_latent_mmds()
+                if len(eval_latent_mmds) > 0:
+                    epoch_metrics["eval_latent_mmds"] = eval_latent_mmds
+                    epoch_metrics["latent_mmd"] = float(np.mean(list(eval_latent_mmds.values())))
+                    print(
+                        "Epoch {} latent_mmds={}".format(
+                            self.epoch,
+                            {
+                                key: round(val, 6)
+                                for key, val in eval_latent_mmds.items()
+                            },
+                        )
+                    )
                     if self.use_wandb:
                         wandb.log({
-                            "LatentMMD": latent_mmd,
+                            "LatentMMD": epoch_metrics["latent_mmd"],
                             "epoch": self.epoch,
                         })
 
@@ -1914,6 +1980,15 @@ class NN(CardinalityEstimationAlg):
         std_plot_path = self._save_standard_training_plot(run_plot_dir)
         if std_plot_path is not None:
             print("Saved standard training plot to:", std_plot_path)
+
+        std_mmd_plot_path = self._save_latent_mmd_plot(
+            self.standard_train_history,
+            run_plot_dir,
+            "standard_eval_latent_mmd.png",
+            "Latent MMD by Eval Dataset",
+        )
+        if std_mmd_plot_path is not None:
+            print("Saved standard latent MMD plot to:", std_mmd_plot_path)
 
         self._maybe_save_latent_visualization(run_plot_dir, force=True)
         self.save_model(save_dir='./saved_models', suffix_name="_epoch"+str(self.epoch))
@@ -2126,9 +2201,10 @@ class NN(CardinalityEstimationAlg):
                     epoch_metrics["val_loss_median"] = val_loss_metrics["median"]
                     epoch_metrics["val_loss_p99"] = val_loss_metrics["p99"]
             if should_eval:
-                latent_mmd = self.compute_latent_mmd()
-                if latent_mmd is not None:
-                    epoch_metrics["latent_mmd"] = latent_mmd
+                eval_latent_mmds = self.compute_eval_latent_mmds()
+                if len(eval_latent_mmds) > 0:
+                    epoch_metrics["eval_latent_mmds"] = eval_latent_mmds
+                    epoch_metrics["latent_mmd"] = float(np.mean(list(eval_latent_mmds.values())))
 
             self.adversarial_train_history.append(epoch_metrics)
             self.model_weights.append(copy.deepcopy(self.net.state_dict()))
@@ -2223,6 +2299,15 @@ class NN(CardinalityEstimationAlg):
         adv_plot_path = self._save_adversarial_training_plot(run_plot_dir)
         if adv_plot_path is not None:
             print("Saved adversarial training plot to:", adv_plot_path)
+
+        adv_mmd_plot_path = self._save_latent_mmd_plot(
+            self.adversarial_train_history,
+            run_plot_dir,
+            "adversarial_eval_latent_mmd.png",
+            "Latent MMD by Eval Dataset",
+        )
+        if adv_mmd_plot_path is not None:
+            print("Saved adversarial latent MMD plot to:", adv_mmd_plot_path)
         self._maybe_save_latent_visualization(run_plot_dir, force=True)
 
         self.save_model(save_dir="./saved_models", suffix_name="_epoch" + str(self.epoch))
@@ -2416,9 +2501,10 @@ class NN(CardinalityEstimationAlg):
                     epoch_metrics["val_loss_median"] = val_loss_metrics["median"]
                     epoch_metrics["val_loss_p99"] = val_loss_metrics["p99"]
             if should_eval:
-                latent_mmd = self.compute_latent_mmd()
-                if latent_mmd is not None:
-                    epoch_metrics["latent_mmd"] = latent_mmd
+                eval_latent_mmds = self.compute_eval_latent_mmds()
+                if len(eval_latent_mmds) > 0:
+                    epoch_metrics["eval_latent_mmds"] = eval_latent_mmds
+                    epoch_metrics["latent_mmd"] = float(np.mean(list(eval_latent_mmds.values())))
 
             self.adversarial_train_history.append(epoch_metrics)
             self.model_weights.append(copy.deepcopy(self.net.state_dict()))
@@ -2510,6 +2596,15 @@ class NN(CardinalityEstimationAlg):
         adv_plot_path = self._save_adversarial_training_plot(run_plot_dir)
         if adv_plot_path is not None:
             print("Saved adversarial training plot to:", adv_plot_path)
+
+        adv_mmd_plot_path = self._save_latent_mmd_plot(
+            self.adversarial_train_history,
+            run_plot_dir,
+            "latent_generator_eval_latent_mmd.png",
+            "Latent MMD by Eval Dataset",
+        )
+        if adv_mmd_plot_path is not None:
+            print("Saved adversarial latent MMD plot to:", adv_mmd_plot_path)
         self._maybe_save_latent_visualization(run_plot_dir, force=True)
 
         self.save_model(save_dir="./saved_models", suffix_name="_epoch" + str(self.epoch))
