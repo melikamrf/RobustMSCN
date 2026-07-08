@@ -791,14 +791,14 @@ class NN(CardinalityEstimationAlg):
         target_views = self._collect_latent_visualization_views(
             getattr(self, "latent_viz_target_loader", None), max_points)
 
-        keys = ["out_mlp1_output", "discriminator_input", "regressor_input"]
+        keys = ["out_mlp1_input", "discriminator_input", "regressor_input"]
         if all(key not in source_views and key not in target_views for key in keys):
             return None
 
         os.makedirs(save_dir, exist_ok=True)
         fig, axes = plt.subplots(1, len(keys), figsize=(18, 5))
         title_map = {
-            "out_mlp1_output": "Output Of out_mlp1",
+            "out_mlp1_input": "Input Of out_mlp1",
             "discriminator_input": "Discriminator Input",
             "regressor_input": "Regressor Input",
         }

@@ -180,7 +180,7 @@ class SetConv(nn.Module):
         # unless flow_feats is 0
         combined_hid_size += flow_feats
         self.out_mlp2 = nn.Linear(combined_hid_size, n_out).to(device)
-        self.latent_dim = self.out_mlp1.out_features
+        self.latent_dim = self.out_mlp1.in_features
         # if self.decoder_output_dim is None:
         #     self.decoder_output_dim = self.out_mlp1.in_features
 
@@ -366,7 +366,7 @@ class SetConv(nn.Module):
     def encode(self, xbatch):
         self._require_latent_interface()
         hid, _, _, _ = self._compute_combined_hidden(xbatch)
-        return F.relu(self.out_mlp1(hid))
+        return hid
 
     def get_decoder_target(self, xbatch):
         flat_inputs = []
@@ -419,7 +419,7 @@ class SetConv(nn.Module):
         return out_source, z_source, out_target, z_target, mmd
 
     def predict_from_latent(self, z, flows=None):
-        hid = z
+        hid = F.relu(self.out_mlp1(z))
         if self.flow_feats:
             if flows is None:
                 raise RuntimeError(
@@ -435,14 +435,15 @@ class SetConv(nn.Module):
     def get_latent_visualization_tensors(self, xbatch):
         self._require_latent_interface()
         hid, flows, _, _ = self._compute_combined_hidden(xbatch)
-        out_mlp1_output = self.out_mlp1(hid)
-        discriminator_input = F.relu(out_mlp1_output)
-        regressor_input = discriminator_input
+        out_mlp1_input = hid
+        out_mlp1_output = F.relu(self.out_mlp1(out_mlp1_input))
+        discriminator_input = out_mlp1_input
+        regressor_input = out_mlp1_output
         if self.flow_feats:
-            regressor_input = torch.cat([discriminator_input, flows], 1)
+            regressor_input = torch.cat([out_mlp1_output, flows], 1)
 
         return {
-            "out_mlp1_output": out_mlp1_output,
+            "out_mlp1_input": out_mlp1_input,
             "discriminator_input": discriminator_input,
             "regressor_input": regressor_input,
         }
@@ -450,7 +451,7 @@ class SetConv(nn.Module):
     def forward_with_latent(self, xbatch):
         self._require_latent_interface()
         hid, flows, _, _ = self._compute_combined_hidden(xbatch)
-        z = F.relu(self.out_mlp1(hid))
+        z = hid
         out = self.predict_from_latent(z, flows=flows)
         return out, z
 
@@ -473,7 +474,7 @@ class SetConv(nn.Module):
         #TODO: describe shapes
         '''
         hid, flows, start, inplayer_time = self._compute_combined_hidden(xbatch)
-        z = F.relu(self.out_mlp1(hid))
+        z = hid
         out = self.predict_from_latent(z, flows=flows)
 
         total_time = time.time()-start
@@ -572,7 +573,7 @@ class SetConvFlow(nn.Module):
                 hid_units).to(device)
 
         self.out_mlp2 = nn.Linear(hid_units, n_out).to(device)
-        self.latent_dim = self.out_mlp1.out_features
+        self.latent_dim = self.out_mlp1.in_features
         # if self.decoder_output_dim is None:
         #     self.decoder_output_dim = self.out_mlp1.in_features
 
@@ -759,7 +760,7 @@ class SetConvFlow(nn.Module):
     def encode(self, xbatch):
         self._require_latent_interface()
         hid = self._compute_combined_hidden(xbatch)
-        return F.relu(self.out_mlp1(hid))
+        return hid
 
     def get_decoder_target(self, xbatch):
         flat_inputs = []
@@ -813,6 +814,7 @@ class SetConvFlow(nn.Module):
         return out_source, z_source, out_target, z_target, mmd
 
     def predict_from_latent(self, z):
+        z = F.relu(self.out_mlp1(z))
         if self.use_sigmoid:
             return torch.sigmoid(self.out_mlp2(z))
         return self.out_mlp2(z)
@@ -820,12 +822,13 @@ class SetConvFlow(nn.Module):
     def get_latent_visualization_tensors(self, xbatch):
         self._require_latent_interface()
         hid = self._compute_combined_hidden(xbatch)
-        out_mlp1_output = self.out_mlp1(hid)
-        discriminator_input = F.relu(out_mlp1_output)
-        regressor_input = discriminator_input
+        out_mlp1_input = hid
+        out_mlp1_output = F.relu(self.out_mlp1(out_mlp1_input))
+        discriminator_input = out_mlp1_input
+        regressor_input = out_mlp1_output
 
         return {
-            "out_mlp1_output": out_mlp1_output,
+            "out_mlp1_input": out_mlp1_input,
             "discriminator_input": discriminator_input,
             "regressor_input": regressor_input,
         }
@@ -833,7 +836,7 @@ class SetConvFlow(nn.Module):
     def forward_with_latent(self, xbatch):
         self._require_latent_interface()
         hid = self._compute_combined_hidden(xbatch)
-        z = F.relu(self.out_mlp1(hid))
+        z = hid
         out = self.predict_from_latent(z)
         return out, z
 
@@ -856,7 +859,7 @@ class SetConvFlow(nn.Module):
         #TODO: describe shapes
         '''
         hid = self._compute_combined_hidden(xbatch)
-        z = F.relu(self.out_mlp1(hid))
+        z = hid
         out = self.predict_from_latent(z)
         return out
 
