@@ -540,6 +540,12 @@ class NN(CardinalityEstimationAlg):
     def _setup_latent_visualization_loaders(self, target_samples=None):
         self.latent_viz_source_loader = getattr(self, "trainloader", None)
 
+        self.latent_viz_eval_loaders = {}
+        for eval_name, eval_ds in getattr(self, "eval_ds", {}).items():
+            eval_loader = self._build_eval_dataset_loader(eval_ds)
+            if eval_loader is not None:
+                self.latent_viz_eval_loaders[eval_name] = eval_loader
+
         target_loader = getattr(self, "target_loader", None)
         if target_loader is None and target_samples is not None and len(target_samples) > 0:
             target_loader = self._build_latent_visualization_loader(target_samples)
@@ -668,6 +674,12 @@ class NN(CardinalityEstimationAlg):
 
         return eval_mmds
 
+    def _format_eval_latent_mmds(self, eval_latent_mmds):
+        return {
+            key: round(val, 6)
+            for key, val in eval_latent_mmds.items()
+        }
+
     def _collect_latent_visualization_views(self, loader, max_points):
         if loader is None:
             return {}
@@ -788,27 +800,40 @@ class NN(CardinalityEstimationAlg):
         max_points = self._latent_visualization_sample_limit()
         source_views = self._collect_latent_visualization_views(
             getattr(self, "latent_viz_source_loader", None), max_points)
-        target_views = self._collect_latent_visualization_views(
-            getattr(self, "latent_viz_target_loader", None), max_points)
 
-        keys = ["out_mlp1_input", "discriminator_input", "regressor_input"]
-        if all(key not in source_views and key not in target_views for key in keys):
+        if len(source_views) == 0:
+            return None
+
+        target_loaders = getattr(self, "latent_viz_eval_loaders", {})
+        if len(target_loaders) == 0:
+            fallback_loader = getattr(self, "latent_viz_target_loader", None)
+            if fallback_loader is None:
+                return None
+            target_loaders = {"target": fallback_loader}
+
+        split_mmds = getattr(self, "latest_eval_latent_mmds", {}) or {}
+
+        source_view = source_views.get("out_mlp1_input")
+        if source_view is None or len(source_view) == 0:
             return None
 
         os.makedirs(save_dir, exist_ok=True)
-        fig, axes = plt.subplots(1, len(keys), figsize=(18, 5))
-        title_map = {
-            "out_mlp1_input": "Input Of out_mlp1",
-            "discriminator_input": "Discriminator Input",
-            "regressor_input": "Regressor Input",
-        }
+        plot_paths = []
+        for split_name, target_loader in target_loaders.items():
+            target_views = self._collect_latent_visualization_views(
+                target_loader, max_points)
+            target_view = target_views.get("out_mlp1_input")
+            if target_view is None or len(target_view) == 0:
+                continue
 
-        for ax, key in zip(axes, keys):
             source_proj, target_proj = self._project_latent_view(
-                source_views.get(key),
-                target_views.get(key),
+                source_view,
+                target_view,
             )
+            if source_proj is None and target_proj is None:
+                continue
 
+            fig, ax = plt.subplots(1, 1, figsize=(7, 6))
             if source_proj is not None and len(source_proj) > 0:
                 ax.scatter(
                     source_proj[:, 0], source_proj[:, 1],
@@ -817,21 +842,31 @@ class NN(CardinalityEstimationAlg):
             if target_proj is not None and len(target_proj) > 0:
                 ax.scatter(
                     target_proj[:, 0], target_proj[:, 1],
-                    s=10, alpha=0.55, label="target", color="#ff7f0e",
+                    s=10, alpha=0.55, label=split_name, color="#ff7f0e",
                 )
 
-            ax.set_title(title_map[key])
+            mmd_value = split_mmds.get(split_name)
+            if mmd_value is None:
+                caption = f"MMD(source, {split_name}) = n/a"
+            else:
+                caption = f"MMD(source, {split_name}) = {mmd_value:.6f}"
+
+            ax.set_title(f"Latent space: source vs {split_name}")
             ax.set_xlabel("Dimension 1")
             ax.set_ylabel("Dimension 2")
             ax.grid(True, alpha=0.2)
-            if source_proj is not None or target_proj is not None:
-                ax.legend()
+            ax.legend()
+            fig.text(0.5, 0.01, caption, ha="center", fontsize=10)
+            fig.tight_layout(rect=(0, 0.04, 1, 1))
 
-        plt.tight_layout()
-        plot_path = os.path.join(save_dir, f"latent_views_{tag}.png")
-        fig.savefig(plot_path, dpi=200, bbox_inches="tight")
-        plt.close(fig)
-        return plot_path
+            plot_path = os.path.join(save_dir, f"latent_views_{split_name}_{tag}.png")
+            fig.savefig(plot_path, dpi=200, bbox_inches="tight")
+            plt.close(fig)
+            plot_paths.append(plot_path)
+
+        if len(plot_paths) == 0:
+            return None
+        return plot_paths[-1]
 
     def _maybe_save_latent_visualization(self, save_dir, force=False, tag=None):
         if not self._latent_visualization_enabled():
@@ -1213,6 +1248,38 @@ class NN(CardinalityEstimationAlg):
             "p99": float(np.percentile(losses_np, 99)) if len(losses_np) > 0 else None,
         }
 
+    def _compute_qerror_metrics_from_numpy(self, preds, samples):
+        if samples is None or len(samples) == 0:
+            return {"mean": None, "median": None, "p99": None}
+
+        if getattr(self.featurizer, "card_type", None) == "joinkey":
+            formatted_preds = format_model_test_output_joinkey(
+                preds,
+                samples,
+                self.featurizer,
+            )
+            errors = get_eval_fn("qerr_joinkey").eval(samples, formatted_preds)
+        else:
+            formatted_preds = format_model_test_output(
+                preds,
+                samples,
+                self.featurizer,
+            )
+            errors = get_eval_fn("qerr").eval(
+                samples,
+                formatted_preds,
+                result_dir=None,
+            )
+
+        if len(errors) == 0:
+            return {"mean": None, "median": None, "p99": None}
+
+        return {
+            "mean": float(np.mean(errors)),
+            "median": float(np.median(errors)),
+            "p99": float(np.percentile(errors, 99)),
+        }
+
     def _save_adversarial_training_plot(self, save_dir):
         if not hasattr(self, "adversarial_train_history"):
             return None
@@ -1369,6 +1436,66 @@ class NN(CardinalityEstimationAlg):
         ax.set_title(title)
         ax.set_xlabel("Epoch")
         ax.set_ylabel("MMD")
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+
+        plt.tight_layout()
+        plot_path = os.path.join(save_dir, plot_name)
+        fig.savefig(plot_path, dpi=200, bbox_inches="tight")
+        plt.close(fig)
+        return plot_path
+
+    def _save_val_qerror_plot(self, history, save_dir, plot_name, title):
+        if history is None or len(history) == 0:
+            return None
+
+        qerr_mean = []
+        qerr_median = []
+        qerr_p99 = []
+        for metrics in history:
+            qerr_mean.append(metrics.get("val_qerr", np.nan))
+            qerr_median.append(metrics.get("val_qerr_median", np.nan))
+            qerr_p99.append(metrics.get("val_qerr_p99", np.nan))
+
+        qerr_mean = np.asarray(qerr_mean, dtype=np.float32)
+        qerr_median = np.asarray(qerr_median, dtype=np.float32)
+        qerr_p99 = np.asarray(qerr_p99, dtype=np.float32)
+
+        valid_mask = np.isfinite(qerr_mean) | np.isfinite(qerr_median) | np.isfinite(qerr_p99)
+        if not valid_mask.any():
+            return None
+
+        os.makedirs(save_dir, exist_ok=True)
+        epochs = np.arange(len(history))
+        fig, ax = plt.subplots(1, 1, figsize=(10, 4))
+
+        if np.isfinite(qerr_mean).any():
+            ax.plot(
+                epochs[np.isfinite(qerr_mean)],
+                qerr_mean[np.isfinite(qerr_mean)],
+                label="Val Q-Error Mean",
+                color="#1f77b4",
+            )
+        if np.isfinite(qerr_median).any():
+            ax.plot(
+                epochs[np.isfinite(qerr_median)],
+                qerr_median[np.isfinite(qerr_median)],
+                label="Val Q-Error Median",
+                color="#ff7f0e",
+                linestyle="--",
+            )
+        if np.isfinite(qerr_p99).any():
+            ax.plot(
+                epochs[np.isfinite(qerr_p99)],
+                qerr_p99[np.isfinite(qerr_p99)],
+                label="Val Q-Error 99p",
+                color="#2ca02c",
+                linestyle=":",
+            )
+
+        ax.set_title(title)
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("Q-Error")
         ax.grid(True, alpha=0.3)
         ax.legend()
 
@@ -1887,7 +2014,6 @@ class NN(CardinalityEstimationAlg):
                 self.periodic_eval()
 
             train_loss = self.train_one_epoch()
-            self._maybe_save_latent_visualization(run_plot_dir)
 
             epoch_metrics = {"train_loss": train_loss}
 
@@ -1899,18 +2025,33 @@ class NN(CardinalityEstimationAlg):
                     epoch_metrics["val_loss_median"] = val_loss_metrics["median"]
                     epoch_metrics["val_loss_p99"] = val_loss_metrics["p99"]
 
+                val_qerr_metrics = self._compute_qerror_metrics_from_numpy(
+                    val_preds,
+                    self.samples.get("val"),
+                )
+                if val_qerr_metrics["mean"] is not None:
+                    epoch_metrics["val_qerr"] = val_qerr_metrics["mean"]
+                    epoch_metrics["val_qerr_median"] = val_qerr_metrics["median"]
+                    epoch_metrics["val_qerr_p99"] = val_qerr_metrics["p99"]
+                    print(
+                        "Epoch {} val_qerr={:.6f}(median={:.6f}, 99p={:.6f})".format(
+                            self.epoch,
+                            epoch_metrics["val_qerr"],
+                            epoch_metrics["val_qerr_median"],
+                            epoch_metrics["val_qerr_p99"],
+                        )
+                    )
+
             if should_eval:
                 eval_latent_mmds = self.compute_eval_latent_mmds()
                 if len(eval_latent_mmds) > 0:
                     epoch_metrics["eval_latent_mmds"] = eval_latent_mmds
                     epoch_metrics["latent_mmd"] = float(np.mean(list(eval_latent_mmds.values())))
+                    self.latest_eval_latent_mmds = eval_latent_mmds
                     print(
                         "Epoch {} latent_mmds={}".format(
                             self.epoch,
-                            {
-                                key: round(val, 6)
-                                for key, val in eval_latent_mmds.items()
-                            },
+                            self._format_eval_latent_mmds(eval_latent_mmds),
                         )
                     )
                     if self.use_wandb:
@@ -1918,6 +2059,16 @@ class NN(CardinalityEstimationAlg):
                             "LatentMMD": epoch_metrics["latent_mmd"],
                             "epoch": self.epoch,
                         })
+
+                    if "val_qerr" in epoch_metrics:
+                        wandb.log({
+                            "ValQError": epoch_metrics["val_qerr"],
+                            "ValQError-Median": epoch_metrics["val_qerr_median"],
+                            "ValQError-99p": epoch_metrics["val_qerr_p99"],
+                            "epoch": self.epoch,
+                        })
+
+            self._maybe_save_latent_visualization(run_plot_dir)
 
             self.standard_train_history.append(epoch_metrics)
 
@@ -1980,6 +2131,15 @@ class NN(CardinalityEstimationAlg):
         std_plot_path = self._save_standard_training_plot(run_plot_dir)
         if std_plot_path is not None:
             print("Saved standard training plot to:", std_plot_path)
+
+        std_qerr_plot_path = self._save_val_qerror_plot(
+            self.standard_train_history,
+            run_plot_dir,
+            "standard_val_qerror.png",
+            "Validation Q-Error by Epoch",
+        )
+        if std_qerr_plot_path is not None:
+            print("Saved standard validation q-error plot to:", std_qerr_plot_path)
 
         std_mmd_plot_path = self._save_latent_mmd_plot(
             self.standard_train_history,
@@ -2191,7 +2351,6 @@ class NN(CardinalityEstimationAlg):
                 self.periodic_eval()
 
             epoch_metrics = train_epoch_fn(self.target_loader)
-            self._maybe_save_latent_visualization(run_plot_dir)
 
             if should_eval and "val" in self.eval_ds:
                 val_preds, val_ys = self._eval_ds(self.eval_ds["val"], self.samples["val"])
@@ -2200,18 +2359,35 @@ class NN(CardinalityEstimationAlg):
                     epoch_metrics["val_loss"] = val_loss_metrics["mean"]
                     epoch_metrics["val_loss_median"] = val_loss_metrics["median"]
                     epoch_metrics["val_loss_p99"] = val_loss_metrics["p99"]
+                val_qerr_metrics = self._compute_qerror_metrics_from_numpy(
+                    val_preds,
+                    self.samples.get("val"),
+                )
+                if val_qerr_metrics["mean"] is not None:
+                    epoch_metrics["val_qerr"] = val_qerr_metrics["mean"]
+                    epoch_metrics["val_qerr_median"] = val_qerr_metrics["median"]
+                    epoch_metrics["val_qerr_p99"] = val_qerr_metrics["p99"]
             if should_eval:
                 eval_latent_mmds = self.compute_eval_latent_mmds()
                 if len(eval_latent_mmds) > 0:
                     epoch_metrics["eval_latent_mmds"] = eval_latent_mmds
                     epoch_metrics["latent_mmd"] = float(np.mean(list(eval_latent_mmds.values())))
+                    self.latest_eval_latent_mmds = eval_latent_mmds
+                    print(
+                        "Epoch {} latent_mmds={}".format(
+                            self.epoch,
+                            self._format_eval_latent_mmds(eval_latent_mmds),
+                        )
+                    )
+
+            self._maybe_save_latent_visualization(run_plot_dir)
 
             self.adversarial_train_history.append(epoch_metrics)
             self.model_weights.append(copy.deepcopy(self.net.state_dict()))
 
             if self.epoch % 2 == 0:
                 print(
-                    "Epoch {} took {}s, reg_loss={:.6f}, recon_loss={:.6f}, phase1_loss={:.6f}, disc_loss={:.6f}, disc_grad_norm={:.6f}, gen_loss={:.6f}, disc_acc={:.6f}, source_acc={:.6f}, target_acc={:.6f}, fool_acc={:.6f}, latent_mmd={:.6f}, val_loss={:.6f}(median={:.6f}, 99p={:.6f})".format(
+                    "Epoch {} took {}s, reg_loss={:.6f}, recon_loss={:.6f}, phase1_loss={:.6f}, disc_loss={:.6f}, disc_grad_norm={:.6f}, gen_loss={:.6f}, disc_acc={:.6f}, source_acc={:.6f}, target_acc={:.6f}, fool_acc={:.6f}, latent_mmd={:.6f}, val_qerr={:.6f}(median={:.6f}, 99p={:.6f})".format(
                         self.epoch,
                         epoch_metrics["epoch_seconds"],
                         epoch_metrics["loss_reg"],
@@ -2225,9 +2401,9 @@ class NN(CardinalityEstimationAlg):
                         epoch_metrics["disc_acc_target"],
                         epoch_metrics["gen_fool_acc"],
                         epoch_metrics.get("latent_mmd", float("nan")),
-                        epoch_metrics.get("val_loss", float("nan")),
-                        epoch_metrics.get("val_loss_median", float("nan")),
-                        epoch_metrics.get("val_loss_p99", float("nan")),
+                        epoch_metrics.get("val_qerr", float("nan")),
+                        epoch_metrics.get("val_qerr_median", float("nan")),
+                        epoch_metrics.get("val_qerr_p99", float("nan")),
                     )
                 )
 
@@ -2246,12 +2422,12 @@ class NN(CardinalityEstimationAlg):
                     wandb_payload["Adv-Disc-Grad-Norm"] = epoch_metrics["disc_grad_norm"]
                 if "latent_mmd" in epoch_metrics:
                     wandb_payload["LatentMMD"] = epoch_metrics["latent_mmd"]
-                if "val_loss" in epoch_metrics:
-                    wandb_payload["ValLoss"] = epoch_metrics["val_loss"]
-                if "val_loss_median" in epoch_metrics:
-                    wandb_payload["ValLoss-Median"] = epoch_metrics["val_loss_median"]
-                if "val_loss_p99" in epoch_metrics:
-                    wandb_payload["ValLoss-99p"] = epoch_metrics["val_loss_p99"]
+                if "val_qerr" in epoch_metrics:
+                    wandb_payload["ValQError"] = epoch_metrics["val_qerr"]
+                if "val_qerr_median" in epoch_metrics:
+                    wandb_payload["ValQError-Median"] = epoch_metrics["val_qerr_median"]
+                if "val_qerr_p99" in epoch_metrics:
+                    wandb_payload["ValQError-99p"] = epoch_metrics["val_qerr_p99"]
                 wandb.log(wandb_payload)
 
             if self.early_stopping == 1:
@@ -2299,6 +2475,15 @@ class NN(CardinalityEstimationAlg):
         adv_plot_path = self._save_adversarial_training_plot(run_plot_dir)
         if adv_plot_path is not None:
             print("Saved adversarial training plot to:", adv_plot_path)
+
+        adv_qerr_plot_path = self._save_val_qerror_plot(
+            self.adversarial_train_history,
+            run_plot_dir,
+            "adversarial_val_qerror.png",
+            "Validation Q-Error by Epoch",
+        )
+        if adv_qerr_plot_path is not None:
+            print("Saved adversarial validation q-error plot to:", adv_qerr_plot_path)
 
         adv_mmd_plot_path = self._save_latent_mmd_plot(
             self.adversarial_train_history,
@@ -2491,7 +2676,6 @@ class NN(CardinalityEstimationAlg):
                 self.periodic_eval()
 
             epoch_metrics = self.train_one_epoch_with_latent_generator()
-            self._maybe_save_latent_visualization(run_plot_dir)
 
             if should_eval and "val" in self.eval_ds:
                 val_preds, val_ys = self._eval_ds(self.eval_ds["val"], self.samples["val"])
@@ -2500,18 +2684,35 @@ class NN(CardinalityEstimationAlg):
                     epoch_metrics["val_loss"] = val_loss_metrics["mean"]
                     epoch_metrics["val_loss_median"] = val_loss_metrics["median"]
                     epoch_metrics["val_loss_p99"] = val_loss_metrics["p99"]
+                val_qerr_metrics = self._compute_qerror_metrics_from_numpy(
+                    val_preds,
+                    self.samples.get("val"),
+                )
+                if val_qerr_metrics["mean"] is not None:
+                    epoch_metrics["val_qerr"] = val_qerr_metrics["mean"]
+                    epoch_metrics["val_qerr_median"] = val_qerr_metrics["median"]
+                    epoch_metrics["val_qerr_p99"] = val_qerr_metrics["p99"]
             if should_eval:
                 eval_latent_mmds = self.compute_eval_latent_mmds()
                 if len(eval_latent_mmds) > 0:
                     epoch_metrics["eval_latent_mmds"] = eval_latent_mmds
                     epoch_metrics["latent_mmd"] = float(np.mean(list(eval_latent_mmds.values())))
+                    self.latest_eval_latent_mmds = eval_latent_mmds
+                    print(
+                        "Epoch {} latent_mmds={}".format(
+                            self.epoch,
+                            self._format_eval_latent_mmds(eval_latent_mmds),
+                        )
+                    )
+
+            self._maybe_save_latent_visualization(run_plot_dir)
 
             self.adversarial_train_history.append(epoch_metrics)
             self.model_weights.append(copy.deepcopy(self.net.state_dict()))
 
             if self.epoch % 2 == 0:
                 print(
-                    "Epoch {} took {}s, reg_loss={}, disc_loss={}, gen_loss={}, disc_acc={}, source_acc={}, fake_acc={}, fool_acc={}, latent_mmd={}, val_loss={}(median={}, 99p={})".format(
+                    "Epoch {} took {}s, reg_loss={}, disc_loss={}, gen_loss={}, disc_acc={}, source_acc={}, fake_acc={}, fool_acc={}, latent_mmd={}, val_qerr={}(median={}, 99p={})".format(
                         self.epoch,
                         epoch_metrics["epoch_seconds"],
                         round(epoch_metrics["loss_reg"], 6),
@@ -2522,9 +2723,9 @@ class NN(CardinalityEstimationAlg):
                         round(epoch_metrics["disc_acc_fake"], 6),
                         round(epoch_metrics["gen_fool_acc"], 6),
                         round(epoch_metrics.get("latent_mmd", float("nan")), 6),
-                        round(epoch_metrics.get("val_loss", float("nan")), 6),
-                        round(epoch_metrics.get("val_loss_median", float("nan")), 6),
-                        round(epoch_metrics.get("val_loss_p99", float("nan")), 6),
+                        round(epoch_metrics.get("val_qerr", float("nan")), 6),
+                        round(epoch_metrics.get("val_qerr_median", float("nan")), 6),
+                        round(epoch_metrics.get("val_qerr_p99", float("nan")), 6),
                     )
                 )
 
@@ -2543,12 +2744,12 @@ class NN(CardinalityEstimationAlg):
                 }
                 if "latent_mmd" in epoch_metrics:
                     wandb_payload["LatentMMD"] = epoch_metrics["latent_mmd"]
-                if "val_loss" in epoch_metrics:
-                    wandb_payload["ValLoss"] = epoch_metrics["val_loss"]
-                if "val_loss_median" in epoch_metrics:
-                    wandb_payload["ValLoss-Median"] = epoch_metrics["val_loss_median"]
-                if "val_loss_p99" in epoch_metrics:
-                    wandb_payload["ValLoss-99p"] = epoch_metrics["val_loss_p99"]
+                if "val_qerr" in epoch_metrics:
+                    wandb_payload["ValQError"] = epoch_metrics["val_qerr"]
+                if "val_qerr_median" in epoch_metrics:
+                    wandb_payload["ValQError-Median"] = epoch_metrics["val_qerr_median"]
+                if "val_qerr_p99" in epoch_metrics:
+                    wandb_payload["ValQError-99p"] = epoch_metrics["val_qerr_p99"]
                 wandb.log(wandb_payload)
 
             if self.early_stopping == 1:
@@ -2596,6 +2797,15 @@ class NN(CardinalityEstimationAlg):
         adv_plot_path = self._save_adversarial_training_plot(run_plot_dir)
         if adv_plot_path is not None:
             print("Saved adversarial training plot to:", adv_plot_path)
+
+        adv_qerr_plot_path = self._save_val_qerror_plot(
+            self.adversarial_train_history,
+            run_plot_dir,
+            "latent_generator_val_qerror.png",
+            "Validation Q-Error by Epoch",
+        )
+        if adv_qerr_plot_path is not None:
+            print("Saved latent-generator validation q-error plot to:", adv_qerr_plot_path)
 
         adv_mmd_plot_path = self._save_latent_mmd_plot(
             self.adversarial_train_history,
