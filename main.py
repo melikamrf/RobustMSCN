@@ -1,8 +1,8 @@
 import sys
 sys.path.append(".")
 # from query_representation.query import *
-from compute_dist_table import compute_distributions_for_qreps, compute_jsd
-from query_representation.utils import get_query_splits
+from compute_dist_table import compute_distributions_for_qreps, compute_jsd, extract_subquery_rows, build_distribution
+from query_representation.utils import get_query_splits, SOURCE_NODE
 
 import os
 # This forces the output to be unbuffered at the binary level
@@ -45,58 +45,142 @@ import time
 import pandas as pd
 import numpy as np
 
-def calc_datasets_jsd(trainqs, valqs, testqs, evalqs, eval_qdirs):
+def _pattern_to_string(pattern):
+    if isinstance(pattern, tuple) and len(pattern) == 4:
+        return f"{pattern[0]}.{pattern[1]} = {pattern[2]}.{pattern[3]}"
+    if isinstance(pattern, list):
+        return " | ".join(_pattern_to_string(item) for item in pattern)
+    if isinstance(pattern, tuple):
+        return " | ".join(_pattern_to_string(item) for item in pattern)
+    return str(pattern)
+
+
+def _build_frequency_dataframe(items):
+    total, counts, _ = build_distribution(items)
+    rows = []
+    for pattern, count in sorted(counts.items(), key=lambda x: (-x[1], str(x[0]))):
+        rows.append({
+            "pattern": _pattern_to_string(pattern),
+            "count": int(count),
+            "probability": (count / total if total else 0.0),
+        })
+    return pd.DataFrame(rows, columns=["pattern", "count", "probability"])
+
+
+def _save_distribution_artifacts(split_name, dist, workload_df, output_dir, save_format="pkl"):
+    if output_dir is None:
+        return None
+
+    os.makedirs(output_dir, exist_ok=True)
+    tables_items = workload_df["tables"].tolist() if not workload_df.empty else []
+    joins_items = [item for item in (workload_df["joins"].tolist() if not workload_df.empty else []) if item]
+    predicate_items = []
+    for preds in (workload_df["predicates"].tolist() if not workload_df.empty else []):
+        if not preds:
+            continue
+        for pred in preds:
+            if pred is not None:
+                predicate_items.append([pred])
+
+    tables_df = _build_frequency_dataframe(tables_items)
+    joins_df = _build_frequency_dataframe(joins_items)
+    predicates_df = _build_frequency_dataframe(predicate_items)
+
+    split_dir = os.path.join(output_dir, split_name)
+    os.makedirs(split_dir, exist_ok=True)
+
+    if save_format.lower() == "pkl":
+        payload = {
+            "split_name": split_name,
+            "distribution": dist,
+            "workload_df": workload_df,
+            "frequency_tables": {
+                "tables": tables_df,
+                "joins": joins_df,
+                "predicates": predicates_df,
+            },
+        }
+        out_path = os.path.join(split_dir, f"{split_name}_dist_table.pkl")
+        with open(out_path, "wb") as f:
+            pickle.dump(payload, f)
+        return out_path
+
+    tables_path = os.path.join(split_dir, f"{split_name}_tables_frequency.csv")
+    joins_path = os.path.join(split_dir, f"{split_name}_joins_frequency.csv")
+    predicates_path = os.path.join(split_dir, f"{split_name}_predicates_frequency.csv")
+    workload_path = os.path.join(split_dir, f"{split_name}_subqueries.csv")
+
+    tables_df.to_csv(tables_path, index=False)
+    joins_df.to_csv(joins_path, index=False)
+    predicates_df.to_csv(predicates_path, index=False)
+    workload_df.to_csv(workload_path, index=False)
+    return {
+        "tables": tables_path,
+        "joins": joins_path,
+        "predicates": predicates_path,
+        "workload": workload_path,
+    }
+
+
+def calc_datasets_jsd(trainqs, valqs, testqs, evalqs, eval_qdirs,
+        result_dir=None, save_dist_tables=True, dist_table_format="pkl"):
     """
     Compute JSD between training and eval query distributions.
-    Optionally filter to only queries with a specific number of joins.
+    Uses the whole dataset only; it does not stratify by join count.
     """
-    def _max_join_count(qreps):
-        max_join_count = 0
-        for qrep in qreps:
-            subset_graph = qrep.get("subset_graph")
-            join_graph = qrep.get("join_graph")
-            if subset_graph is None or join_graph is None:
-                continue
-            for subquery_id in subset_graph.nodes():
-                if not subquery_id:
-                    continue
-                subplan_graph = join_graph.subgraph(subquery_id)
-                max_join_count = max(max_join_count, subplan_graph.number_of_edges())
-        return max_join_count
+    split_results = {}
 
-    def _collect_jsd_rows(rows, source_label, source_qs, target_label, target_qs):
-        source_max_joins = _max_join_count(source_qs)
-        target_max_joins = _max_join_count(target_qs)
-        max_shared_joins = min(source_max_joins, target_max_joins)
-
-        for num_joins in list(range(max_shared_joins + 1)) + [None]:
-            suffix = "all" if num_joins is None else f"joins_{num_joins}"
-            source_dist, _ = compute_distributions_for_qreps(
-                f"{source_label}_{suffix}", source_qs, return_df=True, num_joins=num_joins
-            )
-            target_dist, _ = compute_distributions_for_qreps(
-                f"{target_label}_{suffix}", target_qs, return_df=True, num_joins=num_joins
-            )
-
-            rows.append({
-                "source_split": source_label,
-                "target_split": target_label,
-                "num_joins": num_joins,
-                "jsd_joins": compute_jsd(source_dist["joins"], target_dist["joins"]),
-                "jsd_predicates": compute_jsd(source_dist["predicates"], target_dist["predicates"]),
-                "jsd_tables": compute_jsd(source_dist["tables"], target_dist["tables"]),
-            })
-
-    print("Calculating dataset distribution similarities (JSD) between train, val, test, and eval query sets...")
-
-    rows = []
-    _collect_jsd_rows(rows, "train", trainqs, "val", valqs)
-    _collect_jsd_rows(rows, "train", trainqs, "test", testqs)
+    split_results["train"] = compute_distributions_for_qreps(
+        "train_all", trainqs, return_df=True, num_joins=None
+    )
+    split_results["val"] = compute_distributions_for_qreps(
+        "val_all", valqs, return_df=True, num_joins=None
+    )
+    split_results["test"] = compute_distributions_for_qreps(
+        "test_all", testqs, return_df=True, num_joins=None
+    )
 
     for idx, evalq in enumerate(evalqs):
         raw_label = eval_qdirs[idx] if idx < len(eval_qdirs) else f"eval_{idx}"
         label = os.path.basename(os.path.normpath(raw_label)) or f"eval_{idx}"
-        _collect_jsd_rows(rows, "train", trainqs, label, evalq)
+        split_results[label] = compute_distributions_for_qreps(
+            f"{label}_all", evalq, return_df=True, num_joins=None
+        )
+
+    if save_dist_tables:
+        dist_root = os.path.join(result_dir or "./results", "dataset_jsd_tables")
+        for split_name, (dist, workload_df) in split_results.items():
+            _save_distribution_artifacts(
+                split_name,
+                dist,
+                workload_df,
+                dist_root,
+                save_format=dist_table_format,
+            )
+
+    def _collect_jsd_rows(rows, source_label, target_label):
+        source_dist, _ = split_results[source_label]
+        target_dist, _ = split_results[target_label]
+
+        rows.append({
+            "source_split": source_label,
+            "target_split": target_label,
+            "num_joins": None,
+            "jsd_joins": compute_jsd(source_dist["joins"], target_dist["joins"]),
+            "jsd_predicates": compute_jsd(source_dist["predicates"], target_dist["predicates"]),
+            "jsd_tables": compute_jsd(source_dist["tables"], target_dist["tables"]),
+        })
+
+    print("Calculating dataset distribution similarities (JSD) between train, val, test, and eval query sets...")
+
+    rows = []
+    _collect_jsd_rows(rows, "train", "val")
+    _collect_jsd_rows(rows, "train", "test")
+
+    for idx, _ in enumerate(evalqs):
+        raw_label = eval_qdirs[idx] if idx < len(eval_qdirs) else f"eval_{idx}"
+        label = os.path.basename(os.path.normpath(raw_label)) or f"eval_{idx}"
+        _collect_jsd_rows(rows, "train", label)
 
     jsd_df = pd.DataFrame(rows)
     for _, row in jsd_df.iterrows():
@@ -107,6 +191,88 @@ def calc_datasets_jsd(trainqs, valqs, testqs, evalqs, eval_qdirs):
         )
 
     return jsd_df
+
+
+def _format_subquery_tables(subquery_id):
+    table_entries = [str(alias) for alias in subquery_id]
+    table_entries.sort()
+    return " | ".join(table_entries)
+
+
+def _build_subquery_level_dataframe(qreps):
+    rows = []
+    for qrep in qreps:
+        subset_graph = qrep["subset_graph"]
+        for subquery_row in extract_subquery_rows(qrep, num_joins=None):
+            subquery_id = subquery_row["subquery_id"]
+            if not subquery_id:
+                continue
+            card_info = subset_graph.nodes()[subquery_id].get("cardinality", {})
+            rows.append({
+                "tables": _format_subquery_tables(subquery_id),
+                "joins": " | ".join(str(join) for join in subquery_row["joins"]),
+                "predicates": " | ".join(str(pred) for pred in subquery_row["predicates"]),
+                "true_cardinality": card_info.get("actual"),
+                "postgres_cardinality": card_info.get("expected"),
+                "source_pickle": qrep.get("name"),
+            })
+
+    return pd.DataFrame(rows, columns=[
+        "tables",
+        "joins",
+        "predicates",
+        "true_cardinality",
+        "postgres_cardinality",
+        "source_pickle",
+    ])
+
+
+def _dataset_file_prefix(query_dir):
+    base_name = os.path.basename(os.path.normpath(query_dir))
+    if base_name.endswith("_train"):
+        return base_name[:-6]
+    return base_name
+
+
+def save_subquery_split_dataframes(trainqs, valqs, testqs, evalqs, eval_qdirs, result_dir, query_dir):
+    if result_dir is None:
+        return {}
+
+    export_dir = os.path.join(result_dir, "query_level_dataframes")
+    os.makedirs(export_dir, exist_ok=True)
+
+    train_prefix = _dataset_file_prefix(query_dir)
+
+    split_to_qreps = {
+        "train": (trainqs, train_prefix),
+        "val": (valqs, train_prefix),
+        "test": (testqs, train_prefix),
+    }
+    for idx, evalq in enumerate(evalqs):
+        raw_label = eval_qdirs[idx] if idx < len(eval_qdirs) else f"eval_{idx}"
+        split_name = os.path.basename(os.path.normpath(raw_label)) or f"eval_{idx}"
+        split_to_qreps[split_name] = (evalq, split_name)
+
+    saved_paths = {}
+    for split_name, value in split_to_qreps.items():
+        qreps, prefix = value
+        if qreps is None:
+            continue
+        df = _build_subquery_level_dataframe(qreps)
+        if split_name == "train":
+            file_stem = f"{prefix}_train"
+        elif split_name == "test":
+            file_stem = f"{prefix}_test"
+        elif split_name == "val":
+            file_stem = f"{prefix}_val"
+        else:
+            file_stem = f"{prefix}_{split_name}"
+        csv_path = os.path.join(export_dir, f"{file_stem}.csv")
+        df.to_csv(csv_path, index=False)
+        saved_paths[split_name] = csv_path
+        print(f"Saved query-level dataframe for {split_name} to: {csv_path}")
+
+    return saved_paths
 
 
 
@@ -537,6 +703,17 @@ def main():
     eqs = [len(eq) for eq in evalqs]
     print("""Selected Queries: {} train, {} test, {} val, {} eval"""\
             .format(len(trainqs), len(testqs), len(valqs), sum(eqs)))
+
+    # if args.result_dir is not None:
+    #     save_subquery_split_dataframes(
+    #         trainqs,
+    #         valqs,
+    #         testqs,
+    #         evalqs,
+    #         eval_qdirs,
+    #         args.result_dir,
+    #         cfg["data"]["query_dir"],
+    #     )
    
 
     # Undersample source (trainqs) to match target (evalqs) size
@@ -545,13 +722,13 @@ def main():
     # trainqs = undersample_train_queries_by_subquery_count(trainqs, evalqs, seed=args.undersample_seed)
     #trainqs = undersample_train_queries(trainqs, eqs, seed=args.undersample_seed)
 
-    # dataset_jsd_df = calc_datasets_jsd(trainqs, valqs, testqs, evalqs, eval_qdirs)
-    # if args.result_dir is not None:
-    #     os.makedirs(args.result_dir, exist_ok=True)
-    #     train_dataset = cfg["data"]["query_dir"].rstrip("/").split("/")[-1]
-    #     dataset_jsd_path = os.path.join(args.result_dir, f"dataset_jsd_{train_dataset}.csv")
-    #     dataset_jsd_df.to_csv(dataset_jsd_path, index=False)
-    #     print(f"Saved dataset JSD summary to {dataset_jsd_path}")
+    dataset_jsd_df = calc_datasets_jsd(trainqs, valqs, testqs, evalqs, eval_qdirs, args.result_dir)
+    if args.result_dir is not None:
+        os.makedirs(args.result_dir, exist_ok=True)
+        train_dataset = cfg["data"]["query_dir"].rstrip("/").split("/")[-1]
+        dataset_jsd_path = os.path.join(args.result_dir, f"dataset_jsd_{train_dataset}.csv")
+        dataset_jsd_df.to_csv(dataset_jsd_path, index=False)
+        print(f"Saved dataset JSD summary to {dataset_jsd_path}")
 
         
     # only needs featurizer for learned models
