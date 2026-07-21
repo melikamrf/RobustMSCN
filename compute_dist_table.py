@@ -203,6 +203,68 @@ def build_distribution(items):
     probs = {k: (v / total if total else 0.0) for k, v in counts.items()}
     return total, counts, probs
 
+
+def _pattern_to_string(pattern):
+    if isinstance(pattern, list):
+        return " | ".join(_pattern_to_string(p) for p in pattern)
+    if isinstance(pattern, tuple):
+        if len(pattern) == 4 and all(isinstance(v, str) for v in pattern):
+            return f"{pattern[0]}.{pattern[1]} = {pattern[2]}.{pattern[3]}"
+        return " | ".join(_pattern_to_string(p) for p in pattern)
+    return str(pattern)
+
+
+def _distribution_to_dataframe(total, counts):
+    rows = []
+    for pattern, count in sorted(counts.items(), key=lambda x: (-x[1], str(x[0]))):
+        rows.append({
+            "pattern": _pattern_to_string(pattern),
+            "count": int(count),
+            "probability": (count / total if total else 0.0),
+        })
+    return pd.DataFrame(rows, columns=["pattern", "count", "probability"])
+
+
+def save_frequency_tables(label, workload_df, output_dir):
+    os.makedirs(output_dir, exist_ok=True)
+
+    tables_entries = workload_df["tables"].tolist() if not workload_df.empty else []
+    joins_entries = [
+        joins for joins in (workload_df["joins"].tolist() if not workload_df.empty else [])
+        if joins
+    ]
+
+    predicate_entries = []
+    for preds in (workload_df["predicates"].tolist() if not workload_df.empty else []):
+        if not preds:
+            continue
+        for pred in preds:
+            if pred is not None:
+                predicate_entries.append([pred])
+
+    tables_total, tables_counts, _ = build_distribution(tables_entries)
+    joins_total, joins_counts, _ = build_distribution(joins_entries)
+    preds_total, preds_counts, _ = build_distribution(predicate_entries)
+
+    tables_df = _distribution_to_dataframe(tables_total, tables_counts)
+    joins_df = _distribution_to_dataframe(joins_total, joins_counts)
+    preds_df = _distribution_to_dataframe(preds_total, preds_counts)
+
+    tables_path = os.path.join(output_dir, f"{label}_tables_frequency.csv")
+    joins_path = os.path.join(output_dir, f"{label}_joins_frequency.csv")
+    preds_path = os.path.join(output_dir, f"{label}_predicates_frequency.csv")
+
+    tables_df.to_csv(tables_path, index=False)
+    joins_df.to_csv(joins_path, index=False)
+    preds_df.to_csv(preds_path, index=False)
+
+    print(f"Saved frequency tables for {label} to: {output_dir}")
+    return {
+        "tables": tables_path,
+        "joins": joins_path,
+        "predicates": preds_path,
+    }
+
 def print_distribution_from_counts(label, total, counts):
     print(f"{label.upper()}: ")
     print(f"  Total unique values: {len(counts)}")
@@ -378,6 +440,13 @@ def main():
         action="store_true",
         help="Print each pickle file path while processing",
     )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        required=False,
+        default="distribution_tables",
+        help="Directory where frequency table CSVs will be saved",
+    )
     args = parser.parse_args()
 
     with open(args.config, "r", encoding="utf-8") as f:
@@ -390,15 +459,18 @@ def main():
     testqs = load_qdata(test_qfns)
 
     train_dist, train_df = compute_distributions_for_qreps(
-        "train", trainqs, 1, return_df=True
+        "train", trainqs, None, return_df=True
     )
+    save_frequency_tables("train", train_df, os.path.join(args.output_dir, "train"))
    
     val_dist, val_df = compute_distributions_for_qreps(
         "val", valqs, None, return_df=True
     )
+    save_frequency_tables("val", val_df, os.path.join(args.output_dir, "val"))
     test_dist, test_df = compute_distributions_for_qreps(
         "test", testqs, None, return_df=True
     )
+    save_frequency_tables("test", test_df, os.path.join(args.output_dir, "test"))
 
     train_df.to_csv("train_subquery_distribution.csv", index=False)
     
@@ -415,6 +487,7 @@ def main():
             f"eval_{label}", evalqs, None, return_df=True
         )
         eval_dists.append(eval_dist)
+        save_frequency_tables(label, eval_df, os.path.join(args.output_dir, label))
     
     print(compute_jsd(train_dist["joins"], test_dist["joins"]))
     # print(compute_jsd(train_dist["joins"], val_dist["joins"]))

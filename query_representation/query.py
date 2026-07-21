@@ -1,7 +1,7 @@
 import networkx as nx
 from networkx.readwrite import json_graph
 
-from query_representation.utils import *
+from query_representation import utils
 import time
 import itertools
 import json
@@ -10,7 +10,7 @@ import pickle
 import copy
 
 def get_subset_cache_name(sql):
-    return str(deterministic_hash(sql)[0:5])
+    return str(utils.deterministic_hash(sql)[0:5])
 
 def parse_sql(sql, user, db_name, db_host, port, pwd, timeout=False,
         compute_ground_truth=True, subset_cache_dir="./subset_cache/"):
@@ -42,8 +42,8 @@ def parse_sql(sql, user, db_name, db_host, port, pwd, timeout=False,
             - total_count
     '''
     start = time.time()
-    join_graph = extract_join_graph(sql)
-    subset_graph = generate_subset_graph(join_graph)
+    join_graph = utils.extract_join_graph(sql)
+    subset_graph = utils.generate_subset_graph(join_graph)
 
     print("query has",
           len(join_graph.nodes), "relations,",
@@ -155,5 +155,5 @@ def subplan_to_sql(qrep, subplan_node):
     @ests: dict; key: label of the subplan. value: PostgreSQL cardinality estimate.
     '''
     sg = qrep["join_graph"].subgraph(subplan_node)
-    subsql = nx_graph_to_query(sg)
+    subsql = utils.nx_graph_to_query(sg)
     return subsql
