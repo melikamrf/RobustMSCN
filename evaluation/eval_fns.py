@@ -303,7 +303,7 @@ class QErrorJoinKey(EvalFunc):
 
 class QError(EvalFunc):
 
-    def save_logs(self, qreps, errors, **kwargs):
+    def save_logs(self, qreps, errors, preds=None, **kwargs):
         result_dir = kwargs["result_dir"]
         if result_dir is None:
             return
@@ -319,7 +319,14 @@ class QError(EvalFunc):
         qidxs = []
 
         for i, qrep in enumerate(qreps):
-            nodes = list(qrep["subset_graph"].nodes())
+            # preds[i] may only cover a subset of subset_graph's nodes
+            # (e.g. deduped/masked subqueries) -- errors was built by
+            # iterating preds' keys (see _get_all_cardinalities), so we
+            # have to iterate the same keys here to stay aligned with it.
+            if preds is not None:
+                nodes = list(preds[i].keys())
+            else:
+                nodes = list(qrep["subset_graph"].nodes())
             if SOURCE_NODE in nodes:
                 nodes.remove(SOURCE_NODE)
             nodes.sort()
@@ -364,7 +371,7 @@ class QError(EvalFunc):
         errors = np.maximum((ytrue / yhat), (yhat / ytrue))
 
         if kwargs["result_dir"] is not None:
-            self.save_logs(qreps, errors, **kwargs)
+            self.save_logs(qreps, errors, preds=preds, **kwargs)
 
         return errors
 

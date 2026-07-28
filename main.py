@@ -25,6 +25,7 @@ import copy
 import pickle
 import os
 import yaml
+from collections import defaultdict, Counter
 
 import wandb
 import logging
@@ -275,6 +276,182 @@ def save_subquery_split_dataframes(trainqs, valqs, testqs, evalqs, eval_qdirs, r
     return saved_paths
 
 
+def _qrep_subquery_signatures(qrep):
+    """
+    Maps each subquery node (subset_graph node) in qrep to a hashable
+    signature of its (tables, joins, predicates) -- two subqueries with the
+    same signature are the same subquery, regardless of which top-level
+    query/pkl file they came from.
+    """
+    sigs = {}
+    for row in extract_subquery_rows(qrep, num_joins=None):
+        sigs[row["subquery_id"]] = (
+            tuple(row["tables"]),
+            tuple(row["joins"]),
+            tuple(str(pred) for pred in row["predicates"]),
+        )
+    return sigs
+
+
+def _build_keep_mask(qreps, excluded_by_qrep_idx):
+    """
+    @excluded_by_qrep_idx: {qrep_idx: set(subquery_id)} -- nodes to leave
+    out of the mask (i.e. not used as training/eval samples).
+
+    Returns a subplan_mask in the format QueryDataset expects: a list,
+    same length/order as qreps, of lists of `list(node)` for every
+    subset_graph node to KEEP as a sample. subset_graph itself is never
+    read destructively here -- every node's data stays put, so any other
+    (kept) node that depends on looking it up (e.g. a multi-table
+    subplan's featurizer reading its single-table components' cardinality
+    estimates) is unaffected by what this mask excludes.
+    """
+    mask = []
+    for qi, qrep in enumerate(qreps):
+        excluded = excluded_by_qrep_idx.get(qi, set())
+        keep = [list(node) for node in qrep["subset_graph"].nodes()
+                if node not in excluded]
+        mask.append(keep)
+    return mask
+
+
+def _intersect_masks(qreps, mask_a, mask_b):
+    """
+    Combines two subplan_masks (either may be None, meaning "no
+    restriction") into one that keeps only nodes present in both.
+    """
+    if mask_a is None:
+        return mask_b
+    if mask_b is None:
+        return mask_a
+    combined = []
+    for qi in range(len(qreps)):
+        keep_a = {tuple(node) for node in mask_a[qi]}
+        keep_b = {tuple(node) for node in mask_b[qi]}
+        combined.append([list(node) for node in (keep_a & keep_b)])
+    return combined
+
+
+def remove_duplicate_subqueries(qreps, split_name="split"):
+    """
+    Computes a subplan_mask (see QueryDataset/cardinality_estimation's
+    train() methods) that keeps only the first occurrence -- by qrep
+    order -- of each subquery signature (tables/joins/predicates) within
+    this split; later occurrences of the same signature, in other qreps,
+    are excluded from becoming training/eval samples.
+
+    subset_graph is never modified: every qrep keeps its full node set,
+    so featurizer lookups that a kept subplan makes against its own
+    qrep's graph (e.g. a multi-table subplan reading the postgres
+    estimate of one of its single-table components) always succeed,
+    regardless of what this mask excludes elsewhere in the same graph.
+    Only which nodes get turned into dataset rows is affected.
+
+    Returns (mask, num_excluded): mask is a list, same length/order as
+    qreps, of lists of `list(node)` -- pass it as `subplan_mask` (train),
+    `val_subplan_mask`, or `test_subplan_mask` to alg.train()/
+    train_with_dann()/train_with_new_discriminator().
+    """
+    seen = {}
+    excluded_by_qrep = defaultdict(set)
+    num_excluded = 0
+    for qi, qrep in enumerate(qreps):
+        for subquery_id, sig in _qrep_subquery_signatures(qrep).items():
+            if sig in seen:
+                excluded_by_qrep[qi].add(subquery_id)
+                num_excluded += 1
+            else:
+                seen[sig] = (qi, subquery_id)
+
+    mask = _build_keep_mask(qreps, excluded_by_qrep)
+    main_logger.info(
+        f"[{split_name}] remove_duplicate_subqueries: excluding {num_excluded} "
+        f"duplicate subquery nodes from training/eval samples "
+        f"({len(seen)} unique subqueries kept)"
+    )
+    return mask, num_excluded
+
+
+def detect_leakage(named_splits, remove=False, priority=None):
+    """
+    @named_splits: [(split_name, qreps), ...], e.g.
+        [("train", trainqs), ("val", valqs), ("test", testqs)]
+    Finds subquery signatures (tables/joins/predicates) that appear in
+    more than one split, and logs the pairwise overlap counts.
+
+    @remove: if True, also builds a subplan_mask per split that excludes
+    leaked subplans from becoming training/eval samples in every split
+    except the highest-priority one that contains them (priority
+    defaults to the order of named_splits, i.e. train wins over val, val
+    wins over test). subset_graph is never modified, same as
+    remove_duplicate_subqueries -- only which nodes get turned into
+    dataset rows is affected.
+
+    Returns (report, masks): report is a dict with leaked signature
+    counts and pairwise overlap counts; masks is {split_name: mask or
+    None} (None meaning "no filtering needed for this split").
+    """
+    split_names = [name for name, _ in named_splits]
+    if priority is None:
+        priority = split_names
+    priority_rank = {name: i for i, name in enumerate(priority)}
+
+    # signature -> {split_name: [(qrep_idx, subquery_id), ...]}
+    sig_to_splits = defaultdict(lambda: defaultdict(list))
+    for split_name, qreps in named_splits:
+        for qi, qrep in enumerate(qreps):
+            for subquery_id, sig in _qrep_subquery_signatures(qrep).items():
+                sig_to_splits[sig][split_name].append((qi, subquery_id))
+
+    overlap_counts = Counter()
+    excluded_by_split_qrep = {name: defaultdict(set) for name in split_names}
+    leaked_signatures = 0
+
+    for sig, per_split in sig_to_splits.items():
+        present_in = [s for s in split_names if s in per_split]
+        if len(present_in) <= 1:
+            continue
+
+        leaked_signatures += 1
+        for i in range(len(present_in)):
+            for j in range(i + 1, len(present_in)):
+                overlap_counts[(present_in[i], present_in[j])] += 1
+
+        if remove:
+            keep_split = min(present_in,
+                    key=lambda s: priority_rank.get(s, len(priority)))
+            for split_name in present_in:
+                if split_name == keep_split:
+                    continue
+                for qi, subquery_id in per_split[split_name]:
+                    excluded_by_split_qrep[split_name][qi].add(subquery_id)
+
+    main_logger.info(
+        f"detect_leakage: {leaked_signatures} subquery signatures found in "
+        f"more than one split"
+    )
+    for (split_a, split_b), count in overlap_counts.items():
+        main_logger.info(f"  overlap {split_a} <-> {split_b}: {count} shared subqueries")
+
+    masks = {}
+    removed_counts = {}
+    for split_name, qreps in named_splits:
+        if remove:
+            masks[split_name] = _build_keep_mask(qreps, excluded_by_split_qrep[split_name])
+            removed_counts[split_name] = sum(
+                    len(v) for v in excluded_by_split_qrep[split_name].values())
+        else:
+            masks[split_name] = None
+
+    if remove:
+        for split_name, count in removed_counts.items():
+            main_logger.info(f"  excluding {count} leaked subquery nodes from {split_name}")
+
+    return {
+        "leaked_signatures": leaked_signatures,
+        "overlap_counts": dict(overlap_counts),
+        "removed_counts": removed_counts,
+    }, masks
 
 
 def split_queries_for_discriminator(target_queries, holdout_fraction=0.5, random_state=42):
@@ -496,10 +673,39 @@ def update_labels(qreps):
                     jcard["actual"] = jcard["actual"] / jcard["expected"]
 
     return qreps
-    
+
+# eval funcs whose eval()/save_logs() only look at preds[i].keys() (never
+# at qrep["subset_graph"].nodes() directly to decide what to score), so
+# it's safe to hand them a subset of a qrep's subquery predictions.
+# Plan-cost style funcs (ppc/simple plan cost) need every subplan's
+# estimate to build a full query plan, so they're deliberately excluded
+# here and always get the complete, unfiltered predictions.
+_PER_SUBQUERY_EVAL_FUNCS = {"QError", "AbsError", "MeanSquaredError", "RelativeError"}
+
+def _filter_ests_by_mask(ests, subplan_mask):
+    """
+    @ests: [{node: prediction}, ...], one dict per qrep, as returned by
+    alg.test() -- always covers every subset_graph node.
+    @subplan_mask: subplan_mask format (list, same order as the qreps
+    ests came from, of lists of `list(node)` to keep).
+
+    Returns a same-shape copy of ests with entries for excluded nodes
+    dropped, so per-subquery metrics computed from it only reflect kept
+    (e.g. deduped) subqueries.
+    """
+    filtered = []
+    for qi, qrep_ests in enumerate(ests):
+        if qi >= len(subplan_mask):
+            filtered.append(qrep_ests)
+            continue
+        keep = {tuple(node) for node in subplan_mask[qi]}
+        filtered.append({k: v for k, v in qrep_ests.items() if k in keep})
+    return filtered
+
 def eval_alg(alg, eval_funcs, qreps, cfg,
         samples_type,
-        featurizer=None):
+        featurizer=None,
+        subplan_mask=None):
     '''
     '''
     np.set_printoptions(formatter={'float': lambda x: "{0:0.3f}".format(x)})
@@ -536,12 +742,19 @@ def eval_alg(alg, eval_funcs, qreps, cfg,
             with open(predfn, "wb") as f:
                 pickle.dump(cur_ests, f)
 
+    if subplan_mask is not None:
+        masked_ests = _filter_ests_by_mask(ests, subplan_mask)
+    else:
+        masked_ests = ests
+
     for efunc in eval_funcs:
         if "plan" in str(efunc).lower() and "train" in qreps[0]["template_name"]:
             print("skipping _train_ workload plan cost eval")
             continue
 
-        errors = efunc.eval(qreps, ests,
+        cur_ests = masked_ests if type(efunc).__name__ in _PER_SUBQUERY_EVAL_FUNCS else ests
+
+        errors = efunc.eval(qreps, cur_ests,
                 user = cfg["db"]["user"], pwd = cfg["db"]["pwd"],
                 port = cfg["db"]["port"], db_name = cfg["db"]["db_name"],
                 db_host = cfg["db"]["db_host"],
@@ -685,7 +898,32 @@ def main():
     valqs = load_qdata(val_qfns)
     testqs = load_qdata(test_qfns)
 
-    if args.learn_residual: 
+    # subplan_mask passed to alg.train()/train_with_dann()/
+    # train_with_new_discriminator(): which subset_graph nodes to
+    # actually turn into training/eval samples. None means "no
+    # filtering" (the original, possibly-duplicated/leaky data).
+    train_subplan_mask = None
+    val_subplan_mask = None
+    test_subplan_mask = None
+
+    if args.remove_duplicate_subqueries:
+        train_subplan_mask, _ = remove_duplicate_subqueries(trainqs, split_name="train")
+        val_subplan_mask, _ = remove_duplicate_subqueries(valqs, split_name="val")
+        test_subplan_mask, _ = remove_duplicate_subqueries(testqs, split_name="test")
+
+    if args.remove_leakage or args.detect_leakage:
+        _, leakage_masks = detect_leakage(
+                [("train", trainqs), ("val", valqs), ("test", testqs)],
+                remove=bool(args.remove_leakage))
+        if args.remove_leakage:
+            train_subplan_mask = _intersect_masks(trainqs, train_subplan_mask,
+                    leakage_masks.get("train"))
+            val_subplan_mask = _intersect_masks(valqs, val_subplan_mask,
+                    leakage_masks.get("val"))
+            test_subplan_mask = _intersect_masks(testqs, test_subplan_mask,
+                    leakage_masks.get("test"))
+
+    if args.learn_residual:
         trainqs = update_labels(trainqs)
         valqs = update_labels(valqs)
         testqs = update_labels(testqs)
@@ -704,16 +942,16 @@ def main():
     print("""Selected Queries: {} train, {} test, {} val, {} eval"""\
             .format(len(trainqs), len(testqs), len(valqs), sum(eqs)))
 
-    # if args.result_dir is not None:
-    #     save_subquery_split_dataframes(
-    #         trainqs,
-    #         valqs,
-    #         testqs,
-    #         evalqs,
-    #         eval_qdirs,
-    #         args.result_dir,
-    #         cfg["data"]["query_dir"],
-    #     )
+    if args.result_dir is not None:
+        save_subquery_split_dataframes(
+            trainqs,
+            valqs,
+            testqs,
+            evalqs,
+            eval_qdirs,
+            args.result_dir,
+            cfg["data"]["query_dir"],
+        )
    
 
     # Undersample source (trainqs) to match target (evalqs) size
@@ -820,6 +1058,9 @@ def main():
                 result_dir=args.result_dir,
                 adv_weights=disc_weights,
                 adv_weight_level="dataset",
+                subplan_mask=train_subplan_mask,
+                val_subplan_mask=val_subplan_mask,
+                test_subplan_mask=test_subplan_mask,
             )
         elif use_dann_train:
             if not hasattr(alg, "train_with_dann"):
@@ -836,6 +1077,9 @@ def main():
                 result_dir=args.result_dir,
                 adv_weights=disc_weights,
                 adv_weight_level="dataset",
+                subplan_mask=train_subplan_mask,
+                val_subplan_mask=val_subplan_mask,
+                test_subplan_mask=test_subplan_mask,
             )
         elif use_new_discriminator_train:
             if not hasattr(alg, "train_with_new_discriminator"):
@@ -852,12 +1096,18 @@ def main():
                 result_dir=args.result_dir,
                 adv_weights=disc_weights,
                 adv_weight_level="dataset",
+                subplan_mask=train_subplan_mask,
+                val_subplan_mask=val_subplan_mask,
+                test_subplan_mask=test_subplan_mask,
             )
         else:
             alg.train(trainqs, valqs=valqs, testqs=testqs, evalqs = mscn_evalqs,
                     eval_qdirs = mscn_eval_qdirs, featurizer=featurizer,
                     result_dir=args.result_dir,
-                    adv_weights=disc_weights, adv_weight_level="dataset")
+                    adv_weights=disc_weights, adv_weight_level="dataset",
+                    subplan_mask=train_subplan_mask,
+                    val_subplan_mask=val_subplan_mask,
+                    test_subplan_mask=test_subplan_mask)
     else:
         if use_generator_adversarial_train:
             if not hasattr(alg, "train_with_latent_generator"):
@@ -874,6 +1124,8 @@ def main():
                 result_dir=args.result_dir,
                 adv_weights=disc_weights,
                 adv_weight_level="dataset",
+                subplan_mask=train_subplan_mask,
+                val_subplan_mask=val_subplan_mask,
             )
         elif use_dann_train:
             if not hasattr(alg, "train_with_dann"):
@@ -890,6 +1142,8 @@ def main():
                 result_dir=args.result_dir,
                 adv_weights=disc_weights,
                 adv_weight_level="dataset",
+                subplan_mask=train_subplan_mask,
+                val_subplan_mask=val_subplan_mask,
             )
         elif use_new_discriminator_train:
             if not hasattr(alg, "train_with_new_discriminator"):
@@ -906,28 +1160,39 @@ def main():
                 result_dir=args.result_dir,
                 adv_weights=disc_weights,
                 adv_weight_level="dataset",
+                subplan_mask=train_subplan_mask,
+                val_subplan_mask=val_subplan_mask,
             )
         else:
             alg.train(trainqs, valqs=valqs, testqs=None, evalqs = mscn_evalqs,
                     eval_qdirs = mscn_eval_qdirs, featurizer=featurizer,
                     result_dir=args.result_dir,
-                    adv_weights=disc_weights, adv_weight_level="dataset")
+                    adv_weights=disc_weights, adv_weight_level="dataset",
+                    subplan_mask=train_subplan_mask,
+                    val_subplan_mask=val_subplan_mask)
 
     start_time = time.time()
-    eval_alg(alg, eval_fns, trainqs, cfg, "train", featurizer=featurizer)
+    # subplan_mask here is the same mask actually used for training, so
+    # the reported train QError reflects the same (deduped/leakage-
+    # cleaned) subqueries the model was trained on, not the full,
+    # possibly-duplicated set.
+    eval_alg(alg, eval_fns, trainqs, cfg, "train", featurizer=featurizer,
+            subplan_mask=train_subplan_mask)
     execution_time = time.time() - start_time
     print(f"{args.alg} Evaluation time on train set: {execution_time:.2f} seconds")
 
     # if len(valqs) > 0:
     #     start_time = time.time()
-    #     eval_alg(alg, eval_fns, valqs, cfg, "val", featurizer=featurizer)
+    #     eval_alg(alg, eval_fns, valqs, cfg, "val", featurizer=featurizer,
+    #             subplan_mask=val_subplan_mask)
     #     execution_time = time.time() - start_time
     #     print(f"{args.alg} Evaluation time on val set: {execution_time:.2f} seconds")
 
     if len(testqs) > 0:
         start_time = time.time()
         print(' ----------- Evaluation time on test set starts -----------')
-        eval_alg(alg, eval_fns, testqs, cfg, "test", featurizer=featurizer)
+        eval_alg(alg, eval_fns, testqs, cfg, "test", featurizer=featurizer,
+                subplan_mask=test_subplan_mask)
         execution_time = time.time() - start_time
         print(f"{args.alg} Evaluation time on test set: {execution_time:.2f} seconds")
         print(' ----------- Evaluation time on test set ends -----------')
@@ -938,7 +1203,13 @@ def main():
             eval_dir_name = os.path.basename(os.path.normpath(mscn_eval_qdirs[ei]))
             if not eval_dir_name:
                 eval_dir_name = f"eval_{ei}"
-            eval_alg(alg, eval_fns, evalq, cfg, eval_dir_name, featurizer=featurizer)
+
+            evalq_mask = None
+            if args.remove_duplicate_subqueries:
+                evalq_mask, _ = remove_duplicate_subqueries(evalq, split_name=eval_dir_name)
+
+            eval_alg(alg, eval_fns, evalq, cfg, eval_dir_name, featurizer=featurizer,
+                    subplan_mask=evalq_mask)
             execution_time = time.time() - start_time
             print(f"Evaluation time on held-out eval set {ei}: {execution_time:.2f} seconds")
             del evalq[:]
@@ -988,6 +1259,21 @@ def read_flags():
     parser.add_argument("--undersample_seed", type=int, required=False,
             default=42,
             help="Optional seed for undersampling (defaults to --random_seed)")
+
+    parser.add_argument("--remove_duplicate_subqueries", type=int, required=False,
+            default=0,
+            help="Set to 1 to remove duplicate subquery nodes (same tables/joins/"
+                 "predicates, seen in more than one qrep) within each of train/val/"
+                 "test independently. Default 0 keeps the original duplicated data.")
+    parser.add_argument("--detect_leakage", type=int, required=False,
+            default=0,
+            help="Set to 1 to log subquery overlap between train/val/test without "
+                 "modifying the data.")
+    parser.add_argument("--remove_leakage", type=int, required=False,
+            default=0,
+            help="Set to 1 to remove subqueries that leak across train/val/test, "
+                 "keeping each one only in the highest-priority split (train > val "
+                 "> test). Implies --detect_leakage reporting.")
     return parser.parse_args()
 
 if __name__ == "__main__":

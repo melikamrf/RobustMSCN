@@ -178,14 +178,27 @@ def format_model_test_output_joinkey(pred, samples, featurizer):
 
     return all_ests
 
-def format_model_test_output(pred, samples, featurizer):
+def format_model_test_output(pred, samples, featurizer, subplan_mask=None):
+    '''
+    @subplan_mask: optional, same format as QueryDataset's subplan_mask
+    ([[list(node), ...], ...] per sample). Must be passed whenever `pred`
+    came from a dataset that was itself built with this subplan_mask --
+    otherwise the per-sample node count here won't match how many
+    predictions `pred` actually has for that sample, and indexing into
+    `pred` will drift/overrun.
+    '''
     all_ests = []
     query_idx = 0
     # print("len pred: ", len(pred))
 
     for si, sample in enumerate(samples):
         ests = {}
-        node_keys = list(sample["subset_graph"].nodes())
+        if subplan_mask is not None and si < len(subplan_mask):
+            # same set of nodes QueryDataset kept for this sample; re-sort
+            # since that's the order the dataset laid out its rows in
+            node_keys = [tuple(node) for node in subplan_mask[si]]
+        else:
+            node_keys = list(sample["subset_graph"].nodes())
         if SOURCE_NODE in node_keys:
             node_keys.remove(SOURCE_NODE)
         node_keys.sort()
@@ -1248,11 +1261,15 @@ class NN(CardinalityEstimationAlg):
             "p99": float(np.percentile(losses_np, 99)) if len(losses_np) > 0 else None,
         }
 
-    def _compute_qerror_metrics_from_numpy(self, preds, samples):
+    def _compute_qerror_metrics_from_numpy(self, preds, samples, subplan_mask=None):
         if samples is None or len(samples) == 0:
             return {"mean": None, "median": None, "p99": None}
 
         if getattr(self.featurizer, "card_type", None) == "joinkey":
+            # NOTE: format_model_test_output_joinkey doesn't support
+            # subplan_mask (it indexes by subset_graph edges, not nodes,
+            # so the node-based mask format doesn't directly apply here).
+            # preds must have come from an unmasked dataset in this mode.
             formatted_preds = format_model_test_output_joinkey(
                 preds,
                 samples,
@@ -1264,6 +1281,7 @@ class NN(CardinalityEstimationAlg):
                 preds,
                 samples,
                 self.featurizer,
+                subplan_mask=subplan_mask,
             )
             errors = get_eval_fn("qerr").eval(
                 samples,
@@ -1845,6 +1863,8 @@ class NN(CardinalityEstimationAlg):
             subplan_mask = kwargs["subplan_mask"]
         else:
             subplan_mask = None
+        val_subplan_mask = kwargs.get("val_subplan_mask", None)
+        test_subplan_mask = kwargs.get("test_subplan_mask", None)
 
         self.trainds = self.init_dataset(training_samples,
                 self.load_query_together,
@@ -1892,7 +1912,8 @@ class NN(CardinalityEstimationAlg):
         if self.eval_epoch < self.max_epochs:
             if "valqs" in kwargs and len(kwargs["valqs"]) > 0:
                 self.eval_ds["val"] = self.init_dataset(kwargs["valqs"], False,
-                        load_padded_mscn_feats=self.load_padded_mscn_feats)
+                        load_padded_mscn_feats=self.load_padded_mscn_feats,
+                        subplan_mask=val_subplan_mask)
                 self.samples["val"] = kwargs["valqs"]
 
             # if "valqs" in kwargs and len(kwargs["valqs"]) > 0:
@@ -1901,13 +1922,23 @@ class NN(CardinalityEstimationAlg):
                 if len(kwargs["testqs"]) > 400:
                     ns = int(len(kwargs["testqs"]) / 10)
                     random.seed(42)
-                    testqs = random.sample(kwargs["testqs"], ns)
+                    if test_subplan_mask is not None:
+                        # keep testqs and its mask aligned by sampling the
+                        # same indices out of both
+                        idxs = random.sample(range(len(kwargs["testqs"])), ns)
+                        testqs = [kwargs["testqs"][i] for i in idxs]
+                        cur_test_subplan_mask = [test_subplan_mask[i] for i in idxs]
+                    else:
+                        testqs = random.sample(kwargs["testqs"], ns)
+                        cur_test_subplan_mask = None
                 else:
                     testqs = kwargs["testqs"]
+                    cur_test_subplan_mask = test_subplan_mask
 
                 self.eval_ds["test"] = self.init_dataset(testqs,
                         False,
-                        load_padded_mscn_feats=self.load_padded_mscn_feats)
+                        load_padded_mscn_feats=self.load_padded_mscn_feats,
+                        subplan_mask=cur_test_subplan_mask)
                 self.samples["test"] = testqs
 
             if "evalqs" in kwargs and len(kwargs["eval_qdirs"]) > 0:
@@ -2028,6 +2059,7 @@ class NN(CardinalityEstimationAlg):
                 val_qerr_metrics = self._compute_qerror_metrics_from_numpy(
                     val_preds,
                     self.samples.get("val"),
+                    subplan_mask=val_subplan_mask,
                 )
                 if val_qerr_metrics["mean"] is not None:
                     epoch_metrics["val_qerr"] = val_qerr_metrics["mean"]
@@ -2184,6 +2216,8 @@ class NN(CardinalityEstimationAlg):
             subplan_mask = kwargs["subplan_mask"]
         else:
             subplan_mask = None
+        val_subplan_mask = kwargs.get("val_subplan_mask", None)
+        test_subplan_mask = kwargs.get("test_subplan_mask", None)
 
         self.trainds = self.init_dataset(
             training_samples,
@@ -2223,6 +2257,7 @@ class NN(CardinalityEstimationAlg):
                 self.eval_ds["val"] = self.init_dataset(
                     kwargs["valqs"], False,
                     load_padded_mscn_feats=self.load_padded_mscn_feats,
+                    subplan_mask=val_subplan_mask,
                 )
                 self.samples["val"] = kwargs["valqs"]
 
@@ -2230,13 +2265,23 @@ class NN(CardinalityEstimationAlg):
                 if len(kwargs["testqs"]) > 400:
                     ns = int(len(kwargs["testqs"]) / 10)
                     random.seed(42)
-                    testqs = random.sample(kwargs["testqs"], ns)
+                    if test_subplan_mask is not None:
+                        # keep testqs and its mask aligned by sampling the
+                        # same indices out of both
+                        idxs = random.sample(range(len(kwargs["testqs"])), ns)
+                        testqs = [kwargs["testqs"][i] for i in idxs]
+                        cur_test_subplan_mask = [test_subplan_mask[i] for i in idxs]
+                    else:
+                        testqs = random.sample(kwargs["testqs"], ns)
+                        cur_test_subplan_mask = None
                 else:
                     testqs = kwargs["testqs"]
+                    cur_test_subplan_mask = test_subplan_mask
 
                 self.eval_ds["test"] = self.init_dataset(
                     testqs, False,
                     load_padded_mscn_feats=self.load_padded_mscn_feats,
+                    subplan_mask=cur_test_subplan_mask,
                 )
                 self.samples["test"] = testqs
 
@@ -2362,6 +2407,7 @@ class NN(CardinalityEstimationAlg):
                 val_qerr_metrics = self._compute_qerror_metrics_from_numpy(
                     val_preds,
                     self.samples.get("val"),
+                    subplan_mask=val_subplan_mask,
                 )
                 if val_qerr_metrics["mean"] is not None:
                     epoch_metrics["val_qerr"] = val_qerr_metrics["mean"]
@@ -2536,6 +2582,8 @@ class NN(CardinalityEstimationAlg):
             subplan_mask = kwargs["subplan_mask"]
         else:
             subplan_mask = None
+        val_subplan_mask = kwargs.get("val_subplan_mask", None)
+        test_subplan_mask = kwargs.get("test_subplan_mask", None)
 
         self.trainds = self.init_dataset(
             training_samples,
@@ -2575,6 +2623,7 @@ class NN(CardinalityEstimationAlg):
                 self.eval_ds["val"] = self.init_dataset(
                     kwargs["valqs"], False,
                     load_padded_mscn_feats=self.load_padded_mscn_feats,
+                    subplan_mask=val_subplan_mask,
                 )
                 self.samples["val"] = kwargs["valqs"]
 
@@ -2582,13 +2631,23 @@ class NN(CardinalityEstimationAlg):
                 if len(kwargs["testqs"]) > 400:
                     ns = int(len(kwargs["testqs"]) / 10)
                     random.seed(42)
-                    testqs = random.sample(kwargs["testqs"], ns)
+                    if test_subplan_mask is not None:
+                        # keep testqs and its mask aligned by sampling the
+                        # same indices out of both
+                        idxs = random.sample(range(len(kwargs["testqs"])), ns)
+                        testqs = [kwargs["testqs"][i] for i in idxs]
+                        cur_test_subplan_mask = [test_subplan_mask[i] for i in idxs]
+                    else:
+                        testqs = random.sample(kwargs["testqs"], ns)
+                        cur_test_subplan_mask = None
                 else:
                     testqs = kwargs["testqs"]
+                    cur_test_subplan_mask = test_subplan_mask
 
                 self.eval_ds["test"] = self.init_dataset(
                     testqs, False,
                     load_padded_mscn_feats=self.load_padded_mscn_feats,
+                    subplan_mask=cur_test_subplan_mask,
                 )
                 self.samples["test"] = testqs
 
@@ -2687,6 +2746,7 @@ class NN(CardinalityEstimationAlg):
                 val_qerr_metrics = self._compute_qerror_metrics_from_numpy(
                     val_preds,
                     self.samples.get("val"),
+                    subplan_mask=val_subplan_mask,
                 )
                 if val_qerr_metrics["mean"] is not None:
                     epoch_metrics["val_qerr"] = val_qerr_metrics["mean"]
