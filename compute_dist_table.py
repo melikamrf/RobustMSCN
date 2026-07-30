@@ -279,13 +279,31 @@ def print_distribution(label, items):
     print_distribution_from_counts(label, total, counts)
 
 
-def compute_distributions_for_qreps(label, qreps, max_qreps=None, return_df=False, num_joins=None):
+def compute_distributions_for_qreps(label, qreps, max_qreps=None, return_df=False,
+        num_joins=None, allowed_nodes_per_qrep=None):
+    """
+    @allowed_nodes_per_qrep: optional list, aligned with qreps, where entry i
+    is a set of subset_graph node keys (tuples of aliases) to include for
+    qreps[i]; every other node of that qrep is skipped. None (or a None
+    entry) means "all nodes". Pass a per-split subplan_mask (converted to
+    node-tuple sets) here so the distribution reflects only the subqueries
+    actually in that split -- otherwise every qrep's full subset_graph is
+    used, which in subquery-level-split (--train_csv) mode means ~every
+    template's full graph appears in ~every split, exploding both the row
+    count and memory.
+    """
     if max_qreps:
         qreps = qreps[:max_qreps]
 
     subquery_rows = []
-    for qrep in qreps:
-        subquery_rows.extend(extract_subquery_rows(qrep, num_joins))
+    for i, qrep in enumerate(qreps):
+        allowed = None
+        if allowed_nodes_per_qrep is not None and i < len(allowed_nodes_per_qrep):
+            allowed = allowed_nodes_per_qrep[i]
+        for row in extract_subquery_rows(qrep, num_joins):
+            if allowed is not None and row["subquery_id"] not in allowed:
+                continue
+            subquery_rows.append(row)
 
     workload_df = pd.DataFrame(subquery_rows)
     print("\n" + "=" * 80)

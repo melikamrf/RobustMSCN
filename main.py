@@ -25,6 +25,12 @@ import copy
 import pickle
 import os
 import yaml
+import ast
+import re
+import glob
+import hashlib
+import networkx as nx
+from networkx.readwrite import json_graph
 from collections import defaultdict, Counter
 
 import wandb
@@ -123,29 +129,53 @@ def _save_distribution_artifacts(split_name, dist, workload_df, output_dir, save
     }
 
 
+def _mask_to_allowed_sets(subplan_mask):
+    """
+    Converts a subplan_mask (list, aligned with a qreps list, of lists of
+    `list(node)` to keep) into the list-of-sets-of-node-tuples form the
+    reporting/distribution helpers expect. None (no mask) stays None, meaning
+    "use every subset_graph node".
+    """
+    if subplan_mask is None:
+        return None
+    return [{tuple(node) for node in per_qrep} for per_qrep in subplan_mask]
+
+
 def calc_datasets_jsd(trainqs, valqs, testqs, evalqs, eval_qdirs,
-        result_dir=None, save_dist_tables=True, dist_table_format="pkl"):
+        result_dir=None, save_dist_tables=True, dist_table_format="pkl",
+        train_mask=None, val_mask=None, test_mask=None, eval_masks=None):
     """
     Compute JSD between training and eval query distributions.
     Uses the whole dataset only; it does not stratify by join count.
+
+    train_mask/val_mask/test_mask/eval_masks are optional per-split
+    subplan_masks; when given, only the subqueries each mask keeps are
+    counted (so the JSD reflects the actual split, and -- critically for
+    subquery-level --train_csv splits -- we don't materialize every
+    template's full subset_graph for every split, which OOMs).
     """
     split_results = {}
 
     split_results["train"] = compute_distributions_for_qreps(
-        "train_all", trainqs, return_df=True, num_joins=None
+        "train_all", trainqs, return_df=True, num_joins=None,
+        allowed_nodes_per_qrep=_mask_to_allowed_sets(train_mask)
     )
     split_results["val"] = compute_distributions_for_qreps(
-        "val_all", valqs, return_df=True, num_joins=None
+        "val_all", valqs, return_df=True, num_joins=None,
+        allowed_nodes_per_qrep=_mask_to_allowed_sets(val_mask)
     )
     split_results["test"] = compute_distributions_for_qreps(
-        "test_all", testqs, return_df=True, num_joins=None
+        "test_all", testqs, return_df=True, num_joins=None,
+        allowed_nodes_per_qrep=_mask_to_allowed_sets(test_mask)
     )
 
     for idx, evalq in enumerate(evalqs):
         raw_label = eval_qdirs[idx] if idx < len(eval_qdirs) else f"eval_{idx}"
         label = os.path.basename(os.path.normpath(raw_label)) or f"eval_{idx}"
+        eval_mask = eval_masks[idx] if (eval_masks is not None and idx < len(eval_masks)) else None
         split_results[label] = compute_distributions_for_qreps(
-            f"{label}_all", evalq, return_df=True, num_joins=None
+            f"{label}_all", evalq, return_df=True, num_joins=None,
+            allowed_nodes_per_qrep=_mask_to_allowed_sets(eval_mask)
         )
 
     if save_dist_tables:
@@ -200,13 +230,18 @@ def _format_subquery_tables(subquery_id):
     return " | ".join(table_entries)
 
 
-def _build_subquery_level_dataframe(qreps):
+def _build_subquery_level_dataframe(qreps, allowed_nodes_per_qrep=None):
     rows = []
-    for qrep in qreps:
+    for qi, qrep in enumerate(qreps):
         subset_graph = qrep["subset_graph"]
+        allowed = None
+        if allowed_nodes_per_qrep is not None and qi < len(allowed_nodes_per_qrep):
+            allowed = allowed_nodes_per_qrep[qi]
         for subquery_row in extract_subquery_rows(qrep, num_joins=None):
             subquery_id = subquery_row["subquery_id"]
             if not subquery_id:
+                continue
+            if allowed is not None and subquery_id not in allowed:
                 continue
             card_info = subset_graph.nodes()[subquery_id].get("cardinality", {})
             rows.append({
@@ -235,7 +270,8 @@ def _dataset_file_prefix(query_dir):
     return base_name
 
 
-def save_subquery_split_dataframes(trainqs, valqs, testqs, evalqs, eval_qdirs, result_dir, query_dir):
+def save_subquery_split_dataframes(trainqs, valqs, testqs, evalqs, eval_qdirs, result_dir, query_dir,
+        train_mask=None, val_mask=None, test_mask=None, eval_masks=None):
     if result_dir is None:
         return {}
 
@@ -244,22 +280,26 @@ def save_subquery_split_dataframes(trainqs, valqs, testqs, evalqs, eval_qdirs, r
 
     train_prefix = _dataset_file_prefix(query_dir)
 
+    # (qreps, file-prefix, subplan_mask): the mask restricts the exported
+    # rows to the subqueries actually in that split (see calc_datasets_jsd
+    # for why this matters in subquery-level --train_csv mode).
     split_to_qreps = {
-        "train": (trainqs, train_prefix),
-        "val": (valqs, train_prefix),
-        "test": (testqs, train_prefix),
+        "train": (trainqs, train_prefix, train_mask),
+        "val": (valqs, train_prefix, val_mask),
+        "test": (testqs, train_prefix, test_mask),
     }
     for idx, evalq in enumerate(evalqs):
         raw_label = eval_qdirs[idx] if idx < len(eval_qdirs) else f"eval_{idx}"
         split_name = os.path.basename(os.path.normpath(raw_label)) or f"eval_{idx}"
-        split_to_qreps[split_name] = (evalq, split_name)
+        eval_mask = eval_masks[idx] if (eval_masks is not None and idx < len(eval_masks)) else None
+        split_to_qreps[split_name] = (evalq, split_name, eval_mask)
 
     saved_paths = {}
     for split_name, value in split_to_qreps.items():
-        qreps, prefix = value
+        qreps, prefix, mask = value
         if qreps is None:
             continue
-        df = _build_subquery_level_dataframe(qreps)
+        df = _build_subquery_level_dataframe(qreps, _mask_to_allowed_sets(mask))
         if split_name == "train":
             file_stem = f"{prefix}_train"
         elif split_name == "test":
@@ -330,6 +370,311 @@ def _intersect_masks(qreps, mask_a, mask_b):
         keep_b = {tuple(node) for node in mask_b[qi]}
         combined.append([list(node) for node in (keep_a & keep_b)])
     return combined
+
+
+def _aliases_from_csv_row(join_tables_str, predicates_str):
+    """
+    Reconstructs the set of table aliases a subquery-level CSV row (as
+    produced by GRASP's read_query_file_batched, e.g.
+    join_tables="(('ci','movie_id','t','id'), ...)") touches, so the row can
+    be matched back to a subset_graph node (itself just a tuple of sorted
+    aliases).
+    """
+    joins = ast.literal_eval(join_tables_str) if isinstance(join_tables_str, str) and join_tables_str else ()
+    preds = ast.literal_eval(predicates_str) if isinstance(predicates_str, str) and predicates_str else ()
+    aliases = set()
+    for jt in joins:
+        aliases.add(jt[0])
+        aliases.add(jt[2])
+    for pred in preds:
+        aliases.add(pred[0])
+    return tuple(sorted(aliases))
+
+
+def _qrep_alias_canonical_map(qrep):
+    """
+    Mirrors the self-join alias collapsing GRASP's CEB utilities apply
+    (drop a trailing digit from an alias, e.g. 't1' -> 't', only when that
+    base table has just one alias in the whole query) so CSV rows produced
+    by that pipeline can still be matched against this qrep's (uncollapsed)
+    subset_graph node keys.
+    """
+    aliases = list(qrep["join_graph"].nodes())
+    groups = defaultdict(list)
+    for alias in aliases:
+        groups[re.sub(r'\d+$', '', alias)].append(alias)
+    return {alias: (base if len(members) == 1 else alias)
+            for base, members in groups.items() for alias in members}
+
+
+def _match_csv_rows_to_nodes(rows_df, path_index):
+    """
+    Groups subquery-level CSV rows (template,join_tables,predicates,...) by
+    their `template` (.pkl basename), loads each distinct template's qrep
+    exactly once (via load_qdata, so it gets the same JOB-parsing fixes/
+    cardinality filtering as every other code path), and resolves every row
+    to its subset_graph node.
+
+    Returns {template_basename: (qrep, [row_node, ...])} -- one node per
+    matched row, in row order (duplicate rows produce duplicate entries;
+    callers that need unique nodes should dedupe). Templates not found under
+    query_dir, filtered out entirely by load_qdata, or rows that can't be
+    matched to any node, are skipped with a printed count.
+    """
+    matches = {}
+    num_unmatched = 0
+    num_missing_templates = 0
+
+    for template, group in rows_df.groupby("template"):
+        fullpath = path_index.get(template)
+        if fullpath is None:
+            num_missing_templates += 1
+            continue
+
+        loaded = load_qdata([fullpath])
+        if len(loaded) == 0:
+            num_missing_templates += 1
+            continue
+        qrep = loaded[0]
+
+        node_set = set(qrep["subset_graph"].nodes())
+        node_set.discard(SOURCE_NODE)
+        canonical_to_node = None
+
+        row_nodes = []
+        for _, row in group.iterrows():
+            row_aliases = _aliases_from_csv_row(row["join_tables"], row["predicates"])
+
+            if row_aliases in node_set:
+                row_nodes.append(row_aliases)
+                continue
+
+            if canonical_to_node is None:
+                canonical_map = _qrep_alias_canonical_map(qrep)
+                canonical_to_node = {
+                    tuple(sorted(canonical_map.get(a, a) for a in node)): node
+                    for node in node_set
+                }
+
+            matched_node = canonical_to_node.get(row_aliases)
+            if matched_node is not None:
+                row_nodes.append(matched_node)
+            else:
+                num_unmatched += 1
+
+        if row_nodes:
+            matches[template] = (qrep, row_nodes)
+
+    if num_unmatched:
+        print(f"_match_csv_rows_to_nodes: {num_unmatched} CSV rows did not "
+              f"match any subset_graph node, skipped")
+    if num_missing_templates:
+        print(f"_match_csv_rows_to_nodes: {num_missing_templates} CSV "
+              f"template(s) not found under query_dir (or filtered out by "
+              f"load_qdata), skipped")
+
+    return matches
+
+
+def _index_query_dir_by_basename(query_dir):
+    fns = glob.glob(os.path.join(query_dir, "*", "*.pkl"))
+    return {os.path.basename(fn): fn for fn in fns}
+
+
+def _assert_csv_matched_something(csv_path, query_dir, rows_df, path_index, matches):
+    """
+    Fails fast with an actionable message instead of letting an empty
+    `matches` silently propagate into a confusing sklearn train_test_split
+    error ("n_samples=0") several calls downstream. The most common cause is
+    query_dir pointing at a different workload's directory than whatever
+    CEB-imdb tree the CSV's `template` filenames were generated from.
+    """
+    if matches:
+        return
+    csv_templates = set(rows_df["template"].unique())
+    sample_csv = sorted(csv_templates)[:5]
+    sample_dir = sorted(path_index.keys())[:5]
+    raise ValueError(
+        f"No rows in {csv_path} could be matched to any file under "
+        f"query_dir={query_dir!r}: {len(csv_templates)} distinct CSV "
+        f"template(s) referenced, {len(path_index)} .pkl files found "
+        f"under query_dir. Sample CSV templates: {sample_csv}. Sample "
+        f"filenames found under query_dir: {sample_dir}. This almost "
+        f"always means query_dir points at a different workload directory "
+        f"than the one the CSV was generated from -- check data.query_dir "
+        f"in your config."
+    )
+
+
+def load_eval_set_from_csv(csv_path, query_dir):
+    """
+    Loads a subquery-level eval CSV (template,join_tables,predicates,...)
+    entirely as one held-out eval split -- no further train/val/test split.
+    Returns (qreps, subplan_mask) ready to become evalqs/eval_qdirs.
+    """
+    rows_df = pd.read_csv(csv_path)
+    path_index = _index_query_dir_by_basename(query_dir)
+    matches = _match_csv_rows_to_nodes(rows_df, path_index)
+    _assert_csv_matched_something(csv_path, query_dir, rows_df, path_index, matches)
+
+    qreps = []
+    subplan_mask = []
+    for qrep, nodes in matches.values():
+        qreps.append(qrep)
+        subplan_mask.append([list(node) for node in dict.fromkeys(nodes)])
+
+    return qreps, subplan_mask
+
+
+def load_train_pool_from_csv(csv_path, query_dir, val_size, test_size, seed):
+    """
+    Loads a subquery-level train-pool CSV and splits its *rows* (not whole
+    query files -- the same .pkl template can legitimately contribute nodes
+    to more than one split) into train/val/test, mirroring the val-then-test
+    order get_query_splits uses for train_test_split_kind == "query"
+    (query_representation/utils.py:282-296).
+
+    Each distinct template is loaded once for matching, then deep-copied
+    once per split it contributes to, so trainqs/valqs/testqs never share a
+    mutable qrep object (relevant for --learn_residual, which mutates
+    subset_graph cardinalities in place per split).
+
+    Returns (trainqs, train_mask, valqs, val_mask, testqs, test_mask).
+    """
+    from sklearn.model_selection import train_test_split
+
+    rows_df = pd.read_csv(csv_path)
+    path_index = _index_query_dir_by_basename(query_dir)
+    matches = _match_csv_rows_to_nodes(rows_df, path_index)
+    _assert_csv_matched_something(csv_path, query_dir, rows_df, path_index, matches)
+
+    pairs = sorted({
+        (template, node)
+        for template, (_, nodes) in matches.items()
+        for node in nodes
+    })
+
+    if val_size and val_size > 0.0:
+        val_pairs, pool_pairs = train_test_split(pairs, test_size=1 - val_size,
+                random_state=seed)
+    else:
+        val_pairs, pool_pairs = [], pairs
+
+    if test_size and test_size > 0.0:
+        train_pairs, test_pairs = train_test_split(pool_pairs,
+                test_size=test_size, random_state=seed)
+    else:
+        train_pairs, test_pairs = pool_pairs, []
+
+    def _build_split(split_pairs):
+        by_template = defaultdict(list)
+        for template, node in split_pairs:
+            by_template[template].append(node)
+
+        qreps = []
+        mask = []
+        for template, nodes in by_template.items():
+            base_qrep, _ = matches[template]
+            qreps.append(copy.deepcopy(base_qrep))
+            mask.append([list(node) for node in nodes])
+        return qreps, mask
+
+    trainqs, train_mask = _build_split(train_pairs)
+    valqs, val_mask = _build_split(val_pairs)
+    testqs, test_mask = _build_split(test_pairs)
+
+    return trainqs, train_mask, valqs, val_mask, testqs, test_mask
+
+
+def _csv_split_cache_path(train_csv, eval_csv, query_dir, val_size, test_size,
+        seed, cache_dir):
+    parts = []
+    for fn in (train_csv, eval_csv):
+        st = os.stat(fn)
+        parts.append(f"{os.path.abspath(fn)}|{st.st_mtime}|{st.st_size}")
+    parts.append(f"{query_dir}|{val_size}|{test_size}|{seed}")
+    key = hashlib.md5("||".join(parts).encode()).hexdigest()
+    return os.path.join(cache_dir, f"{key}.pkl")
+
+
+def _qrep_to_cacheable(qrep):
+    """
+    Swaps subset_graph/join_graph for their plain-dict adjacency form (same
+    as what's actually stored in the original .pkl files, see
+    query_representation/query.py's parse_sql/load_qrep) instead of pickling
+    the live networkx Graph objects directly. Pickling live networkx graphs
+    is drastically slower to write/read than this flat form once you're
+    talking thousands of qreps -- worth doing since the whole point of this
+    cache is to be fast.
+    """
+    out = dict(qrep)
+    out["subset_graph"] = nx.adjacency_data(qrep["subset_graph"])
+    out["join_graph"] = nx.adjacency_data(qrep["join_graph"])
+    return out
+
+
+def _qrep_from_cacheable(qrep):
+    out = dict(qrep)
+    out["subset_graph"] = nx.OrderedDiGraph(json_graph.adjacency_graph(qrep["subset_graph"]))
+    out["join_graph"] = json_graph.adjacency_graph(qrep["join_graph"])
+    return out
+
+
+def load_csv_split_data(train_csv, eval_csv, query_dir, val_size, test_size,
+        seed, use_cache=True, cache_dir="./csv_split_cache"):
+    """
+    Wraps load_train_pool_from_csv + load_eval_set_from_csv with an on-disk
+    cache. Matching every CSV row back to its subset_graph node requires
+    loading every distinct referenced .pkl once (thousands of individual
+    file reads for a full CEB-imdb workload), which can take several
+    minutes -- worth avoiding when re-running the exact same split against
+    a different --alg/architecture.
+
+    The cache key is derived from train_csv/eval_csv's paths + mtime + size,
+    plus query_dir/val_size/test_size/seed, so it's automatically invalidated
+    if the CSVs are regenerated or the split parameters change; no manual
+    cache-busting needed. Set use_cache=False (--use_csv_split_cache 0) to
+    force a fresh recompute regardless.
+
+    Returns (trainqs, train_mask, valqs, val_mask, testqs, test_mask,
+    eval_qreps, eval_mask).
+    """
+    cache_path = _csv_split_cache_path(train_csv, eval_csv, query_dir,
+            val_size, test_size, seed, cache_dir)
+
+    if use_cache and os.path.exists(cache_path):
+        print(f"Loading cached CSV-derived train/val/test/eval split from {cache_path}")
+        with open(cache_path, "rb") as f:
+            cached_qlists, masks = pickle.load(f)
+        cached_trainqs, cached_valqs, cached_testqs, cached_evalqs = cached_qlists
+        trainqs = [_qrep_from_cacheable(q) for q in cached_trainqs]
+        valqs = [_qrep_from_cacheable(q) for q in cached_valqs]
+        testqs = [_qrep_from_cacheable(q) for q in cached_testqs]
+        eval_qreps = [_qrep_from_cacheable(q) for q in cached_evalqs]
+        train_mask, val_mask, test_mask, eval_mask = masks
+        return trainqs, train_mask, valqs, val_mask, testqs, test_mask, eval_qreps, eval_mask
+
+    trainqs, train_mask, valqs, val_mask, testqs, test_mask = \
+            load_train_pool_from_csv(train_csv, query_dir, val_size, test_size, seed)
+    eval_qreps, eval_mask = load_eval_set_from_csv(eval_csv, query_dir)
+
+    result = (trainqs, train_mask, valqs, val_mask, testqs, test_mask,
+            eval_qreps, eval_mask)
+
+    if use_cache:
+        cached_qlists = tuple(
+                [_qrep_to_cacheable(q) for q in qs]
+                for qs in (trainqs, valqs, testqs, eval_qreps))
+        masks = (train_mask, val_mask, test_mask, eval_mask)
+
+        os.makedirs(cache_dir, exist_ok=True)
+        tmp_path = cache_path + ".tmp"
+        with open(tmp_path, "wb") as f:
+            pickle.dump((cached_qlists, masks), f, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp_path, cache_path)
+        print(f"Saved CSV-derived train/val/test/eval split to {cache_path} for reuse")
+
+    return result
 
 
 def remove_duplicate_subqueries(qreps, split_name="split"):
@@ -891,25 +1236,41 @@ def main():
         wandb.init(project="ceb", config=wandbcfg,
                 tags=wandb_tags)
 
-    train_qfns, test_qfns, val_qfns, eval_qfns = get_query_splits(cfg["data"])
-    trainqs = load_qdata(train_qfns)
-    # Note: can be quite memory intensive to load them all; might want to just
-    # keep around the qfns and load them as needed
-    valqs = load_qdata(val_qfns)
-    testqs = load_qdata(test_qfns)
-
     # subplan_mask passed to alg.train()/train_with_dann()/
     # train_with_new_discriminator(): which subset_graph nodes to
     # actually turn into training/eval samples. None means "no
     # filtering" (the original, possibly-duplicated/leaky data).
-    train_subplan_mask = None
-    val_subplan_mask = None
-    test_subplan_mask = None
+    if args.train_csv and args.eval_csv:
+        trainqs, train_subplan_mask, valqs, val_subplan_mask, \
+                testqs, test_subplan_mask, csv_eval_qreps, csv_eval_subplan_mask = \
+                load_csv_split_data(
+                        args.train_csv, args.eval_csv, cfg["data"]["query_dir"],
+                        cfg["data"]["val_size"], cfg["data"]["test_size"],
+                        cfg["data"]["diff_templates_seed"],
+                        use_cache=bool(args.use_csv_split_cache))
+        eval_qfns = None
+    else:
+        train_subplan_mask = None
+        val_subplan_mask = None
+        test_subplan_mask = None
+        train_qfns, test_qfns, val_qfns, eval_qfns = get_query_splits(cfg["data"])
+        trainqs = load_qdata(train_qfns)
+        # Note: can be quite memory intensive to load them all; might want to just
+        # keep around the qfns and load them as needed
+        valqs = load_qdata(val_qfns)
+        testqs = load_qdata(test_qfns)
 
     if args.remove_duplicate_subqueries:
-        train_subplan_mask, _ = remove_duplicate_subqueries(trainqs, split_name="train")
-        val_subplan_mask, _ = remove_duplicate_subqueries(valqs, split_name="val")
-        test_subplan_mask, _ = remove_duplicate_subqueries(testqs, split_name="test")
+        # Compose onto (not overwrite) whatever train/val/test_subplan_mask
+        # were initialized to above -- in --train_csv/--eval_csv mode those
+        # already restrict samples to the CSV-selected subqueries, and
+        # deduping must narrow that further rather than replace it.
+        dedup_train_mask, _ = remove_duplicate_subqueries(trainqs, split_name="train")
+        dedup_val_mask, _ = remove_duplicate_subqueries(valqs, split_name="val")
+        dedup_test_mask, _ = remove_duplicate_subqueries(testqs, split_name="test")
+        train_subplan_mask = _intersect_masks(trainqs, train_subplan_mask, dedup_train_mask)
+        val_subplan_mask = _intersect_masks(valqs, val_subplan_mask, dedup_val_mask)
+        test_subplan_mask = _intersect_masks(testqs, test_subplan_mask, dedup_test_mask)
 
     if args.remove_leakage or args.detect_leakage:
         _, leakage_masks = detect_leakage(
@@ -928,19 +1289,37 @@ def main():
         valqs = update_labels(valqs)
         testqs = update_labels(testqs)
     
-    eval_qdirs = cfg["data"]["eval_query_dir"].split(",")
-
-    evalqs = []
-    for eval_qfn in eval_qfns:
-        temp_evalqs = load_qdata(eval_qfn)
+    if args.train_csv and args.eval_csv:
+        eval_qreps, eval_subplan_mask = csv_eval_qreps, csv_eval_subplan_mask
+        # Short, fixed label (not the raw CSV basename): save_subquery_split_
+        # dataframes() builds this split's filename as f"{label}_{label}.csv"
+        # (main.py, save_subquery_split_dataframes), so a long/comma-laden
+        # CSV filename doubled can exceed Windows' path length limit.
+        eval_qdirs = ["eval"]
         if args.learn_residual:
-            temp_evalqs = update_labels(temp_evalqs)
-            
-        evalqs.append(temp_evalqs)
-        
+            eval_qreps = update_labels(eval_qreps)
+        evalqs = [eval_qreps]
+    else:
+        eval_subplan_mask = None
+        eval_qdirs = cfg["data"]["eval_query_dir"].split(",")
+
+        evalqs = []
+        for eval_qfn in eval_qfns:
+            temp_evalqs = load_qdata(eval_qfn)
+            if args.learn_residual:
+                temp_evalqs = update_labels(temp_evalqs)
+
+            evalqs.append(temp_evalqs)
+
     eqs = [len(eq) for eq in evalqs]
     print("""Selected Queries: {} train, {} test, {} val, {} eval"""\
             .format(len(trainqs), len(testqs), len(valqs), sum(eqs)))
+
+    # Per-split subplan masks (from --train_csv/--eval_csv, and/or
+    # --remove_duplicate_subqueries/--remove_leakage) restrict the reporting
+    # helpers to the subqueries actually used in each split. eval_masks is a
+    # list aligned with evalqs.
+    eval_masks = [eval_subplan_mask] if eval_subplan_mask is not None else None
 
     if args.result_dir is not None:
         save_subquery_split_dataframes(
@@ -951,8 +1330,12 @@ def main():
             eval_qdirs,
             args.result_dir,
             cfg["data"]["query_dir"],
+            train_mask=train_subplan_mask,
+            val_mask=val_subplan_mask,
+            test_mask=test_subplan_mask,
+            eval_masks=eval_masks,
         )
-   
+
 
     # Undersample source (trainqs) to match target (evalqs) size
     # Use undersample_train_queries() to match query count
@@ -960,7 +1343,9 @@ def main():
     # trainqs = undersample_train_queries_by_subquery_count(trainqs, evalqs, seed=args.undersample_seed)
     #trainqs = undersample_train_queries(trainqs, eqs, seed=args.undersample_seed)
 
-    dataset_jsd_df = calc_datasets_jsd(trainqs, valqs, testqs, evalqs, eval_qdirs, args.result_dir)
+    dataset_jsd_df = calc_datasets_jsd(trainqs, valqs, testqs, evalqs, eval_qdirs, args.result_dir,
+            train_mask=train_subplan_mask, val_mask=val_subplan_mask,
+            test_mask=test_subplan_mask, eval_masks=eval_masks)
     if args.result_dir is not None:
         os.makedirs(args.result_dir, exist_ok=True)
         train_dataset = cfg["data"]["query_dir"].rstrip("/").split("/")[-1]
@@ -1204,9 +1589,15 @@ def main():
             if not eval_dir_name:
                 eval_dir_name = f"eval_{ei}"
 
-            evalq_mask = None
+            # eval_subplan_mask (from --eval_csv) is only positionally valid
+            # against evalqs itself; if the discriminator holdout path
+            # (prepare_discriminator_weights) resampled it into
+            # heldout_evalqs, mscn_evalqs is no longer evalqs and we can't
+            # line the mask back up, so it's skipped in that case.
+            evalq_mask = eval_subplan_mask if (ei == 0 and mscn_evalqs is evalqs) else None
             if args.remove_duplicate_subqueries:
-                evalq_mask, _ = remove_duplicate_subqueries(evalq, split_name=eval_dir_name)
+                dedup_mask, _ = remove_duplicate_subqueries(evalq, split_name=eval_dir_name)
+                evalq_mask = _intersect_masks(evalq, evalq_mask, dedup_mask)
 
             eval_alg(alg, eval_fns, evalq, cfg, eval_dir_name, featurizer=featurizer,
                     subplan_mask=evalq_mask)
@@ -1274,6 +1665,28 @@ def read_flags():
             help="Set to 1 to remove subqueries that leak across train/val/test, "
                  "keeping each one only in the highest-priority split (train > val "
                  "> test). Implies --detect_leakage reporting.")
+
+    parser.add_argument("--train_csv", type=str, required=False,
+            default=None,
+            help="Subquery-level CSV (template,join_tables,predicates,pgcard,"
+                 "true_card,model_card) defining the train pool. If set "
+                 "together with --eval_csv, this replaces get_query_splits: "
+                 "the pool's rows are split into train/val/test (using "
+                 "data.val_size/test_size/diff_templates_seed) at the "
+                 "individual-subquery level, so the same .pkl file can "
+                 "contribute different subqueries to different splits.")
+    parser.add_argument("--eval_csv", type=str, required=False,
+            default=None,
+            help="Subquery-level CSV (same schema as --train_csv) used "
+                 "entirely as the held-out eval/target set, with no further "
+                 "split. Must be set together with --train_csv.")
+    parser.add_argument("--use_csv_split_cache", type=int, required=False,
+            default=1,
+            help="When using --train_csv/--eval_csv, cache the matched "
+                 "train/val/test/eval split to ./csv_split_cache/ and reuse "
+                 "it on later runs with the same CSVs/split params (e.g. "
+                 "trying a different --alg). Set to 0 to force a fresh "
+                 "recompute.")
     return parser.parse_args()
 
 if __name__ == "__main__":
