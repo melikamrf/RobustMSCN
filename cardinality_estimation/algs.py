@@ -2092,13 +2092,13 @@ class NN(CardinalityEstimationAlg):
                             "epoch": self.epoch,
                         })
 
-                    if "val_qerr" in epoch_metrics:
-                        wandb.log({
-                            "ValQError": epoch_metrics["val_qerr"],
-                            "ValQError-Median": epoch_metrics["val_qerr_median"],
-                            "ValQError-99p": epoch_metrics["val_qerr_p99"],
-                            "epoch": self.epoch,
-                        })
+                        if "val_qerr" in epoch_metrics:
+                            wandb.log({
+                                "ValQError": epoch_metrics["val_qerr"],
+                                "ValQError-Median": epoch_metrics["val_qerr_median"],
+                                "ValQError-99p": epoch_metrics["val_qerr_p99"],
+                                "epoch": self.epoch,
+                            })
 
             self._maybe_save_latent_visualization(run_plot_dir)
 
