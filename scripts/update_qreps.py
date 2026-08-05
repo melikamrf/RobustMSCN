@@ -26,11 +26,11 @@ PKtoFK["rt.id"] = ("ci", "ci.role_id")
 
 # PKtoFK["it.id"] = ("mi", "mi.info_type_id")
 
-USER="pari"
-HOST="localhost"
+USER="postgres"
+HOST="127.0.0.1"
 PORT=5432
 DBNAME="imdb"
-PWD=""
+PWD="password"
 con = pg.connect(user=USER, host=HOST, port=PORT,
         password=PWD, dbname=DBNAME)
 cursor = con.cursor()

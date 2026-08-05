@@ -1,3 +1,6 @@
+#TODO
+#check sels in node after pred_vals and before id (real_name)
+#only in wanderjoin!
 
 import os
 import pdb
