@@ -994,6 +994,178 @@ def undersample_train_queries_by_subquery_count(trainqs, evalqs, seed=None):
     
     return trainqs
 
+def _mask_sample_count(qreps, mask):
+    """
+    How many subplans would actually become dataset rows: every
+    subset_graph node when mask is None, else only the kept ones.
+    SOURCE_NODE is never a training sample (QueryDataset._get_query_
+    features_nodes drops it), so it's excluded either way.
+    """
+    if mask is None:
+        return sum(len([n for n in q["subset_graph"].nodes() if n != SOURCE_NODE])
+                   for q in qreps)
+    return sum(len([n for n in per_qrep if tuple(n) != SOURCE_NODE])
+               for per_qrep in mask)
+
+
+def _materialize_full_mask(qreps):
+    """
+    The explicit "keep every node" subplan_mask, so subquery-level
+    subsampling has something concrete to shrink when a split had no mask
+    yet (None == unrestricted).
+    """
+    return [[list(node) for node in q["subset_graph"].nodes() if node != SOURCE_NODE]
+            for q in qreps]
+
+
+def _resolve_train_size(train_size, pool_size):
+    """
+    @train_size: a fraction of the pool when in (0, 1], an absolute sample
+    count when > 1. Note 1 therefore means "all of it", not "one sample".
+
+    Returns the target size, or None when no subsampling is needed
+    (train_size unset/<=0, or >= the whole pool).
+    """
+    if train_size is None or train_size <= 0:
+        return None
+    if train_size <= 1.0:
+        target = int(round(train_size * pool_size))
+    else:
+        target = int(round(train_size))
+    target = max(1, min(target, pool_size))
+    return None if target >= pool_size else target
+
+
+def resolve_train_size_level(level, from_csv):
+    """
+    "auto" -> "subquery" in --train_csv mode (that split is already
+    subquery-level), "query" otherwise (the get_query_splits path splits
+    over .pkl files).
+    """
+    if level == "auto":
+        return "subquery" if from_csv else "query"
+    if level not in ("query", "subquery"):
+        raise ValueError(f"unknown train_size level: {level!r} "
+                         f"(expected auto/query/subquery)")
+    return level
+
+
+def subsample_train_split(trainqs, train_mask, train_size,
+        level="auto", seed=42, from_csv=False):
+    """
+    Shrinks ONLY the training split to @train_size; val/test/eval are left
+    exactly as they were, so a sweep over training sizes varies one thing
+    and the resulting numbers stay comparable across runs.
+
+    @train_size: fraction of the current training pool in (0, 1], or an
+    absolute number of samples when > 1. None/<=0/1.0 keeps everything.
+    @level: what a "sample" is when counting/drawing.
+      "query":    whole query files (qreps) are dropped. The natural unit
+                  for the get_query_splits path, whose split is itself
+                  over .pkl files.
+      "subquery": individual subplans are dropped, spread over all qreps.
+                  The natural unit for --train_csv (that split is already
+                  subquery-level), and the apples-to-apples unit when
+                  comparing the two split options, since it makes a given
+                  train_size mean the same number of training rows in both.
+      "auto":     "subquery" in --train_csv mode, "query" otherwise.
+    @train_mask: the split's current subplan_mask (None == unrestricted).
+    It is subsampled alongside trainqs so the two stay positionally
+    aligned, which is what QueryDataset indexes it by.
+
+    Call this AFTER --remove_duplicate_subqueries/--remove_leakage have
+    narrowed train_mask, so the requested size counts samples that are
+    actually trained on.
+
+    Returns (trainqs, train_mask).
+    """
+    level = resolve_train_size_level(level, from_csv)
+
+    num_queries = len(trainqs)
+    num_subqueries = _mask_sample_count(trainqs, train_mask)
+
+    pool_size = num_queries if level == "query" else num_subqueries
+    target = _resolve_train_size(train_size, pool_size)
+    if target is None:
+        main_logger.info(
+            f"subsample_train_split(train_size={train_size}): using the full "
+            f"training split ({num_queries} queries, {num_subqueries} "
+            f"subquery samples)"
+        )
+        return trainqs, train_mask
+
+    rng = np.random.RandomState(seed)
+
+    if level == "query":
+        idxs = sorted(rng.choice(num_queries, size=target, replace=False))
+        new_trainqs = [trainqs[i] for i in idxs]
+        new_mask = [train_mask[i] for i in idxs] if train_mask is not None else None
+    else:
+        mask = train_mask if train_mask is not None else _materialize_full_mask(trainqs)
+        flat = [(qi, node) for qi, per_qrep in enumerate(mask)
+                for node in per_qrep if tuple(node) != SOURCE_NODE]
+        idxs = rng.choice(len(flat), size=target, replace=False)
+        kept = defaultdict(list)
+        for i in sorted(idxs):
+            qi, node = flat[i]
+            kept[qi].append(list(node))
+
+        # qreps that kept no samples are dropped outright -- they would only
+        # cost featurizer/bitmap work for rows that no longer exist. Every
+        # retained qrep keeps its full subset_graph, so featurizer lookups a
+        # kept subplan makes against its own graph still resolve.
+        new_trainqs = []
+        new_mask = []
+        for qi, qrep in enumerate(trainqs):
+            if qi in kept:
+                new_trainqs.append(qrep)
+                new_mask.append(kept[qi])
+
+    main_logger.info(
+        f"subsample_train_split(level={level}, train_size={train_size}, "
+        f"seed={seed}): {num_queries} -> {len(new_trainqs)} train queries, "
+        f"{num_subqueries} -> {_mask_sample_count(new_trainqs, new_mask)} "
+        f"train subquery samples (val/test/eval unchanged)"
+    )
+
+    return new_trainqs, new_mask
+
+
+def save_split_sizes(result_dir, trainqs, train_mask, valqs, val_mask,
+        testqs, test_mask, evalqs, eval_masks, extra=None):
+    """
+    Dumps the per-split query/subquery counts actually used by this run to
+    <result_dir>/train_split_sizes.json, so a training-size sweep can
+    report "x training subqueries -> y q-error" without re-deriving the
+    sizes or scraping stdout.
+    """
+    if result_dir is None:
+        return None
+
+    os.makedirs(result_dir, exist_ok=True)
+    sizes = dict(extra or {})
+    sizes.update({
+        "num_train_queries": len(trainqs),
+        "num_train_subqueries": _mask_sample_count(trainqs, train_mask),
+        "num_val_queries": len(valqs),
+        "num_val_subqueries": _mask_sample_count(valqs, val_mask),
+        "num_test_queries": len(testqs),
+        "num_test_subqueries": _mask_sample_count(testqs, test_mask),
+        "num_eval_queries": sum(len(eq) for eq in evalqs),
+        "num_eval_subqueries": sum(
+            _mask_sample_count(
+                eq,
+                eval_masks[i] if (eval_masks is not None and i < len(eval_masks)) else None)
+            for i, eq in enumerate(evalqs)),
+    })
+
+    out_path = os.path.join(result_dir, "train_split_sizes.json")
+    with open(out_path, "w") as f:
+        json.dump(sizes, f, indent=2)
+    print(f"Saved split sizes to {out_path}")
+    return out_path
+
+
 def update_labels(qreps):
     """
     Add residual labels to qreps without overwriting true cardinalities.
@@ -1284,6 +1456,18 @@ def main():
             test_subplan_mask = _intersect_masks(testqs, test_subplan_mask,
                     leakage_masks.get("test"))
 
+    # Training-size experiments: shrink train only (val/test/eval keep the
+    # sizes data.val_size/test_size gave them). Done after the dedup/
+    # leakage masks above so --train_size counts samples actually trained on.
+    train_size_seed = args.train_size_seed if args.train_size_seed is not None \
+            else args.random_seed
+    train_size_level = resolve_train_size_level(args.train_size_level,
+            from_csv=bool(args.train_csv and args.eval_csv))
+    trainqs, train_subplan_mask = subsample_train_split(
+            trainqs, train_subplan_mask, args.train_size,
+            level=train_size_level,
+            seed=train_size_seed)
+
     if args.learn_residual:
         trainqs = update_labels(trainqs)
         valqs = update_labels(valqs)
@@ -1320,6 +1504,24 @@ def main():
     # helpers to the subqueries actually used in each split. eval_masks is a
     # list aligned with evalqs.
     eval_masks = [eval_subplan_mask] if eval_subplan_mask is not None else None
+
+    save_split_sizes(
+        args.result_dir,
+        trainqs, train_subplan_mask,
+        valqs, val_subplan_mask,
+        testqs, test_subplan_mask,
+        evalqs, eval_masks,
+        extra={
+            "split_source": "csv" if (args.train_csv and args.eval_csv) else "query_splits",
+            "train_size": args.train_size,
+            "train_size_level": train_size_level,
+            "train_size_seed": train_size_seed,
+            "val_size": cfg["data"]["val_size"],
+            "test_size": cfg["data"]["test_size"],
+            "alg": args.alg,
+            "config": args.config,
+        },
+    )
 
     if args.result_dir is not None:
         save_subquery_split_dataframes(
@@ -1665,6 +1867,28 @@ def read_flags():
             help="Set to 1 to remove subqueries that leak across train/val/test, "
                  "keeping each one only in the highest-priority split (train > val "
                  "> test). Implies --detect_leakage reporting.")
+
+    parser.add_argument("--train_size", type=float, required=False,
+            default=None,
+            help="Shrink the TRAINING split only, leaving val/test/eval at "
+                 "the sizes data.val_size/test_size produced (so runs at "
+                 "different training sizes stay comparable). A value in "
+                 "(0, 1] is a fraction of the training pool, a value > 1 is "
+                 "an absolute number of samples. Default (unset) or 1.0 "
+                 "trains on everything. Works in both split modes: the "
+                 "get_query_splits path and --train_csv/--eval_csv.")
+    parser.add_argument("--train_size_level", type=str, required=False,
+            default="auto", choices=["auto", "query", "subquery"],
+            help="What --train_size counts. 'query': whole query files. "
+                 "'subquery': individual subplans across all query files. "
+                 "'auto' (default) uses subquery in --train_csv mode and "
+                 "query otherwise. Force 'subquery' for both modes when "
+                 "comparing them against each other, so a given "
+                 "--train_size means the same number of training rows.")
+    parser.add_argument("--train_size_seed", type=int, required=False,
+            default=None,
+            help="Seed for the --train_size subsample (defaults to "
+                 "--random_seed). Vary it to get repeats at the same size.")
 
     parser.add_argument("--train_csv", type=str, required=False,
             default=None,
