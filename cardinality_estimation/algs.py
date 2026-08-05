@@ -1865,6 +1865,11 @@ class NN(CardinalityEstimationAlg):
             subplan_mask = None
         val_subplan_mask = kwargs.get("val_subplan_mask", None)
         test_subplan_mask = kwargs.get("test_subplan_mask", None)
+        # optional list, aligned with kwargs["evalqs"], of per-eval-group
+        # subplan masks; restricts the during-training eval featurization to
+        # the selected subplans (subquery-level --eval_csv), same reason as
+        # train/val/test.
+        eval_subplan_masks = kwargs.get("eval_subplan_masks", None)
 
         self.trainds = self.init_dataset(training_samples,
                 self.load_query_together,
@@ -1946,29 +1951,56 @@ class NN(CardinalityEstimationAlg):
 
                 for ei, cur_evalqs in enumerate(kwargs["evalqs"]):
                     evalqname = eval_qdirs[ei]
+                    # mask aligned with this eval group's qreps; any branch
+                    # that filters cur_evalqs must filter this in lockstep so
+                    # subplan_mask[i] keeps pointing at cur_evalqs[i].
+                    cur_eval_mask = None
+                    if eval_subplan_masks is not None and ei < len(eval_subplan_masks):
+                        cur_eval_mask = eval_subplan_masks[ei]
+
                     if "job" in evalqname:
                         evalqname = "JOB"
                         print("Going to remove JOB Q29 from evaluation because it takes too long for computing PPC")
-                        cur_evalqs = [q for q in cur_evalqs if "29" not in
-                                q["name"]]
+                        if cur_eval_mask is not None:
+                            kept = [(q, m) for q, m in zip(cur_evalqs, cur_eval_mask)
+                                    if "29" not in q["name"]]
+                            cur_evalqs = [q for q, _ in kept]
+                            cur_eval_mask = [m for _, m in kept]
+                        else:
+                            cur_evalqs = [q for q in cur_evalqs if "29" not in
+                                    q["name"]]
 
                     elif "imdb" in evalqname:
                         # evalqname = "CEB-IMDb"
-                        group_evalqs = [q for q in cur_evalqs if "group" in
-                                q["sql"].lower()]
-                        not_group_evalqs = [q for q in cur_evalqs if "group" not in
-                                q["sql"].lower()]
+                        if cur_eval_mask is not None:
+                            group_pairs = [(q, m) for q, m in zip(cur_evalqs, cur_eval_mask)
+                                    if "group" in q["sql"].lower()]
+                            not_group_pairs = [(q, m) for q, m in zip(cur_evalqs, cur_eval_mask)
+                                    if "group" not in q["sql"].lower()]
+                            group_evalqs = [q for q, _ in group_pairs]
+                            group_mask = [m for _, m in group_pairs]
+                            not_group_evalqs = [q for q, _ in not_group_pairs]
+                            not_group_mask = [m for _, m in not_group_pairs]
+                        else:
+                            group_evalqs = [q for q in cur_evalqs if "group" in
+                                    q["sql"].lower()]
+                            not_group_evalqs = [q for q in cur_evalqs if "group" not in
+                                    q["sql"].lower()]
+                            group_mask = None
+                            not_group_mask = None
                         gqname = "CEB-IMDb-Complex"
                         not_gqname = "CEB-IMDb-NoGroupNoLike"
                         self.eval_ds[gqname] = \
                                 self.init_dataset(group_evalqs, False,
-                                load_padded_mscn_feats=self.load_padded_mscn_feats)
+                                load_padded_mscn_feats=self.load_padded_mscn_feats,
+                                subplan_mask=group_mask)
                         self.true_costs[gqname] = 0.0
                         self.samples[gqname] = group_evalqs
 
                         self.eval_ds[not_gqname] = \
                                 self.init_dataset(not_group_evalqs, False,
-                                load_padded_mscn_feats=self.load_padded_mscn_feats)
+                                load_padded_mscn_feats=self.load_padded_mscn_feats,
+                                subplan_mask=not_group_mask)
                         self.true_costs[not_gqname] = 0.0
                         self.samples[not_gqname] = not_group_evalqs
 
@@ -1985,7 +2017,8 @@ class NN(CardinalityEstimationAlg):
 
                     self.eval_ds[evalqname] = self.init_dataset(cur_evalqs,
                             False,
-                            load_padded_mscn_feats=self.load_padded_mscn_feats)
+                            load_padded_mscn_feats=self.load_padded_mscn_feats,
+                            subplan_mask=cur_eval_mask)
                     self.true_costs[evalqname] = 0.0
                     self.samples[evalqname] = cur_evalqs
 
@@ -3254,21 +3287,35 @@ class NN(CardinalityEstimationAlg):
     def test(self, test_samples, **kwargs):
         '''
         @test_samples: [sql_rep objects]
+        @subplan_mask: optional [[list(node), ...], ...] aligned with
+        test_samples. When given, only those subplans are featurized/predicted
+        (instead of every node of every query's full graph) -- essential when
+        test_samples carry full graphs but only a subset of their subplans is
+        the actual eval set (subquery-level --train_csv/--eval_csv splits),
+        both to avoid featurizing ~all subplans (OOM) and to avoid scoring
+        subplans that were in training. Passed straight through to
+        format_model_test_output so pred->node alignment is preserved.
         @ret: [dicts]. Each element is a dictionary with cardinality estimate
         for each subset graph node (subplan). Each key should be ' ' separated
         list of aliases / table names
         '''
+        subplan_mask = kwargs.get("subplan_mask", None)
         testds = self.init_dataset(test_samples, False,
                 max_num_tables = -1,
-                load_padded_mscn_feats=self.load_padded_mscn_feats)
+                load_padded_mscn_feats=self.load_padded_mscn_feats,
+                subplan_mask=subplan_mask)
 
         start = time.time()
         preds, _ = self._eval_ds(testds, test_samples)
 
         if self.featurizer.card_type == "joinkey":
+            # joinkey featurization is edge-based and ignores subplan_mask on
+            # both sides (dataset + formatter), so it stays internally
+            # consistent; nothing to thread through here.
             return format_model_test_output_joinkey(preds, test_samples, self.featurizer)
         else:
-            return format_model_test_output(preds, test_samples, self.featurizer)
+            return format_model_test_output(preds, test_samples, self.featurizer,
+                    subplan_mask=subplan_mask)
 
     def get_exp_name(self):
         name = self.__str__()

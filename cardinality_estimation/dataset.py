@@ -293,6 +293,10 @@ class QueryDataset(data.Dataset):
             pickle.dump(data, f)
 
     def _get_sample_info(self, qrep, dataset_qidx, query_idx):
+        submask = None
+        if self.subplan_mask is not None:
+            submask = self.subplan_mask[query_idx]
+
         sample_info = []
         node_names = list(qrep["subset_graph"].nodes())
         if SOURCE_NODE in node_names:
@@ -300,6 +304,15 @@ class QueryDataset(data.Dataset):
         node_names.sort()
 
         for node_idx, node in enumerate(node_names):
+            # Mirror the skip conditions in _get_query_features_nodes so this
+            # count matches the number of features actually produced/cached
+            # for this (query, mask). Otherwise the staleness check in
+            # _get_feature_vectors compares a masked feature count against the
+            # full node count and always recomputes.
+            if self.max_num_tables != -1 and self.max_num_tables < len(node):
+                continue
+            if submask is not None and list(node) not in submask:
+                continue
             cur_info = {}
             cur_info["num_tables"] = len(node)
             cur_info["dataset_idx"] = dataset_qidx + node_idx
@@ -551,6 +564,19 @@ class QueryDataset(data.Dataset):
         for i, qrep in enumerate(samples):
             qhash = str(deterministic_hash(qrep["sql"]))
 
+            # The feature cache is keyed on SQL text, but the subplan_mask
+            # decides which of a query's subplans actually become samples --
+            # and the SAME query (SQL) can appear in train/val/test with
+            # DIFFERENT masks. Fold the kept-node set into the key so each
+            # (query, mask) gets its own cache file. This both lets cache
+            # hits happen again and makes it impossible for a masked split to
+            # load an unmasked (or differently-masked) cache and silently
+            # bypass its mask. When there's no mask, the key is unchanged, so
+            # existing non-masked caches stay valid.
+            if self.subplan_mask is not None:
+                kept = sorted(tuple(node) for node in self.subplan_mask[i])
+                qhash = qhash + "_" + str(deterministic_hash(str(kept)))
+
             if self.save_mscn_feats and \
                     "job" not in qrep["template_name"]:
                 featfn = os.path.join(self.featdir, qhash) + ".pkl"
@@ -558,6 +584,19 @@ class QueryDataset(data.Dataset):
                     try:
                         x,y = self._load_mscn_features(featfn)
                         cur_info = self._get_sample_info(qrep, qidx, i)
+                        # the cache is keyed on the query's SQL text, but the
+                        # subset_graph (and hence the number of subplans) can
+                        # change without the SQL changing -- e.g. after dedup.
+                        # if the cached feature count no longer matches the
+                        # current graph, the cache is stale: recompute and
+                        # overwrite it so `x`/`y` stay aligned with `cur_info`
+                        # (and with format_model_test_output downstream).
+                        if len(x) != len(cur_info):
+                            print("stale cached features for {} ({} cached vs "
+                                    "{} current subplans), recomputing".format(
+                                        qhash, len(x), len(cur_info)))
+                            x,y,cur_info = self._get_query_features(qrep, qidx, i)
+                            self._save_mscn_features(x,y,featfn)
                     except Exception as e:
                         print(e)
                         print("features could not be loaded in try")

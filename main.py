@@ -28,9 +28,6 @@ import yaml
 import ast
 import re
 import glob
-import hashlib
-import networkx as nx
-from networkx.readwrite import json_graph
 from collections import defaultdict, Counter
 
 import wandb
@@ -586,95 +583,18 @@ def load_train_pool_from_csv(csv_path, query_dir, val_size, test_size, seed):
     return trainqs, train_mask, valqs, val_mask, testqs, test_mask
 
 
-def _csv_split_cache_path(train_csv, eval_csv, query_dir, val_size, test_size,
-        seed, cache_dir):
-    parts = []
-    for fn in (train_csv, eval_csv):
-        st = os.stat(fn)
-        parts.append(f"{os.path.abspath(fn)}|{st.st_mtime}|{st.st_size}")
-    parts.append(f"{query_dir}|{val_size}|{test_size}|{seed}")
-    key = hashlib.md5("||".join(parts).encode()).hexdigest()
-    return os.path.join(cache_dir, f"{key}.pkl")
-
-
-def _qrep_to_cacheable(qrep):
+def load_csv_split_data(train_csv, eval_csv, query_dir, val_size, test_size, seed):
     """
-    Swaps subset_graph/join_graph for their plain-dict adjacency form (same
-    as what's actually stored in the original .pkl files, see
-    query_representation/query.py's parse_sql/load_qrep) instead of pickling
-    the live networkx Graph objects directly. Pickling live networkx graphs
-    is drastically slower to write/read than this flat form once you're
-    talking thousands of qreps -- worth doing since the whole point of this
-    cache is to be fast.
-    """
-    out = dict(qrep)
-    out["subset_graph"] = nx.adjacency_data(qrep["subset_graph"])
-    out["join_graph"] = nx.adjacency_data(qrep["join_graph"])
-    return out
-
-
-def _qrep_from_cacheable(qrep):
-    out = dict(qrep)
-    out["subset_graph"] = nx.OrderedDiGraph(json_graph.adjacency_graph(qrep["subset_graph"]))
-    out["join_graph"] = json_graph.adjacency_graph(qrep["join_graph"])
-    return out
-
-
-def load_csv_split_data(train_csv, eval_csv, query_dir, val_size, test_size,
-        seed, use_cache=True, cache_dir="./csv_split_cache"):
-    """
-    Wraps load_train_pool_from_csv + load_eval_set_from_csv with an on-disk
-    cache. Matching every CSV row back to its subset_graph node requires
-    loading every distinct referenced .pkl once (thousands of individual
-    file reads for a full CEB-imdb workload), which can take several
-    minutes -- worth avoiding when re-running the exact same split against
-    a different --alg/architecture.
-
-    The cache key is derived from train_csv/eval_csv's paths + mtime + size,
-    plus query_dir/val_size/test_size/seed, so it's automatically invalidated
-    if the CSVs are regenerated or the split parameters change; no manual
-    cache-busting needed. Set use_cache=False (--use_csv_split_cache 0) to
-    force a fresh recompute regardless.
-
+    Matches the train/eval CSVs to subplan nodes and builds the split.
     Returns (trainqs, train_mask, valqs, val_mask, testqs, test_mask,
     eval_qreps, eval_mask).
     """
-    cache_path = _csv_split_cache_path(train_csv, eval_csv, query_dir,
-            val_size, test_size, seed, cache_dir)
-
-    if use_cache and os.path.exists(cache_path):
-        print(f"Loading cached CSV-derived train/val/test/eval split from {cache_path}")
-        with open(cache_path, "rb") as f:
-            cached_qlists, masks = pickle.load(f)
-        cached_trainqs, cached_valqs, cached_testqs, cached_evalqs = cached_qlists
-        trainqs = [_qrep_from_cacheable(q) for q in cached_trainqs]
-        valqs = [_qrep_from_cacheable(q) for q in cached_valqs]
-        testqs = [_qrep_from_cacheable(q) for q in cached_testqs]
-        eval_qreps = [_qrep_from_cacheable(q) for q in cached_evalqs]
-        train_mask, val_mask, test_mask, eval_mask = masks
-        return trainqs, train_mask, valqs, val_mask, testqs, test_mask, eval_qreps, eval_mask
-
     trainqs, train_mask, valqs, val_mask, testqs, test_mask = \
             load_train_pool_from_csv(train_csv, query_dir, val_size, test_size, seed)
     eval_qreps, eval_mask = load_eval_set_from_csv(eval_csv, query_dir)
 
-    result = (trainqs, train_mask, valqs, val_mask, testqs, test_mask,
+    return (trainqs, train_mask, valqs, val_mask, testqs, test_mask,
             eval_qreps, eval_mask)
-
-    if use_cache:
-        cached_qlists = tuple(
-                [_qrep_to_cacheable(q) for q in qs]
-                for qs in (trainqs, valqs, testqs, eval_qreps))
-        masks = (train_mask, val_mask, test_mask, eval_mask)
-
-        os.makedirs(cache_dir, exist_ok=True)
-        tmp_path = cache_path + ".tmp"
-        with open(tmp_path, "wb") as f:
-            pickle.dump((cached_qlists, masks), f, protocol=pickle.HIGHEST_PROTOCOL)
-        os.replace(tmp_path, cache_path)
-        print(f"Saved CSV-derived train/val/test/eval split to {cache_path} for reuse")
-
-    return result
 
 
 def remove_duplicate_subqueries(qreps, split_name="split"):
@@ -1234,7 +1154,16 @@ def eval_alg(alg, eval_funcs, qreps, cfg,
     if not samples_label:
         samples_label = "eval"
 
-    ests = alg.test(qreps)
+    # Pass the mask into test() so featurization/prediction is restricted to
+    # the subplans actually in this split, instead of every node of every
+    # query's full graph. Without this, evaluating train/test/eval qreps
+    # (which carry full graphs in subquery-level --train_csv/--eval_csv mode)
+    # featurizes ~all subplans -> OOM. The later _filter_ests_by_mask call
+    # then becomes a no-op (ests already only contain masked nodes).
+    # Note: this returns estimates only for masked subplans, which is what
+    # per-subquery eval fns (e.g. qerr) need; plan-cost (ppc) eval, which
+    # needs every node, is not compatible with a masked eval set.
+    ests = alg.test(qreps, subplan_mask=subplan_mask)
     rdir = None
     if args.result_dir is not None:
         rdir = os.path.join(args.result_dir, exp_name)
@@ -1418,8 +1347,7 @@ def main():
                 load_csv_split_data(
                         args.train_csv, args.eval_csv, cfg["data"]["query_dir"],
                         cfg["data"]["val_size"], cfg["data"]["test_size"],
-                        cfg["data"]["diff_templates_seed"],
-                        use_cache=bool(args.use_csv_split_cache))
+                        cfg["data"]["diff_templates_seed"])
         eval_qfns = None
     else:
         train_subplan_mask = None
@@ -1688,13 +1616,18 @@ def main():
                 test_subplan_mask=test_subplan_mask,
             )
         else:
+            # eval_masks aligns with evalqs; only pass it through when
+            # mscn_evalqs is still that same list (the discriminator-holdout
+            # path can resample it, which would misalign the masks).
+            train_eval_masks = eval_masks if mscn_evalqs is evalqs else None
             alg.train(trainqs, valqs=valqs, testqs=testqs, evalqs = mscn_evalqs,
                     eval_qdirs = mscn_eval_qdirs, featurizer=featurizer,
                     result_dir=args.result_dir,
                     adv_weights=disc_weights, adv_weight_level="dataset",
                     subplan_mask=train_subplan_mask,
                     val_subplan_mask=val_subplan_mask,
-                    test_subplan_mask=test_subplan_mask)
+                    test_subplan_mask=test_subplan_mask,
+                    eval_subplan_masks=train_eval_masks)
     else:
         if use_generator_adversarial_train:
             if not hasattr(alg, "train_with_latent_generator"):
@@ -1904,13 +1837,6 @@ def read_flags():
             help="Subquery-level CSV (same schema as --train_csv) used "
                  "entirely as the held-out eval/target set, with no further "
                  "split. Must be set together with --train_csv.")
-    parser.add_argument("--use_csv_split_cache", type=int, required=False,
-            default=1,
-            help="When using --train_csv/--eval_csv, cache the matched "
-                 "train/val/test/eval split to ./csv_split_cache/ and reuse "
-                 "it on later runs with the same CSVs/split params (e.g. "
-                 "trying a different --alg). Set to 0 to force a fresh "
-                 "recompute.")
     return parser.parse_args()
 
 if __name__ == "__main__":
