@@ -21,6 +21,8 @@ from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
 
 from cardinality_estimation.dataset import QueryDataset
+from cardinality_estimation.seeding import DEFAULT_TRAIN_SEED, derive_seed, \
+        make_generator, seed_everything
 
 # Setup logging
 logging.basicConfig(
@@ -244,6 +246,7 @@ def learn_weights(
     lr: float = 1e-3,
     n_disc_steps: int = 5,
     max_num_tables: int = -1,
+    train_seed: int = DEFAULT_TRAIN_SEED,
 ) -> Dict[str, object]:
     """
     Learn importance weights for MSCN source subplans using evaluation subplans.
@@ -258,7 +261,10 @@ def learn_weights(
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    logger.info(f"Using device: {device}")
+    adv_seed = derive_seed(train_seed, "adversarial_weights")
+    seed_everything(adv_seed)
+    logger.info(f"Using device: {device} (train_seed={train_seed}, "
+                f"adversarial weight seed={adv_seed})")
 
     logger.info("Featurizing source MSCN inputs...")
     source_feats, source_info, source_stats = extract_mscn_features(
@@ -309,8 +315,10 @@ def learn_weights(
 
     logger.info(f"Setup optimizers with lr={lr}")
 
-    source_loader = DataLoader(TensorDataset(source_feats), batch_size=batch_size, shuffle=True)
-    target_loader = DataLoader(TensorDataset(target_feats), batch_size=batch_size, shuffle=True)
+    source_loader = DataLoader(TensorDataset(source_feats), batch_size=batch_size, shuffle=True,
+            generator=make_generator(adv_seed, "adv_source_loader"))
+    target_loader = DataLoader(TensorDataset(target_feats), batch_size=batch_size, shuffle=True,
+            generator=make_generator(adv_seed, "adv_target_loader"))
 
     logger.info(f"Setup data loaders with batch_size={batch_size}")
 

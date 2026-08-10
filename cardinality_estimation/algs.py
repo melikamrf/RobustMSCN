@@ -23,6 +23,8 @@ from evaluation.flow_loss import FlowLoss, \
         get_optimization_variables, get_subsetg_vectors
 from .discriminator import LatentDiscriminator, LatentGenerator
 from .DANN import train_one_epoch_dann as _train_one_epoch_dann
+from .seeding import DEFAULT_TRAIN_SEED, derive_seed, make_generator, \
+        make_worker_init_fn, seed_everything
 
 from torch.utils import data
 from torch.nn.utils.clip_grad import clip_grad_norm_
@@ -239,6 +241,13 @@ class NN(CardinalityEstimationAlg):
         for k, val in model_params.items():
             self.__setattr__(k, val)
 
+        # Seed for training-time randomness (weight init, shuffling, dropout).
+        # None when an alg is constructed outside main() -- notebooks, tests --
+        # so fall back to the default rather than crashing.
+        if getattr(self, "train_seed", None) is None:
+            self.train_seed = DEFAULT_TRAIN_SEED
+        self.train_seed = int(self.train_seed)
+
         # when estimates are log-normalized, then optimizing for mse is
         # basically equivalent to optimizing for q-error
         self.num_workers = 8
@@ -287,6 +296,13 @@ class NN(CardinalityEstimationAlg):
             self.eval_fn_handles.append(get_eval_fn(efn))
 
     def init_net(self, sample):
+        # Re-seed here rather than relying on the seeding done in main(): all
+        # the featurization/split work in between consumes a variable amount
+        # of RNG, so without this the initial weights would depend on e.g. how
+        # many queries got loaded. Seeding at the point of construction makes
+        # init a pure function of --train_seed, which is what lets two
+        # architectures be compared at "the same" seed.
+        seed_everything(derive_seed(self.train_seed, "net_init"))
         net = self._init_net(sample)
         print(net)
 
@@ -1896,6 +1912,11 @@ class NN(CardinalityEstimationAlg):
         self.trainloader = data.DataLoader(self.trainds,
                 batch_size=self.mb_size, shuffle=True,
                 collate_fn=self.collate_fn,
+                # Without an explicit generator the shuffle order comes from
+                # the global torch RNG, i.e. from whatever ran before this
+                # point. Tie it to --train_seed instead.
+                generator=make_generator(self.train_seed, "trainloader"),
+                worker_init_fn=make_worker_init_fn(self.train_seed),
                 # num_workers=self.num_workers
                 )
 
@@ -2280,6 +2301,8 @@ class NN(CardinalityEstimationAlg):
             batch_size=self.mb_size,
             shuffle=True,
             collate_fn=self.collate_fn,
+            generator=make_generator(self.train_seed, "trainloader"),
+            worker_init_fn=make_worker_init_fn(self.train_seed),
         )
 
         self.eval_ds = {}
@@ -2400,6 +2423,8 @@ class NN(CardinalityEstimationAlg):
             batch_size=self.mb_size,
             shuffle=True,
             collate_fn=self.collate_fn,
+            generator=make_generator(self.train_seed, "target_loader"),
+            worker_init_fn=make_worker_init_fn(self.train_seed, "target_loader"),
         )
         self._setup_latent_visualization_loaders(target_samples=target_samples)
 
@@ -2646,6 +2671,8 @@ class NN(CardinalityEstimationAlg):
             batch_size=self.mb_size,
             shuffle=True,
             collate_fn=self.collate_fn,
+            generator=make_generator(self.train_seed, "trainloader"),
+            worker_init_fn=make_worker_init_fn(self.train_seed),
         )
 
         self.eval_ds = {}
@@ -3320,9 +3347,14 @@ class NN(CardinalityEstimationAlg):
     def get_exp_name(self):
         name = self.__str__()
         if not hasattr(self, "rand_id"):
+            # Use a private RNG: this used to call random.seed(wall_clock),
+            # which reseeded the *global* python RNG mid-run and silently
+            # de-randomized/re-randomized everything downstream of the first
+            # call to get_exp_name(). The id itself stays run-unique (it is
+            # only a directory/name suffix, and two runs at the same
+            # --train_seed are meant to be distinguishable on disk).
             t = 1000 * time.time() # current time in milliseconds
-            random.seed(int(t) % 2**32)
-            self.rand_id = str(random.getrandbits(32))
+            self.rand_id = str(random.Random(int(t) % 2**32).getrandbits(32))
             print("Experiment name will be: ", name + self.rand_id)
 
         name += self.rand_id

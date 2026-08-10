@@ -3,7 +3,9 @@ from cardinality_estimation.mscn import MSCN, MSCN_JoinKeyCards
 from cardinality_estimation.mstn import MSTN
 from cardinality_estimation.algs import *
 
-def get_alg(alg, cfg):
+def get_alg(alg, cfg, train_seed=None):
+    # train_seed is only meaningful for the learned models; the analytic /
+    # true-cardinality baselines below have no training randomness.
     if alg == "saved":
         return SavedPreds(model_dir=cfg["model_dir"])
 
@@ -38,22 +40,26 @@ def get_alg(alg, cfg):
         return FCNN(
                 cfg["model"],
                 use_wandb = cfg["eval"]["use_wandb"],
+                train_seed = train_seed,
                 )
     elif alg == "mscn":
         return MSCN(
                 cfg["model"],
                 use_wandb = cfg["eval"]["use_wandb"],
+                train_seed = train_seed,
                 )
 
     elif alg == "mstn":
         return MSTN(
                 cfg["model"],
-                use_wandb = cfg["eval"]["use_wandb"])
+                use_wandb = cfg["eval"]["use_wandb"],
+                train_seed = train_seed)
 
     elif alg == "mscn_joinkey":
         return MSCN_JoinKeyCards(
                 cfg["model"],
-                use_wandb = cfg["eval"]["use_wandb"])
+                use_wandb = cfg["eval"]["use_wandb"],
+                train_seed = train_seed)
 
     else:
         assert False

@@ -26,6 +26,8 @@ import matplotlib.pyplot as plt
 from sklearn.metrics import roc_auc_score
 
 from cardinality_estimation.dataset import QueryDataset
+from cardinality_estimation.seeding import DEFAULT_TRAIN_SEED, derive_seed, \
+        make_generator, make_numpy_generator, seed_everything
 from Adversarial_weight import extract_mscn_features
 
 # Setup logging
@@ -152,9 +154,14 @@ def _log_label_balance(split_name: str, labels: torch.Tensor) -> None:
 class StratifiedBatchSampler(Sampler[List[int]]):
     """Yield batches with fixed source/target counts for binary labels."""
 
-    def __init__(self, labels: torch.Tensor, batch_size: int, drop_last: bool = False):
+    def __init__(self, labels: torch.Tensor, batch_size: int, drop_last: bool = False,
+                 seed: int = DEFAULT_TRAIN_SEED):
         if batch_size < 2:
             raise ValueError("batch_size must be >= 2 for stratified batching")
+
+        # Private RNG: __iter__ used to draw from the global np.random state,
+        # so batch composition depended on whatever else had touched numpy.
+        self._rng = make_numpy_generator(seed, "stratified_batch_sampler")
 
         flat = labels.reshape(-1).to(torch.int64).cpu().numpy()
         self.source_indices = np.where(flat == 0)[0]
@@ -181,18 +188,18 @@ class StratifiedBatchSampler(Sampler[List[int]]):
 
     def __iter__(self) -> Iterator[List[int]]:
         for _ in range(self.num_batches):
-            src = np.random.choice(
+            src = self._rng.choice(
                 self.source_indices,
                 size=self.source_per_batch,
                 replace=len(self.source_indices) < self.source_per_batch,
             )
-            tgt = np.random.choice(
+            tgt = self._rng.choice(
                 self.target_indices,
                 size=self.target_per_batch,
                 replace=len(self.target_indices) < self.target_per_batch,
             )
             batch = np.concatenate([src, tgt])
-            np.random.shuffle(batch)
+            self._rng.shuffle(batch)
             yield batch.tolist()
 
 #TODO - check if this is correct
@@ -273,6 +280,7 @@ def train_discriminator(
     min_delta: float = 1e-4,
     min_epochs: int = 10,
     stratify_train_batches: bool = True,
+    train_seed: int = DEFAULT_TRAIN_SEED,
 ) -> Dict[str, object]:
     """
     Train a domain discriminator to distinguish source from target features.
@@ -298,6 +306,10 @@ def train_discriminator(
         min_epochs: Minimum epochs before early stopping can trigger
         stratify_train_batches: Ensure each training batch contains both
             source and target samples
+        train_seed: Seeds this module's weight init and batch sampling. Given
+            a sub-seed derived from the run's --train_seed so the
+            discriminator is reproducible without sharing an RNG stream with
+            the MSCN trainer.
 
     Returns:
         dict with:
@@ -315,7 +327,10 @@ def train_discriminator(
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    logger.info(f"Using device: {device}")
+    disc_seed = derive_seed(train_seed, "discriminator")
+    seed_everything(disc_seed)
+    logger.info(f"Using device: {device} (train_seed={train_seed}, "
+                f"discriminator seed={disc_seed})")
 
     # Extract features
     logger.info("Extracting source features...")
@@ -415,6 +430,7 @@ def train_discriminator(
                 train_labels,
                 batch_size=batch_size,
                 drop_last=False,
+                seed=disc_seed,
             )
             train_loader = DataLoader(train_dataset, batch_sampler=stratified_sampler)
 
@@ -431,9 +447,11 @@ def train_discriminator(
                 f"Could not create stratified train batches ({exc}). "
                 "Falling back to shuffled DataLoader."
             )
-            train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+            train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
+                    generator=make_generator(disc_seed, "disc_train_loader"))
     else:
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
+                generator=make_generator(disc_seed, "disc_train_loader"))
 
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 

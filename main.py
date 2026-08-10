@@ -12,6 +12,7 @@ sys.stderr.reconfigure(line_buffering=True)
 from cardinality_estimation.featurizer import *
 from cardinality_estimation.dataset import QueryDataset, load_qdata
 from cardinality_estimation import get_alg
+from cardinality_estimation.seeding import DEFAULT_TRAIN_SEED, seed_everything
 from evaluation.eval_fns import get_eval_fn
 # Distribution table utilities
 #from compute_dist_table import compute_distributions_for_files, compute_distributions_for_qreps
@@ -739,7 +740,8 @@ def split_queries_for_discriminator(target_queries, holdout_fraction=0.5, random
     return disc_targetqs, heldout_evalqs
 
 
-def prepare_discriminator_weights(trainqs, evalqs, eval_qdirs, featurizer):
+def prepare_discriminator_weights(trainqs, evalqs, eval_qdirs, featurizer,
+        train_seed=DEFAULT_TRAIN_SEED):
     """
     Optionally train discriminator and return:
       1. adversarial source weights for training
@@ -789,6 +791,7 @@ def prepare_discriminator_weights(trainqs, evalqs, eval_qdirs, featurizer):
         batch_size=args.disc_batch_size,
         epochs=args.disc_epochs,
         lr=args.disc_lr,
+        train_seed=train_seed,
     )
     disc_time = time.time() - start_disc_time
     main_logger.info(f"Domain discriminator training completed in {disc_time:.2f} seconds")
@@ -1311,6 +1314,22 @@ def get_featurizer(trainqs, valqs, testqs, eval_qs):
 
     return featurizer
 
+def resolve_train_seed(args, cfg):
+    """
+    --train_seed wins; otherwise model.train_seed from the config if the
+    config pins one; otherwise the default. Lets a config fix a seed for
+    "the canonical run of this experiment" while a sweep still overrides it
+    per run from the CLI.
+    """
+    if args.train_seed is not None:
+        return int(args.train_seed)
+
+    cfg_seed = cfg.get("model", {}).get("train_seed", None)
+    if cfg_seed is not None:
+        return int(cfg_seed)
+
+    return DEFAULT_TRAIN_SEED
+
 def main():
     global args,cfg
 
@@ -1318,6 +1337,20 @@ def main():
         cfg = yaml.safe_load(f.read())
 
     print(yaml.dump(cfg, default_flow_style=False))
+
+    # --train_seed governs everything downstream of the splits: weight init,
+    # DataLoader shuffling, dropout. Data seeds (data.seed,
+    # data.diff_templates_seed, --train_size_seed, --random_seed) are separate
+    # on purpose -- fix those and vary --train_seed to measure training noise
+    # for one architecture; see cardinality_estimation/seeding.py.
+    train_seed = resolve_train_seed(args, cfg)
+    seed_everything(train_seed, strict=bool(args.strict_determinism))
+    main_logger.info(
+        f"Seeded run: train_seed={train_seed}, "
+        f"strict_determinism={bool(args.strict_determinism)}, "
+        f"random_seed={args.random_seed}, "
+        f"data.seed={cfg['data']['seed']}, "
+        f"data.diff_templates_seed={cfg['data']['diff_templates_seed']}")
 
     # set up wandb logging metrics
     if cfg["eval"]["use_wandb"]:
@@ -1330,6 +1363,9 @@ def main():
                 wandbcfg.update({k:v})
 
         wandbcfg.update(vars(args))
+        # vars(args)["train_seed"] is None when the seed came from the config,
+        # so log the resolved value -- runs are grouped/compared by it.
+        wandbcfg.update({"train_seed": train_seed})
         # additional config tags
         wandb_tags = ["1a"]
         if args.wandb_tags is not None:
@@ -1444,6 +1480,11 @@ def main():
             "train_size": args.train_size,
             "train_size_level": train_size_level,
             "train_size_seed": train_size_seed,
+            "train_seed": train_seed,
+            "random_seed": args.random_seed,
+            "data_seed": cfg["data"]["seed"],
+            "diff_templates_seed": cfg["data"]["diff_templates_seed"],
+            "strict_determinism": bool(args.strict_determinism),
             "val_size": cfg["data"]["val_size"],
             "test_size": cfg["data"]["test_size"],
             "alg": args.alg,
@@ -1490,7 +1531,7 @@ def main():
     else:
         featurizer = None
 
-    alg = get_alg(args.alg, cfg)
+    alg = get_alg(args.alg, cfg, train_seed=train_seed)
 
     eval_fns = []
     for efn in args.eval_fns.split(","):
@@ -1547,6 +1588,7 @@ def main():
             evalqs=evalqs,
             eval_qdirs=eval_qdirs,
             featurizer=featurizer,
+            train_seed=train_seed,
         )
 
     if args.load_model is not None:
@@ -1781,10 +1823,32 @@ def read_flags():
     parser.add_argument("--disc_lr", type=float, required=False,
             default=1e-3)
     parser.add_argument("--random_seed", type=int, required=False,
-            default=42)
+            default=42,
+            help="DATA seed: discriminator target holdout split, and the "
+                 "default for --train_size_seed/--undersample_seed. Decides "
+                 "which queries land in which split, so hold it FIXED when "
+                 "comparing architectures. See --train_seed for the knob to "
+                 "vary across repeats.")
     parser.add_argument("--undersample_seed", type=int, required=False,
             default=42,
             help="Optional seed for undersampling (defaults to --random_seed)")
+    parser.add_argument("--train_seed", type=int, required=False,
+            default=None,
+            help="TRAINING seed: weight init, DataLoader shuffle order, "
+                 "dropout -- everything downstream of the data splits. This "
+                 "is the seed to vary (e.g. 1,2,3,4,5) to get repeats of the "
+                 "same architecture on identical data, so architectures can "
+                 "be compared as mean +/- std instead of single runs. "
+                 "Defaults to model.train_seed from the config, else "
+                 f"{DEFAULT_TRAIN_SEED}.")
+    parser.add_argument("--strict_determinism", type=int, required=False,
+            default=0,
+            help="Set to 1 to force deterministic CUDA kernels "
+                 "(cudnn.deterministic, use_deterministic_algorithms). Costs "
+                 "throughput and warns on ops with no deterministic "
+                 "implementation; --train_seed alone already gives "
+                 "run-to-run reproducibility on the same hardware and "
+                 "library versions.")
 
     parser.add_argument("--remove_duplicate_subqueries", type=int, required=False,
             default=0,
