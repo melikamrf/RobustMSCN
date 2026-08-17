@@ -1487,6 +1487,11 @@ def main():
             "strict_determinism": bool(args.strict_determinism),
             "val_size": cfg["data"]["val_size"],
             "test_size": cfg["data"]["test_size"],
+            # these run before the subsample, so they change what the
+            # training pool a given --train_size is a fraction OF
+            "remove_duplicate_subqueries": args.remove_duplicate_subqueries,
+            "detect_leakage": args.detect_leakage,
+            "remove_leakage": args.remove_leakage,
             "alg": args.alg,
             "config": args.config,
         },

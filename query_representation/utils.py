@@ -177,8 +177,13 @@ def get_query_splits(data_params):
     from types import SimpleNamespace
     data_params = SimpleNamespace(**data_params)
 
-    fns = list(glob.glob(data_params.query_dir + "/*"))
-    fns = [fn for fn in fns if os.path.isdir(fn)]
+    # sort: glob returns filesystem order, which is stable on one machine but
+    # not across machines/filesystems. The per-template splits below are
+    # already seeded, but this order decides how the per-template file lists
+    # get concatenated, i.e. the index each query gets in trainqs -- and hence
+    # which queries share a batch once the loader shuffles.
+    fns = sorted(fn for fn in glob.glob(data_params.query_dir + "/*")
+                 if os.path.isdir(fn))
     skipped_templates = []
     train_qfns = []
     test_qfns = []
@@ -330,8 +335,7 @@ def get_query_splits(data_params):
             qkeys = None
 
         cur_eval_qfns = []
-        fns = list(glob.glob(qdir + "/*"))
-        fns = [fn for fn in fns if os.path.isdir(fn)]
+        fns = sorted(fn for fn in glob.glob(qdir + "/*") if os.path.isdir(fn))
 
         for qi,qdir in enumerate(fns):
             if ".json" in qdir:
@@ -361,7 +365,15 @@ def get_query_splits(data_params):
 
             cur_eval_qfns += qfns
 
-        random.shuffle(cur_eval_qfns)
+        # Seed from the DATA seed, not the global RNG. This shuffle decides
+        # the order of the eval workload, and split_queries_for_discriminator()
+        # slices that list positionally (train_test_split at a fixed
+        # random_state), so the order determines WHICH eval queries are held
+        # out for MSCN evaluation vs. handed to the discriminator. Drawing it
+        # from the global stream meant --train_seed would silently change the
+        # eval set -- exactly the data/training confound the two seed classes
+        # exist to prevent.
+        random.Random(data_params.seed).shuffle(cur_eval_qfns)
         eval_qfns.append(cur_eval_qfns)
 
     if data_params.train_test_split_kind == "query":
@@ -379,9 +391,16 @@ def get_query_splits(data_params):
     # Cost functions for some of these templates take a lot longer; so when we
     # compute them in parallel, we want the queries to be shuffled so the
     # workload is divided evely
-    random.shuffle(train_qfns)
-    random.shuffle(test_qfns)
-    random.shuffle(val_qfns)
+    #
+    # Seeded from the DATA seed for the same reason as the eval shuffle above:
+    # --train_size subsamples these lists positionally, so if the order came
+    # from the global RNG then varying --train_seed would change WHICH queries
+    # you train on, not just how they are shuffled into batches. Each list gets
+    # its own Random() so that adding or removing one split cannot shift the
+    # others.
+    random.Random(data_params.seed).shuffle(train_qfns)
+    random.Random(data_params.seed).shuffle(test_qfns)
+    random.Random(data_params.seed).shuffle(val_qfns)
 
     return train_qfns, test_qfns, val_qfns, eval_qfns
 

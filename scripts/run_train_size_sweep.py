@@ -11,9 +11,22 @@ Only the TRAINING split varies -- val/test/eval are identical across every
 run of a mode, so the q-errors are comparable size-to-size (see
 main.subsample_train_split).
 
+Each size is run once per --train_size_seeds value (default 3 seeds), so
+every point on the size curve gets an error bar: the spread tells you how
+much of a size-to-size difference is a real size effect and how much is
+just which subsample you happened to draw. --train_seed is held FIXED
+across all of them, so the spread is attributable to the subsample rather
+than to the initialization.
+
+train_size=1.0 is run only once, at the first seed: it keeps the whole
+training pool, so the subsample seed is never used and repeats would be
+byte-identical runs.
+
 Each run is a fresh `python main.py` process writing into its own
---result_dir, so nothing leaks between sizes. Afterwards this script reads
-each run's QError.csv + train_split_sizes.json and writes one summary CSV.
+--result_dir (<result_root>/<mode>/<size>/seed<n>), so nothing leaks
+between runs. Afterwards this script reads each run's QError.csv +
+train_split_sizes.json and writes two CSVs: one row per run, and one
+aggregated across seeds per (mode, size, samples_type).
 
 Examples
 --------
@@ -31,12 +44,20 @@ Only the original split, custom sizes, subquery-level counting:
       --orig_config configs/config-joblight-robust.yaml \
       --sizes 0.1,0.5,1.0 --train_size_level subquery
 
+With duplicate subqueries and cross-split leakage removed first (both are
+applied before the subsample, so they shrink the pool a fractional
+--train_size is measured against):
+
+  python scripts/run_train_size_sweep.py \
+      --remove_duplicate_subqueries 1 --remove_leakage 1
+
 Re-summarize finished runs without retraining:
 
   python scripts/run_train_size_sweep.py --summarize_only ...
 
 Anything after a bare `--` is forwarded verbatim to every main.py call,
-e.g. `-- --remove_duplicate_subqueries 1 --learn_residual 0`.
+e.g. `-- --learn_residual 1`. Flags the sweep sets itself (see
+MANAGED_FLAGS) are rejected there -- use the matching sweep option.
 """
 
 import argparse
@@ -50,7 +71,28 @@ import pandas as pd
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-DEFAULT_SIZES = "0.1,0.25,0.5,0.75,1.0"
+DEFAULT_SIZES = "0.01,0.1,0.5,1.0"
+DEFAULT_SEEDS = "1,2,3"
+
+# main.py flags this script sets itself. Passing one after `--` would
+# silently fight with the sweep's own value (argparse keeps the last
+# occurrence), so they're rejected there in favour of the sweep option.
+MANAGED_FLAGS = {
+    "--config", "--alg", "--eval_fns", "--result_dir",
+    "--train_size", "--train_size_level", "--train_size_seed",
+    "--random_seed", "--train_seed",
+    "--train_csv", "--eval_csv", "--use_csv_split_cache",
+    "--remove_duplicate_subqueries", "--detect_leakage", "--remove_leakage",
+}
+
+
+def check_passthrough(passthrough):
+    clashes = sorted({tok for tok in passthrough if tok in MANAGED_FLAGS})
+    if clashes:
+        raise ValueError(
+            "these main.py flags are set by the sweep itself; use the "
+            "matching sweep option instead of passing them after `--`: "
+            + ", ".join(clashes))
 
 
 def parse_sizes(sizes_str):
@@ -68,6 +110,35 @@ def parse_sizes(sizes_str):
     return sizes
 
 
+def parse_seeds(seeds_str):
+    seeds = []
+    for tok in seeds_str.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        seeds.append(int(tok))
+    if not seeds:
+        raise ValueError("--train_size_seeds did not contain any values")
+    if len(set(seeds)) != len(seeds):
+        raise ValueError(f"--train_size_seeds has duplicates: {seeds}")
+    return seeds
+
+
+def seeds_for_size(size, seeds):
+    """
+    Which subsample seeds to run at this training size.
+
+    At train_size == 1.0 the whole pool is kept -- main._resolve_train_size
+    returns None and never touches the RNG -- so repeats would be identical
+    runs. One seed is enough there.
+
+    (An absolute --sizes entry that happens to exceed the pool is the same
+    no-op, but the pool size is not known until main.py has loaded the
+    queries, so those still get the full set of repeats.)
+    """
+    return seeds[:1] if size == 1.0 else seeds
+
+
 def size_tag(size):
     """Filesystem-safe, sortable directory name for a training size."""
     if size <= 1.0:
@@ -75,7 +146,26 @@ def size_tag(size):
     return "n_%d" % int(round(size))
 
 
-def build_cmd(args, mode, size, run_dir, passthrough):
+def cleaning_tag(args):
+    """
+    Run-dir suffix for the dedup/leakage cleaning in effect, so two sweeps
+    that differ only in cleaning can share a --result_root instead of one
+    silently overwriting the other. Empty when no cleaning is on, which
+    keeps the plain <mode>/<size> layout for the default sweep.
+
+    --detect_leakage is deliberately not part of this: it only logs the
+    overlap, it doesn't change the data, so runs with and without it are
+    interchangeable.
+    """
+    parts = []
+    if args.remove_duplicate_subqueries:
+        parts.append("dedup")
+    if args.remove_leakage:
+        parts.append("noleak")
+    return ("_" + "_".join(parts)) if parts else ""
+
+
+def build_cmd(args, mode, size, train_size_seed, run_dir, passthrough):
     config = args.orig_config if mode == "original" else args.csv_config
     cmd = [
         sys.executable, "main.py",
@@ -85,8 +175,20 @@ def build_cmd(args, mode, size, run_dir, passthrough):
         "--result_dir", run_dir,
         "--train_size", str(size),
         "--train_size_level", args.train_size_level,
-        "--train_size_seed", str(args.train_size_seed),
+        # The one knob that varies across repeats: which subsample of the
+        # training pool this run draws.
+        "--train_size_seed", str(train_size_seed),
         "--random_seed", str(args.random_seed),
+        # Pass explicitly rather than letting each run fall back to
+        # model.train_seed: the two modes use DIFFERENT config files, so an
+        # implicit default would let 'original' and 'csv' train from different
+        # initializations and quietly confound the mode comparison.
+        "--train_seed", str(args.train_seed),
+        # Applied before the subsample, so these decide what pool a given
+        # --train_size is a fraction OF. Held constant across the sweep.
+        "--remove_duplicate_subqueries", str(args.remove_duplicate_subqueries),
+        "--detect_leakage", str(args.detect_leakage),
+        "--remove_leakage", str(args.remove_leakage),
     ]
     if mode == "csv":
         cmd += ["--train_csv", args.train_csv, "--eval_csv", args.eval_csv,
@@ -113,7 +215,7 @@ def run_one(cmd, run_dir):
     return proc.returncode
 
 
-def summarize_run(run_dir, mode, size):
+def summarize_run(run_dir, mode, size, train_size_seed):
     """
     Turns one finished run into summary rows -- one per samples_type
     (train/test/<eval dir name>) found in that run's QError.csv.
@@ -139,7 +241,23 @@ def summarize_run(run_dir, mode, size):
         rows.append({
             "mode": mode,
             "train_size": size,
+            # The repeat index for this (mode, size): the seed the subsample
+            # was drawn with. Taken from this script rather than the run's
+            # JSON so the aggregation below still groups correctly if an old
+            # run predates save_split_sizes() recording it.
+            "train_size_seed": train_size_seed,
             "train_size_level": split_sizes.get("train_size_level"),
+            # Recorded by main.save_split_sizes(); carried into the summary so
+            # a row can always be traced back to the seeds that produced it.
+            "train_seed": split_sizes.get("train_seed"),
+            "random_seed": split_sizes.get("random_seed"),
+            "data_seed": split_sizes.get("data_seed"),
+            # Read back from the run rather than echoed from this script's
+            # flags, so --summarize_only over a directory of older runs
+            # reports the cleaning each of them actually used.
+            "remove_duplicate_subqueries": split_sizes.get("remove_duplicate_subqueries"),
+            "detect_leakage": split_sizes.get("detect_leakage"),
+            "remove_leakage": split_sizes.get("remove_leakage"),
             "num_train_queries": split_sizes.get("num_train_queries"),
             "num_train_subqueries": split_sizes.get("num_train_subqueries"),
             "num_val_subqueries": split_sizes.get("num_val_subqueries"),
@@ -157,21 +275,84 @@ def summarize_run(run_dir, mode, size):
     return rows
 
 
+def aggregate_over_seeds(df):
+    """
+    Collapses the per-run rows into one row per (mode, cleaning, size,
+    samples_type), with mean/std across the --train_size_seeds repeats.
+
+    std is the population-vs-sample question that matters here: with 3 seeds
+    ddof=1 (pandas' default) is the right estimator of the underlying spread,
+    and it is NaN at train_size=1.0 where there is only one run. That NaN is
+    meaningful -- it says "no repeats here" -- so it is left in rather than
+    filled with 0, which would read as "no variance".
+    """
+    if df.empty:
+        return df
+
+    keys = ["mode", "remove_duplicate_subqueries", "remove_leakage",
+            "train_size", "samples_type"]
+    agg = df.groupby(keys, dropna=False).agg(
+        n_seeds=("train_size_seed", "nunique"),
+        num_train_subqueries=("num_train_subqueries", "mean"),
+        qerror_mean_avg=("qerror_mean", "mean"),
+        qerror_mean_std=("qerror_mean", "std"),
+        qerror_mean_min=("qerror_mean", "min"),
+        qerror_mean_max=("qerror_mean", "max"),
+        qerror_median_avg=("qerror_median", "mean"),
+        qerror_median_std=("qerror_median", "std"),
+        qerror_90p_avg=("qerror_90p", "mean"),
+        qerror_90p_std=("qerror_90p", "std"),
+        qerror_99p_avg=("qerror_99p", "mean"),
+        qerror_99p_std=("qerror_99p", "std"),
+    ).reset_index()
+    return agg.sort_values(["mode", "samples_type", "train_size"])
+
+
 def print_summary(df):
     if df.empty:
         print("No results to summarize.")
         return
-    cols = ["mode", "train_size", "num_train_subqueries", "samples_type",
+    cols = ["mode", "train_size", "train_size_seed",
+            "remove_duplicate_subqueries", "remove_leakage",
+            "num_train_subqueries", "samples_type",
             "num_samples", "qerror_mean", "qerror_median", "qerror_90p",
             "qerror_99p"]
     view = df[cols].copy()
     for c in ["qerror_mean", "qerror_median", "qerror_90p", "qerror_99p"]:
         view[c] = view[c].round(3)
+    # short headers; the full names live in the CSV
+    view = view.rename(columns={"remove_duplicate_subqueries": "dedup",
+                                "remove_leakage": "noleak",
+                                "train_size_seed": "seed"})
     print()
     print("=" * 100)
-    print("Training-size sweep summary")
+    print("Training-size sweep -- individual runs")
     print("=" * 100)
     print(view.to_string(index=False))
+
+
+def print_aggregate(df):
+    if df.empty:
+        return
+    cols = ["mode", "train_size", "n_seeds", "remove_duplicate_subqueries",
+            "remove_leakage", "num_train_subqueries", "samples_type",
+            "qerror_mean_avg", "qerror_mean_std",
+            "qerror_median_avg", "qerror_median_std",
+            "qerror_90p_avg", "qerror_90p_std"]
+    view = df[cols].copy()
+    for c in cols:
+        if c.startswith("qerror") or c == "num_train_subqueries":
+            view[c] = view[c].astype(float).round(3)
+    view = view.rename(columns={"remove_duplicate_subqueries": "dedup",
+                                "remove_leakage": "noleak"})
+    print()
+    print("=" * 100)
+    print("Training-size sweep -- mean +/- std over train_size_seeds")
+    print("=" * 100)
+    print(view.to_string(index=False))
+    print()
+    print("std is NaN where only one seed was run (train_size=1.0 keeps the "
+          "whole pool, so repeats would be identical).")
 
 
 def main():
@@ -179,6 +360,7 @@ def main():
     # argparse may or may not swallow the separator depending on where it
     # lands; drop any stray ones so they don't reach main.py.
     passthrough = [tok for tok in passthrough if tok != "--"]
+    check_passthrough(passthrough)
 
     modes = [m.strip() for m in args.modes.split(",") if m.strip()]
     for mode in modes:
@@ -191,53 +373,77 @@ def main():
             raise ValueError(f"config for mode {mode!r} not found: {config}")
 
     sizes = parse_sizes(args.sizes)
+    seeds = parse_seeds(args.train_size_seeds)
     os.makedirs(args.result_root, exist_ok=True)
 
     all_rows = []
     failures = []
     for mode in modes:
         for size in sizes:
-            run_dir = os.path.join(args.result_root, mode, size_tag(size))
-            cmd = build_cmd(args, mode, size, run_dir, passthrough)
+            cur_seeds = seeds_for_size(size, seeds)
+            if len(cur_seeds) < len(seeds):
+                print(f"\n[{mode}] train_size={size} keeps the whole training "
+                      f"pool, so --train_size_seed is never used: running once "
+                      f"at seed {cur_seeds[0]} instead of {len(seeds)} "
+                      f"identical repeats")
 
-            print()
-            print("-" * 100)
-            print(f"[{mode}] train_size={size} -> {run_dir}")
-            print(" ".join(cmd))
-            print("-" * 100)
+            for seed in cur_seeds:
+                run_dir = os.path.join(args.result_root, mode,
+                        size_tag(size) + cleaning_tag(args), f"seed{seed}")
+                cmd = build_cmd(args, mode, size, seed, run_dir, passthrough)
 
-            if args.dry_run:
-                continue
+                print()
+                print("-" * 100)
+                print(f"[{mode}] train_size={size} train_size_seed={seed}"
+                      f" -> {run_dir}")
+                print(" ".join(cmd))
+                print("-" * 100)
 
-            already_done = os.path.exists(os.path.join(run_dir, "QError.csv"))
-            if args.summarize_only:
-                pass
-            elif args.skip_existing and already_done:
-                print("  QError.csv already present, skipping (--skip_existing)")
-            else:
-                rc = run_one(cmd, run_dir)
-                if rc != 0:
-                    print(f"  RUN FAILED (exit {rc}); see {os.path.join(run_dir, 'run.log')}")
-                    failures.append((mode, size, rc))
+                if args.dry_run:
                     continue
 
-            all_rows += summarize_run(run_dir, mode, size)
+                already_done = os.path.exists(os.path.join(run_dir, "QError.csv"))
+                if args.summarize_only:
+                    pass
+                elif args.skip_existing and already_done:
+                    print("  QError.csv already present, skipping (--skip_existing)")
+                else:
+                    rc = run_one(cmd, run_dir)
+                    if rc != 0:
+                        print(f"  RUN FAILED (exit {rc}); see {os.path.join(run_dir, 'run.log')}")
+                        failures.append((mode, size, seed, rc))
+                        continue
+
+                all_rows += summarize_run(run_dir, mode, size, seed)
 
     if args.dry_run:
         return
 
     summary = pd.DataFrame(all_rows)
     if not summary.empty:
-        summary = summary.sort_values(["mode", "samples_type", "train_size"])
-        out_path = os.path.join(args.result_root, "train_size_sweep_summary.csv")
+        summary = summary.sort_values(
+                ["mode", "samples_type", "train_size", "train_size_seed"])
+        # Tagged like the run dirs, so a cleaned sweep doesn't overwrite the
+        # uncleaned one's summary. The two CSVs share a schema (both carry
+        # remove_duplicate_subqueries/remove_leakage), so they concatenate.
+        tag = cleaning_tag(args)
+        out_path = os.path.join(args.result_root,
+                f"train_size_sweep_summary{tag}.csv")
         summary.to_csv(out_path, index=False)
         print_summary(summary)
-        print(f"\nSaved summary to {out_path}")
+        print(f"\nSaved per-run summary to {out_path}")
+
+        agg = aggregate_over_seeds(summary)
+        agg_path = os.path.join(args.result_root,
+                f"train_size_sweep_by_seed{tag}.csv")
+        agg.to_csv(agg_path, index=False)
+        print_aggregate(agg)
+        print(f"\nSaved seed-aggregated summary to {agg_path}")
 
     if failures:
         print("\nFailed runs:")
-        for mode, size, rc in failures:
-            print(f"  {mode} train_size={size}: exit {rc}")
+        for mode, size, seed, rc in failures:
+            print(f"  {mode} train_size={size} train_size_seed={seed}: exit {rc}")
         sys.exit(1)
 
 
@@ -275,12 +481,49 @@ def read_flags():
             choices=["auto", "query", "subquery"],
             help="Passed to main.py --train_size_level. Use 'subquery' when "
                  "comparing the two modes against each other.")
-    parser.add_argument("--train_size_seed", type=int, default=42)
+    parser.add_argument("--train_size_seeds", type=str, default=DEFAULT_SEEDS,
+            help="Comma separated seeds for main.py --train_size_seed. Each "
+                 "size is run once per seed, giving repeats that differ only "
+                 "in WHICH subsample of the training pool was drawn -- so the "
+                 "spread at a size is the subsample effect, not training "
+                 "noise. train_size=1.0 keeps the whole pool and is run once "
+                 f"regardless. Default: {DEFAULT_SEEDS}. Pass a single value "
+                 "for the old one-run-per-size behaviour.")
     parser.add_argument("--random_seed", type=int, default=42)
+    parser.add_argument("--train_seed", type=int, default=42,
+            help="Passed to main.py --train_seed: weight init, batch order, "
+                 "dropout, feature masking. Held FIXED across every size and "
+                 "seed in the sweep, so the repeats isolate the subsample "
+                 "effect. Re-run the whole sweep at 2-3 values of this to "
+                 "measure training noise instead.")
+
+    # Subquery cleaning. Both run BEFORE the training-size subsample, so
+    # they change the pool a fractional --train_size is measured against
+    # (and shrink it); the summary reports num_train_subqueries so the
+    # actual size behind each row is never in doubt. Held constant across
+    # every run of a sweep -- to compare cleaned vs uncleaned, run the
+    # sweep twice; the run dirs are suffixed so they won't collide.
+    parser.add_argument("--remove_duplicate_subqueries", type=int, default=0,
+            help="Passed to main.py: 1 drops repeated subqueries (same "
+                 "tables/joins/predicates) within each of train/val/test, "
+                 "keeping the first occurrence. Without it a subquery that "
+                 "appears in many query files is effectively upweighted, "
+                 "and the same rows can be counted in both train and eval.")
+    parser.add_argument("--remove_leakage", type=int, default=0,
+            help="Passed to main.py: 1 drops subqueries that appear in more "
+                 "than one split, keeping each in the highest-priority one "
+                 "(train > val > test). Use this when the test/val q-errors "
+                 "look implausibly good at small training sizes.")
+    parser.add_argument("--detect_leakage", type=int, default=0,
+            help="Passed to main.py: 1 logs the train/val/test subquery "
+                 "overlap per run without changing the data. Cheap way to "
+                 "see how much overlap a mode has before deciding whether "
+                 "--remove_leakage is worth the rerun.")
 
     parser.add_argument("--result_root", type=str,
             default="./results/train_size_sweep",
-            help="Per-run result dirs go under <result_root>/<mode>/<size>/")
+            help="Per-run result dirs go under <result_root>/<mode>/<size>/, "
+                 "with a _dedup/_noleak suffix when those options are on")
     parser.add_argument("--skip_existing", type=int, default=0,
             help="1 to skip runs whose result dir already has a QError.csv "
                  "(resume an interrupted sweep)")

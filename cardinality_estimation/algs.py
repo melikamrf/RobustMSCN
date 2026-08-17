@@ -24,7 +24,7 @@ from evaluation.flow_loss import FlowLoss, \
 from .discriminator import LatentDiscriminator, LatentGenerator
 from .DANN import train_one_epoch_dann as _train_one_epoch_dann
 from .seeding import DEFAULT_TRAIN_SEED, derive_seed, make_generator, \
-        make_worker_init_fn, seed_everything
+        make_numpy_generator, make_worker_init_fn, seed_everything
 
 from torch.utils import data
 from torch.nn.utils.clip_grad import clip_grad_norm_
@@ -247,6 +247,21 @@ class NN(CardinalityEstimationAlg):
         if getattr(self, "train_seed", None) is None:
             self.train_seed = DEFAULT_TRAIN_SEED
         self.train_seed = int(self.train_seed)
+
+        # Dedicated RNG streams for the per-batch input transforms: random
+        # onehot/feature masking (onehot_dropout) and the bitmap index
+        # permutation (random_bitmap_idx). Both fire on every training batch.
+        # Drawing them from the global numpy/torch state would make them
+        # depend on every other draw in the process -- the periodic eval, a
+        # visualization, an extra logging call -- so the masks would change
+        # when eval_epoch changed, even at the same --train_seed. Private
+        # generators make them a function of the seed and the batch index
+        # only.
+        self._mask_rng = make_numpy_generator(self.train_seed, "onehot_mask")
+        self._batch_transform_gen = make_generator(
+                self.train_seed, "batch_transform")
+        self._test_bitmap_gen = make_generator(
+                self.train_seed, "test_random_bitmap")
 
         # when estimates are log-normalized, then optimizing for mse is
         # basically equivalent to optimizing for q-error
@@ -951,7 +966,8 @@ class NN(CardinalityEstimationAlg):
 
     def _apply_training_batch_transforms(self, xbatch):
         if self.random_bitmap_idx and "join" in xbatch:
-            idxs = torch.randperm(xbatch["join"].shape[-1])
+            idxs = torch.randperm(xbatch["join"].shape[-1],
+                    generator=self._batch_transform_gen)
             xbatch["join"] = xbatch["join"][:, :, idxs]
 
         if self.onehot_dropout == 0:
@@ -1314,6 +1330,78 @@ class NN(CardinalityEstimationAlg):
             "p99": float(np.percentile(errors, 99)),
         }
 
+    def _compute_train_qerror_metrics(self, subplan_mask=None):
+        '''
+        Q-error over the training queries, so the val q-error curve can be read
+        against it (fit vs. generalization).
+
+        Reuses self.trainds instead of featurizing a second copy of the
+        training set -- QueryDataset keeps all feature vectors in memory, so a
+        dedicated "train" eval dataset would double that. The flip side is that
+        trainds' rows only line up with format_model_test_output's per-sample
+        node ordering when it was built one-row-per-subplan and without the
+        max_num_tables filter (which silently drops nodes that
+        format_model_test_output still walks over), so bail out otherwise
+        rather than report drifted numbers.
+        '''
+        skipped = {"mean": None, "median": None, "p99": None}
+
+        if getattr(self, "trainds", None) is None:
+            return skipped
+        if getattr(self, "training_samples", None) is None:
+            return skipped
+        if self.load_query_together or self.max_num_tables != -1:
+            return skipped
+
+        train_preds, _ = self._eval_ds(self.trainds, self.training_samples)
+        return self._compute_qerror_metrics_from_numpy(
+            train_preds,
+            self.training_samples,
+            subplan_mask=subplan_mask,
+        )
+
+    def _compute_eval_qerror_metrics(self):
+        '''
+        Q-error on every registered eval dataset -- the held-out test split
+        plus each eval workload (JOB, CEB-IMDb, ...) -- keyed by the same name
+        self.eval_ds uses. "val" is skipped: it gets its own curve from the
+        caller, and re-doing it here would just be a second forward pass.
+
+        Note this does its own forward passes rather than piggybacking on
+        periodic_eval(): that one returns early unless wandb is on, and it
+        formats predictions without each dataset's subplan_mask, so its
+        numbers are only right for unmasked eval sets.
+        '''
+        eval_qerrs = {}
+
+        for name, ds in getattr(self, "eval_ds", {}).items():
+            if name == "val":
+                continue
+
+            samples = self.samples.get(name)
+            if samples is None or len(samples) == 0:
+                continue
+
+            preds, _ = self._eval_ds(ds, samples)
+            metrics = self._compute_qerror_metrics_from_numpy(
+                preds,
+                samples,
+                subplan_mask=getattr(self, "eval_subplan_masks", {}).get(name),
+            )
+            if metrics["mean"] is None:
+                continue
+
+            eval_qerrs[name] = metrics
+
+        return eval_qerrs
+
+    def _format_eval_qerrs(self, eval_qerrs):
+        return {
+            name: "{:.4f}(median={:.4f}, 99p={:.4f})".format(
+                metrics["mean"], metrics["median"], metrics["p99"])
+            for name, metrics in eval_qerrs.items()
+        }
+
     def _save_adversarial_training_plot(self, save_dir):
         if not hasattr(self, "adversarial_train_history"):
             return None
@@ -1479,61 +1567,121 @@ class NN(CardinalityEstimationAlg):
         plt.close(fig)
         return plot_path
 
-    def _save_val_qerror_plot(self, history, save_dir, plot_name, title):
+    # Colors for the q-error splits. Train/val are pinned so they keep the same
+    # color across runs; eval datasets take the rest in registration order.
+    QERR_SPLIT_COLORS = [
+        "#ff7f0e", "#1f77b4", "#2ca02c", "#d62728", "#9467bd",
+        "#8c564b", "#e377c2", "#17becf", "#bcbd22", "#7f7f7f",
+    ]
+
+    def _collect_qerror_series(self, history):
+        '''
+        [(label, {stat_key: values_array})] for train, val and every eval
+        dataset that recorded a q-error, in a stable order.
+        '''
+        series = []
+
+        for split_key, label in (("train", "Train"), ("val", "Val")):
+            series.append((label, {
+                "mean": [m.get(split_key + "_qerr", np.nan) for m in history],
+                "median": [m.get(split_key + "_qerr_median", np.nan)
+                    for m in history],
+                "p99": [m.get(split_key + "_qerr_p99", np.nan)
+                    for m in history],
+            }))
+
+        # eval datasets come and go by name; take them in first-seen order so
+        # colors stay put from epoch to epoch
+        eval_names = []
+        for metrics in history:
+            for name in metrics.get("eval_qerrs", {}):
+                if name not in eval_names:
+                    eval_names.append(name)
+
+        for name in eval_names:
+            per_stat = {"mean": [], "median": [], "p99": []}
+            for metrics in history:
+                cur = metrics.get("eval_qerrs", {}).get(name, {})
+                for stat in per_stat:
+                    per_stat[stat].append(cur.get(stat, np.nan))
+            # "test" -> "Test", but leave names like JOB / CEB-IMDb-Complex be
+            label = name.capitalize() if name.islower() else name
+            series.append((label, per_stat))
+
+        out = []
+        for label, per_stat in series:
+            arrays = {stat: np.asarray(vals, dtype=np.float32)
+                    for stat, vals in per_stat.items()}
+            if not any(np.isfinite(a).any() for a in arrays.values()):
+                continue
+            out.append((label, arrays))
+
+        return out
+
+    def _save_qerror_plot(self, history, save_dir, plot_name, title):
         if history is None or len(history) == 0:
             return None
 
-        qerr_mean = []
-        qerr_median = []
-        qerr_p99 = []
-        for metrics in history:
-            qerr_mean.append(metrics.get("val_qerr", np.nan))
-            qerr_median.append(metrics.get("val_qerr_median", np.nan))
-            qerr_p99.append(metrics.get("val_qerr_p99", np.nan))
+        series = self._collect_qerror_series(history)
+        if len(series) == 0:
+            return None
 
-        qerr_mean = np.asarray(qerr_mean, dtype=np.float32)
-        qerr_median = np.asarray(qerr_median, dtype=np.float32)
-        qerr_p99 = np.asarray(qerr_p99, dtype=np.float32)
-
-        valid_mask = np.isfinite(qerr_mean) | np.isfinite(qerr_median) | np.isfinite(qerr_p99)
-        if not valid_mask.any():
+        # One panel per statistic, one line per split: with train, val, test and
+        # a few eval workloads, all of them on a single axes is unreadable, and
+        # the comparison that matters is between splits *within* a statistic.
+        stats = [("mean", "Mean"), ("median", "Median"), ("p99", "99p")]
+        stats = [(key, label) for key, label in stats
+                if any(np.isfinite(arrays[key]).any() for _, arrays in series)]
+        if len(stats) == 0:
             return None
 
         os.makedirs(save_dir, exist_ok=True)
         epochs = np.arange(len(history))
-        fig, ax = plt.subplots(1, 1, figsize=(10, 4))
+        fig, axes = plt.subplots(1, len(stats), figsize=(6*len(stats), 4),
+                squeeze=False)
 
-        if np.isfinite(qerr_mean).any():
-            ax.plot(
-                epochs[np.isfinite(qerr_mean)],
-                qerr_mean[np.isfinite(qerr_mean)],
-                label="Val Q-Error Mean",
-                color="#1f77b4",
-            )
-        if np.isfinite(qerr_median).any():
-            ax.plot(
-                epochs[np.isfinite(qerr_median)],
-                qerr_median[np.isfinite(qerr_median)],
-                label="Val Q-Error Median",
-                color="#ff7f0e",
-                linestyle="--",
-            )
-        if np.isfinite(qerr_p99).any():
-            ax.plot(
-                epochs[np.isfinite(qerr_p99)],
-                qerr_p99[np.isfinite(qerr_p99)],
-                label="Val Q-Error 99p",
-                color="#2ca02c",
-                linestyle=":",
-            )
+        # one shared legend for the figure; a split can be missing from a given
+        # panel, so collect handles across all of them
+        legend_handles = {}
 
-        ax.set_title(title)
-        ax.set_xlabel("Epoch")
-        ax.set_ylabel("Q-Error")
-        ax.grid(True, alpha=0.3)
-        ax.legend()
+        for pi, (stat_key, stat_label) in enumerate(stats):
+            ax = axes[0][pi]
+            for si, (label, arrays) in enumerate(series):
+                values = arrays[stat_key]
+                mask = np.isfinite(values)
+                if not mask.any():
+                    continue
 
-        plt.tight_layout()
+                lines = ax.plot(
+                    epochs[mask],
+                    values[mask],
+                    label=label,
+                    color=self.QERR_SPLIT_COLORS[
+                        si % len(self.QERR_SPLIT_COLORS)],
+                    marker="o",
+                    markersize=3,
+                )
+                legend_handles.setdefault(label, lines[0])
+
+            ax.set_title("{} Q-Error".format(stat_label))
+            ax.set_xlabel("Epoch")
+            ax.set_ylabel("Q-Error")
+            # q-error is a ratio >= 1 and the splits routinely sit orders of
+            # magnitude apart (train ~2, a shifted eval workload ~100), so a
+            # linear axis would flatten the lower curves into the floor
+            ax.set_yscale("log")
+            ax.grid(True, alpha=0.3, which="both")
+
+        ncol = max(1, min(len(legend_handles), 5))
+        fig.legend(list(legend_handles.values()), list(legend_handles.keys()),
+                loc="lower center", ncol=ncol, frameon=False)
+        fig.suptitle(title)
+
+        # leave room for the suptitle and for however many rows the shared
+        # legend wraps onto, so it never lands on top of the x-axis labels
+        legend_rows = int(np.ceil(len(legend_handles) / ncol))
+        bottom = min(0.06 + 0.05*legend_rows, 0.4)
+        fig.tight_layout(rect=[0, bottom, 1, 0.94])
         plot_path = os.path.join(save_dir, plot_name)
         fig.savefig(plot_path, dpi=200, bbox_inches="tight")
         plt.close(fig)
@@ -1926,6 +2074,11 @@ class NN(CardinalityEstimationAlg):
 
         self.eval_ds = {}
         self.samples = {}
+        # subplan_mask each eval dataset was built with, keyed the same way as
+        # self.eval_ds. Needed to compute q-error for it later:
+        # format_model_test_output has to walk exactly the nodes the dataset
+        # kept, or its estimates land on the wrong subplans.
+        self.eval_subplan_masks = {}
 
         # if self.eval_epoch < self.max_epochs:
             # self.samples["train"] = training_samples
@@ -1941,21 +2094,27 @@ class NN(CardinalityEstimationAlg):
                         load_padded_mscn_feats=self.load_padded_mscn_feats,
                         subplan_mask=val_subplan_mask)
                 self.samples["val"] = kwargs["valqs"]
+                self.eval_subplan_masks["val"] = val_subplan_mask
 
             # if "valqs" in kwargs and len(kwargs["valqs"]) > 0:
                 # pass
             if "testqs" in kwargs and len(kwargs["testqs"]) > 0:
                 if len(kwargs["testqs"]) > 400:
                     ns = int(len(kwargs["testqs"]) / 10)
-                    random.seed(42)
+                    # Private RNG at a fixed seed: this is a DATA decision
+                    # (which test queries get evaluated), so it must not move
+                    # with --train_seed. It also used to call random.seed(42)
+                    # on the global RNG, resetting the stream for everything
+                    # constructed afterwards.
+                    test_rng = random.Random(42)
                     if test_subplan_mask is not None:
                         # keep testqs and its mask aligned by sampling the
                         # same indices out of both
-                        idxs = random.sample(range(len(kwargs["testqs"])), ns)
+                        idxs = test_rng.sample(range(len(kwargs["testqs"])), ns)
                         testqs = [kwargs["testqs"][i] for i in idxs]
                         cur_test_subplan_mask = [test_subplan_mask[i] for i in idxs]
                     else:
-                        testqs = random.sample(kwargs["testqs"], ns)
+                        testqs = test_rng.sample(kwargs["testqs"], ns)
                         cur_test_subplan_mask = None
                 else:
                     testqs = kwargs["testqs"]
@@ -1966,6 +2125,7 @@ class NN(CardinalityEstimationAlg):
                         load_padded_mscn_feats=self.load_padded_mscn_feats,
                         subplan_mask=cur_test_subplan_mask)
                 self.samples["test"] = testqs
+                self.eval_subplan_masks["test"] = cur_test_subplan_mask
 
             if "evalqs" in kwargs and len(kwargs["eval_qdirs"]) > 0:
                 eval_qdirs = kwargs["eval_qdirs"]
@@ -2017,6 +2177,7 @@ class NN(CardinalityEstimationAlg):
                                 subplan_mask=group_mask)
                         self.true_costs[gqname] = 0.0
                         self.samples[gqname] = group_evalqs
+                        self.eval_subplan_masks[gqname] = group_mask
 
                         self.eval_ds[not_gqname] = \
                                 self.init_dataset(not_group_evalqs, False,
@@ -2024,6 +2185,7 @@ class NN(CardinalityEstimationAlg):
                                 subplan_mask=not_group_mask)
                         self.true_costs[not_gqname] = 0.0
                         self.samples[not_gqname] = not_group_evalqs
+                        self.eval_subplan_masks[not_gqname] = not_group_mask
 
                         continue
 
@@ -2042,6 +2204,7 @@ class NN(CardinalityEstimationAlg):
                             subplan_mask=cur_eval_mask)
                     self.true_costs[evalqname] = 0.0
                     self.samples[evalqname] = cur_evalqs
+                    self.eval_subplan_masks[evalqname] = cur_eval_mask
 
         # TODO: initialize self.num_features
         self.net, self.optimizer = self.init_net(self.trainds[0])
@@ -2102,6 +2265,22 @@ class NN(CardinalityEstimationAlg):
 
             epoch_metrics = {"train_loss": train_loss}
 
+            if should_eval:
+                train_qerr_metrics = self._compute_train_qerror_metrics(
+                        subplan_mask)
+                if train_qerr_metrics["mean"] is not None:
+                    epoch_metrics["train_qerr"] = train_qerr_metrics["mean"]
+                    epoch_metrics["train_qerr_median"] = train_qerr_metrics["median"]
+                    epoch_metrics["train_qerr_p99"] = train_qerr_metrics["p99"]
+                    print(
+                        "Epoch {} train_qerr={:.6f}(median={:.6f}, 99p={:.6f})".format(
+                            self.epoch,
+                            epoch_metrics["train_qerr"],
+                            epoch_metrics["train_qerr_median"],
+                            epoch_metrics["train_qerr_p99"],
+                        )
+                    )
+
             if should_eval and "val" in self.eval_ds:
                 val_preds, val_ys = self._eval_ds(self.eval_ds["val"], self.samples["val"])
                 val_loss_metrics = self._compute_loss_metrics_from_numpy(val_preds, val_ys)
@@ -2129,6 +2308,25 @@ class NN(CardinalityEstimationAlg):
                     )
 
             if should_eval:
+                eval_qerrs = self._compute_eval_qerror_metrics()
+                if len(eval_qerrs) > 0:
+                    epoch_metrics["eval_qerrs"] = eval_qerrs
+                    print(
+                        "Epoch {} eval_qerrs={}".format(
+                            self.epoch,
+                            self._format_eval_qerrs(eval_qerrs),
+                        )
+                    )
+                    if self.use_wandb:
+                        for name, metrics in eval_qerrs.items():
+                            wandb.log({
+                                "EvalQError-" + name: metrics["mean"],
+                                "EvalQError-" + name + "-Median": metrics["median"],
+                                "EvalQError-" + name + "-99p": metrics["p99"],
+                                "epoch": self.epoch,
+                            })
+
+            if should_eval:
                 eval_latent_mmds = self.compute_eval_latent_mmds()
                 if len(eval_latent_mmds) > 0:
                     epoch_metrics["eval_latent_mmds"] = eval_latent_mmds
@@ -2145,6 +2343,14 @@ class NN(CardinalityEstimationAlg):
                             "LatentMMD": epoch_metrics["latent_mmd"],
                             "epoch": self.epoch,
                         })
+
+                        if "train_qerr" in epoch_metrics:
+                            wandb.log({
+                                "TrainQError": epoch_metrics["train_qerr"],
+                                "TrainQError-Median": epoch_metrics["train_qerr_median"],
+                                "TrainQError-99p": epoch_metrics["train_qerr_p99"],
+                                "epoch": self.epoch,
+                            })
 
                         if "val_qerr" in epoch_metrics:
                             wandb.log({
@@ -2218,14 +2424,14 @@ class NN(CardinalityEstimationAlg):
         if std_plot_path is not None:
             print("Saved standard training plot to:", std_plot_path)
 
-        std_qerr_plot_path = self._save_val_qerror_plot(
+        std_qerr_plot_path = self._save_qerror_plot(
             self.standard_train_history,
             run_plot_dir,
             "standard_val_qerror.png",
-            "Validation Q-Error by Epoch",
+            "Q-Error by Epoch",
         )
         if std_qerr_plot_path is not None:
-            print("Saved standard validation q-error plot to:", std_qerr_plot_path)
+            print("Saved standard q-error plot to:", std_qerr_plot_path)
 
         std_mmd_plot_path = self._save_latent_mmd_plot(
             self.standard_train_history,
@@ -2307,6 +2513,9 @@ class NN(CardinalityEstimationAlg):
 
         self.eval_ds = {}
         self.samples = {}
+        # see the note in train(): the mask each eval dataset was built with,
+        # needed to line its predictions back up with its subplans
+        self.eval_subplan_masks = {}
 
         if self.eval_epoch < self.max_epochs:
             if "valqs" in kwargs and len(kwargs["valqs"]) > 0:
@@ -2316,19 +2525,25 @@ class NN(CardinalityEstimationAlg):
                     subplan_mask=val_subplan_mask,
                 )
                 self.samples["val"] = kwargs["valqs"]
+                self.eval_subplan_masks["val"] = val_subplan_mask
 
             if "testqs" in kwargs and len(kwargs["testqs"]) > 0:
                 if len(kwargs["testqs"]) > 400:
                     ns = int(len(kwargs["testqs"]) / 10)
-                    random.seed(42)
+                    # Private RNG at a fixed seed: this is a DATA decision
+                    # (which test queries get evaluated), so it must not move
+                    # with --train_seed. It also used to call random.seed(42)
+                    # on the global RNG, resetting the stream for everything
+                    # constructed afterwards.
+                    test_rng = random.Random(42)
                     if test_subplan_mask is not None:
                         # keep testqs and its mask aligned by sampling the
                         # same indices out of both
-                        idxs = random.sample(range(len(kwargs["testqs"])), ns)
+                        idxs = test_rng.sample(range(len(kwargs["testqs"])), ns)
                         testqs = [kwargs["testqs"][i] for i in idxs]
                         cur_test_subplan_mask = [test_subplan_mask[i] for i in idxs]
                     else:
-                        testqs = random.sample(kwargs["testqs"], ns)
+                        testqs = test_rng.sample(kwargs["testqs"], ns)
                         cur_test_subplan_mask = None
                 else:
                     testqs = kwargs["testqs"]
@@ -2340,6 +2555,7 @@ class NN(CardinalityEstimationAlg):
                     subplan_mask=cur_test_subplan_mask,
                 )
                 self.samples["test"] = testqs
+                self.eval_subplan_masks["test"] = cur_test_subplan_mask
 
             if "evalqs" in kwargs and len(kwargs["eval_qdirs"]) > 0:
                 eval_qdirs = kwargs["eval_qdirs"]
@@ -2360,6 +2576,7 @@ class NN(CardinalityEstimationAlg):
                         )
                         self.true_costs[gqname] = 0.0
                         self.samples[gqname] = group_evalqs
+                        self.eval_subplan_masks[gqname] = None
 
                         self.eval_ds[not_gqname] = self.init_dataset(
                             not_group_evalqs, False,
@@ -2367,6 +2584,7 @@ class NN(CardinalityEstimationAlg):
                         )
                         self.true_costs[not_gqname] = 0.0
                         self.samples[not_gqname] = not_group_evalqs
+                        self.eval_subplan_masks[not_gqname] = None
                         continue
                     elif "stats" in evalqname:
                         evalqname = "Stats-CEB"
@@ -2381,6 +2599,7 @@ class NN(CardinalityEstimationAlg):
                     )
                     self.true_costs[evalqname] = 0.0
                     self.samples[evalqname] = cur_evalqs
+                    self.eval_subplan_masks[evalqname] = None
 
         self.net, self.optimizer = self.init_net(self.trainds[0])
         if not hasattr(self.net, "forward_with_latent") or \
@@ -2455,6 +2674,14 @@ class NN(CardinalityEstimationAlg):
 
             epoch_metrics = train_epoch_fn(self.target_loader)
 
+            if should_eval:
+                train_qerr_metrics = self._compute_train_qerror_metrics(
+                        subplan_mask)
+                if train_qerr_metrics["mean"] is not None:
+                    epoch_metrics["train_qerr"] = train_qerr_metrics["mean"]
+                    epoch_metrics["train_qerr_median"] = train_qerr_metrics["median"]
+                    epoch_metrics["train_qerr_p99"] = train_qerr_metrics["p99"]
+
             if should_eval and "val" in self.eval_ds:
                 val_preds, val_ys = self._eval_ds(self.eval_ds["val"], self.samples["val"])
                 val_loss_metrics = self._compute_loss_metrics_from_numpy(val_preds, val_ys)
@@ -2471,6 +2698,18 @@ class NN(CardinalityEstimationAlg):
                     epoch_metrics["val_qerr"] = val_qerr_metrics["mean"]
                     epoch_metrics["val_qerr_median"] = val_qerr_metrics["median"]
                     epoch_metrics["val_qerr_p99"] = val_qerr_metrics["p99"]
+
+            if should_eval:
+                eval_qerrs = self._compute_eval_qerror_metrics()
+                if len(eval_qerrs) > 0:
+                    epoch_metrics["eval_qerrs"] = eval_qerrs
+                    print(
+                        "Epoch {} eval_qerrs={}".format(
+                            self.epoch,
+                            self._format_eval_qerrs(eval_qerrs),
+                        )
+                    )
+
             if should_eval:
                 eval_latent_mmds = self.compute_eval_latent_mmds()
                 if len(eval_latent_mmds) > 0:
@@ -2491,7 +2730,7 @@ class NN(CardinalityEstimationAlg):
 
             if self.epoch % 2 == 0:
                 print(
-                    "Epoch {} took {}s, reg_loss={:.6f}, recon_loss={:.6f}, phase1_loss={:.6f}, disc_loss={:.6f}, disc_grad_norm={:.6f}, gen_loss={:.6f}, disc_acc={:.6f}, source_acc={:.6f}, target_acc={:.6f}, fool_acc={:.6f}, latent_mmd={:.6f}, val_qerr={:.6f}(median={:.6f}, 99p={:.6f})".format(
+                    "Epoch {} took {}s, reg_loss={:.6f}, recon_loss={:.6f}, phase1_loss={:.6f}, disc_loss={:.6f}, disc_grad_norm={:.6f}, gen_loss={:.6f}, disc_acc={:.6f}, source_acc={:.6f}, target_acc={:.6f}, fool_acc={:.6f}, latent_mmd={:.6f}, train_qerr={:.6f}(median={:.6f}, 99p={:.6f}), val_qerr={:.6f}(median={:.6f}, 99p={:.6f})".format(
                         self.epoch,
                         epoch_metrics["epoch_seconds"],
                         epoch_metrics["loss_reg"],
@@ -2505,6 +2744,9 @@ class NN(CardinalityEstimationAlg):
                         epoch_metrics["disc_acc_target"],
                         epoch_metrics["gen_fool_acc"],
                         epoch_metrics.get("latent_mmd", float("nan")),
+                        epoch_metrics.get("train_qerr", float("nan")),
+                        epoch_metrics.get("train_qerr_median", float("nan")),
+                        epoch_metrics.get("train_qerr_p99", float("nan")),
                         epoch_metrics.get("val_qerr", float("nan")),
                         epoch_metrics.get("val_qerr_median", float("nan")),
                         epoch_metrics.get("val_qerr_p99", float("nan")),
@@ -2526,12 +2768,22 @@ class NN(CardinalityEstimationAlg):
                     wandb_payload["Adv-Disc-Grad-Norm"] = epoch_metrics["disc_grad_norm"]
                 if "latent_mmd" in epoch_metrics:
                     wandb_payload["LatentMMD"] = epoch_metrics["latent_mmd"]
+                if "train_qerr" in epoch_metrics:
+                    wandb_payload["TrainQError"] = epoch_metrics["train_qerr"]
+                if "train_qerr_median" in epoch_metrics:
+                    wandb_payload["TrainQError-Median"] = epoch_metrics["train_qerr_median"]
+                if "train_qerr_p99" in epoch_metrics:
+                    wandb_payload["TrainQError-99p"] = epoch_metrics["train_qerr_p99"]
                 if "val_qerr" in epoch_metrics:
                     wandb_payload["ValQError"] = epoch_metrics["val_qerr"]
                 if "val_qerr_median" in epoch_metrics:
                     wandb_payload["ValQError-Median"] = epoch_metrics["val_qerr_median"]
                 if "val_qerr_p99" in epoch_metrics:
                     wandb_payload["ValQError-99p"] = epoch_metrics["val_qerr_p99"]
+                for name, metrics in epoch_metrics.get("eval_qerrs", {}).items():
+                    wandb_payload["EvalQError-" + name] = metrics["mean"]
+                    wandb_payload["EvalQError-" + name + "-Median"] = metrics["median"]
+                    wandb_payload["EvalQError-" + name + "-99p"] = metrics["p99"]
                 wandb.log(wandb_payload)
 
             if self.early_stopping == 1:
@@ -2580,14 +2832,14 @@ class NN(CardinalityEstimationAlg):
         if adv_plot_path is not None:
             print("Saved adversarial training plot to:", adv_plot_path)
 
-        adv_qerr_plot_path = self._save_val_qerror_plot(
+        adv_qerr_plot_path = self._save_qerror_plot(
             self.adversarial_train_history,
             run_plot_dir,
             "adversarial_val_qerror.png",
-            "Validation Q-Error by Epoch",
+            "Q-Error by Epoch",
         )
         if adv_qerr_plot_path is not None:
-            print("Saved adversarial validation q-error plot to:", adv_qerr_plot_path)
+            print("Saved adversarial q-error plot to:", adv_qerr_plot_path)
 
         adv_mmd_plot_path = self._save_latent_mmd_plot(
             self.adversarial_train_history,
@@ -2677,6 +2929,9 @@ class NN(CardinalityEstimationAlg):
 
         self.eval_ds = {}
         self.samples = {}
+        # see the note in train(): the mask each eval dataset was built with,
+        # needed to line its predictions back up with its subplans
+        self.eval_subplan_masks = {}
 
         if self.eval_epoch < self.max_epochs:
             if "valqs" in kwargs and len(kwargs["valqs"]) > 0:
@@ -2686,19 +2941,25 @@ class NN(CardinalityEstimationAlg):
                     subplan_mask=val_subplan_mask,
                 )
                 self.samples["val"] = kwargs["valqs"]
+                self.eval_subplan_masks["val"] = val_subplan_mask
 
             if "testqs" in kwargs and len(kwargs["testqs"]) > 0:
                 if len(kwargs["testqs"]) > 400:
                     ns = int(len(kwargs["testqs"]) / 10)
-                    random.seed(42)
+                    # Private RNG at a fixed seed: this is a DATA decision
+                    # (which test queries get evaluated), so it must not move
+                    # with --train_seed. It also used to call random.seed(42)
+                    # on the global RNG, resetting the stream for everything
+                    # constructed afterwards.
+                    test_rng = random.Random(42)
                     if test_subplan_mask is not None:
                         # keep testqs and its mask aligned by sampling the
                         # same indices out of both
-                        idxs = random.sample(range(len(kwargs["testqs"])), ns)
+                        idxs = test_rng.sample(range(len(kwargs["testqs"])), ns)
                         testqs = [kwargs["testqs"][i] for i in idxs]
                         cur_test_subplan_mask = [test_subplan_mask[i] for i in idxs]
                     else:
-                        testqs = random.sample(kwargs["testqs"], ns)
+                        testqs = test_rng.sample(kwargs["testqs"], ns)
                         cur_test_subplan_mask = None
                 else:
                     testqs = kwargs["testqs"]
@@ -2710,6 +2971,7 @@ class NN(CardinalityEstimationAlg):
                     subplan_mask=cur_test_subplan_mask,
                 )
                 self.samples["test"] = testqs
+                self.eval_subplan_masks["test"] = cur_test_subplan_mask
 
             if "evalqs" in kwargs and len(kwargs["eval_qdirs"]) > 0:
                 eval_qdirs = kwargs["eval_qdirs"]
@@ -2730,6 +2992,7 @@ class NN(CardinalityEstimationAlg):
                         )
                         self.true_costs[gqname] = 0.0
                         self.samples[gqname] = group_evalqs
+                        self.eval_subplan_masks[gqname] = None
 
                         self.eval_ds[not_gqname] = self.init_dataset(
                             not_group_evalqs, False,
@@ -2737,6 +3000,7 @@ class NN(CardinalityEstimationAlg):
                         )
                         self.true_costs[not_gqname] = 0.0
                         self.samples[not_gqname] = not_group_evalqs
+                        self.eval_subplan_masks[not_gqname] = None
                         continue
                     elif "stats" in evalqname:
                         evalqname = "Stats-CEB"
@@ -2751,6 +3015,7 @@ class NN(CardinalityEstimationAlg):
                     )
                     self.true_costs[evalqname] = 0.0
                     self.samples[evalqname] = cur_evalqs
+                    self.eval_subplan_masks[evalqname] = None
 
         self.net, self.optimizer = self.init_net(self.trainds[0])
         if not hasattr(self.net, "forward_with_latent") or \
@@ -2796,6 +3061,14 @@ class NN(CardinalityEstimationAlg):
 
             epoch_metrics = self.train_one_epoch_with_latent_generator()
 
+            if should_eval:
+                train_qerr_metrics = self._compute_train_qerror_metrics(
+                        subplan_mask)
+                if train_qerr_metrics["mean"] is not None:
+                    epoch_metrics["train_qerr"] = train_qerr_metrics["mean"]
+                    epoch_metrics["train_qerr_median"] = train_qerr_metrics["median"]
+                    epoch_metrics["train_qerr_p99"] = train_qerr_metrics["p99"]
+
             if should_eval and "val" in self.eval_ds:
                 val_preds, val_ys = self._eval_ds(self.eval_ds["val"], self.samples["val"])
                 val_loss_metrics = self._compute_loss_metrics_from_numpy(val_preds, val_ys)
@@ -2812,6 +3085,18 @@ class NN(CardinalityEstimationAlg):
                     epoch_metrics["val_qerr"] = val_qerr_metrics["mean"]
                     epoch_metrics["val_qerr_median"] = val_qerr_metrics["median"]
                     epoch_metrics["val_qerr_p99"] = val_qerr_metrics["p99"]
+
+            if should_eval:
+                eval_qerrs = self._compute_eval_qerror_metrics()
+                if len(eval_qerrs) > 0:
+                    epoch_metrics["eval_qerrs"] = eval_qerrs
+                    print(
+                        "Epoch {} eval_qerrs={}".format(
+                            self.epoch,
+                            self._format_eval_qerrs(eval_qerrs),
+                        )
+                    )
+
             if should_eval:
                 eval_latent_mmds = self.compute_eval_latent_mmds()
                 if len(eval_latent_mmds) > 0:
@@ -2832,7 +3117,7 @@ class NN(CardinalityEstimationAlg):
 
             if self.epoch % 2 == 0:
                 print(
-                    "Epoch {} took {}s, reg_loss={}, disc_loss={}, gen_loss={}, disc_acc={}, source_acc={}, fake_acc={}, fool_acc={}, latent_mmd={}, val_qerr={}(median={}, 99p={})".format(
+                    "Epoch {} took {}s, reg_loss={}, disc_loss={}, gen_loss={}, disc_acc={}, source_acc={}, fake_acc={}, fool_acc={}, latent_mmd={}, train_qerr={}(median={}, 99p={}), val_qerr={}(median={}, 99p={})".format(
                         self.epoch,
                         epoch_metrics["epoch_seconds"],
                         round(epoch_metrics["loss_reg"], 6),
@@ -2843,6 +3128,9 @@ class NN(CardinalityEstimationAlg):
                         round(epoch_metrics["disc_acc_fake"], 6),
                         round(epoch_metrics["gen_fool_acc"], 6),
                         round(epoch_metrics.get("latent_mmd", float("nan")), 6),
+                        round(epoch_metrics.get("train_qerr", float("nan")), 6),
+                        round(epoch_metrics.get("train_qerr_median", float("nan")), 6),
+                        round(epoch_metrics.get("train_qerr_p99", float("nan")), 6),
                         round(epoch_metrics.get("val_qerr", float("nan")), 6),
                         round(epoch_metrics.get("val_qerr_median", float("nan")), 6),
                         round(epoch_metrics.get("val_qerr_p99", float("nan")), 6),
@@ -2864,12 +3152,22 @@ class NN(CardinalityEstimationAlg):
                 }
                 if "latent_mmd" in epoch_metrics:
                     wandb_payload["LatentMMD"] = epoch_metrics["latent_mmd"]
+                if "train_qerr" in epoch_metrics:
+                    wandb_payload["TrainQError"] = epoch_metrics["train_qerr"]
+                if "train_qerr_median" in epoch_metrics:
+                    wandb_payload["TrainQError-Median"] = epoch_metrics["train_qerr_median"]
+                if "train_qerr_p99" in epoch_metrics:
+                    wandb_payload["TrainQError-99p"] = epoch_metrics["train_qerr_p99"]
                 if "val_qerr" in epoch_metrics:
                     wandb_payload["ValQError"] = epoch_metrics["val_qerr"]
                 if "val_qerr_median" in epoch_metrics:
                     wandb_payload["ValQError-Median"] = epoch_metrics["val_qerr_median"]
                 if "val_qerr_p99" in epoch_metrics:
                     wandb_payload["ValQError-99p"] = epoch_metrics["val_qerr_p99"]
+                for name, metrics in epoch_metrics.get("eval_qerrs", {}).items():
+                    wandb_payload["EvalQError-" + name] = metrics["mean"]
+                    wandb_payload["EvalQError-" + name + "-Median"] = metrics["median"]
+                    wandb_payload["EvalQError-" + name + "-99p"] = metrics["p99"]
                 wandb.log(wandb_payload)
 
             if self.early_stopping == 1:
@@ -2918,14 +3216,14 @@ class NN(CardinalityEstimationAlg):
         if adv_plot_path is not None:
             print("Saved adversarial training plot to:", adv_plot_path)
 
-        adv_qerr_plot_path = self._save_val_qerror_plot(
+        adv_qerr_plot_path = self._save_qerror_plot(
             self.adversarial_train_history,
             run_plot_dir,
             "latent_generator_val_qerror.png",
-            "Validation Q-Error by Epoch",
+            "Q-Error by Epoch",
         )
         if adv_qerr_plot_path is not None:
-            print("Saved latent-generator validation q-error plot to:", adv_qerr_plot_path)
+            print("Saved latent-generator q-error plot to:", adv_qerr_plot_path)
 
         adv_mmd_plot_path = self._save_latent_mmd_plot(
             self.adversarial_train_history,
@@ -2975,14 +3273,20 @@ class NN(CardinalityEstimationAlg):
             ybatch = ybatch.to(device, non_blocking=True)
 
             if self.test_random_bitmap:
+                # Own generator: this runs during evaluation, so drawing from
+                # the global torch RNG would shift the dropout stream of the
+                # training that follows -- i.e. how often you evaluate would
+                # change how the model trains.
                 if self.featurizer.join_features:
                     print("testing with randomized idxs")
-                    idxs = torch.randperm(xbatch["join"].shape[-1])
+                    idxs = torch.randperm(xbatch["join"].shape[-1],
+                            generator=self._test_bitmap_gen)
                     xbatch["join"] = xbatch["join"][:,:,idxs]
                 if self.featurizer.sample_bitmap and \
                         self.featurizer.table_features:
                     print("testing with randomized idxs")
-                    idxs = torch.randperm(xbatch["table"].shape[-1])
+                    idxs = torch.randperm(xbatch["table"].shape[-1],
+                            generator=self._test_bitmap_gen)
                     xbatch["table"] = xbatch["table"][:,:,idxs]
 
             if self.mask_unseen_subplans:
@@ -3059,7 +3363,7 @@ class NN(CardinalityEstimationAlg):
         pfalse = 1-self.onehot_mask_truep
 
         # probabilities are switched
-        bools = np.random.choice(a=[False, True], size=(len(tmask),),
+        bools = self._mask_rng.choice(a=[False, True], size=(len(tmask),),
                 p=[ptrue,pfalse])
         tmask *= bools
         tmask = ~tmask
@@ -3152,7 +3456,8 @@ class NN(CardinalityEstimationAlg):
             ybatch = ybatch.to(device, non_blocking=True)
 
             if self.random_bitmap_idx:
-                idxs = torch.randperm(xbatch["join"].shape[-1])
+                idxs = torch.randperm(xbatch["join"].shape[-1],
+                        generator=self._batch_transform_gen)
                 xbatch["join"] = xbatch["join"][:,:,idxs]
 
             if self.onehot_dropout == 0:
