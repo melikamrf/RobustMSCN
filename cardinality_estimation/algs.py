@@ -8,6 +8,7 @@ import sys
 import torch
 import os
 from collections import defaultdict
+import pickle
 import random
 import copy
 
@@ -38,7 +39,32 @@ import matplotlib.pyplot as plt
 from sklearn.manifold import TSNE
 
 QERR_MIN_EPS=0.0000001
+def train_size_tag(train_size):
+    """
+    Filesystem-safe name for a --train_size, matching the directory names
+    scripts/run_train_size_sweep.py builds (frac_0p1, n_500), so a file in the
+    model dir can be lined up with the sweep run it came from.
+    """
+    if train_size is None or float(train_size) <= 0:
+        return None
+    if float(train_size) <= 1.0:
+        return "frac_" + ("%g" % float(train_size)).replace(".", "p")
+    return "n_%d" % int(round(float(train_size)))
+
+
+# epochs whose per-query predictions get dumped alongside the model
+DEFAULT_PRED_CHECKPOINT_EPOCHS = [1, 5, 20, 50, 100]
 DEBUG_TIMES=False
+
+# early_stopping == 1: how many of the most recent per-epoch % changes in
+# validation loss the stop decision averages over. 1 = decide on the epoch
+# that just finished. This used to be a 4-wide trailing window that also
+# excluded the newest point, so the decision lagged the evidence by an epoch.
+EARLY_STOP_WINDOW = 5
+# ...and how many epochs to let run before the stop can fire at all. Formerly
+# coupled to the window size; now purely a warmup, so the run cannot stop on
+# the noise of its first couple of epochs.
+EARLY_STOP_WARMUP_EPOCHS = 5
 
 def qloss_torch(yhat, ytrue):
     assert yhat.shape == ytrue.shape
@@ -248,6 +274,11 @@ class NN(CardinalityEstimationAlg):
             self.train_seed = DEFAULT_TRAIN_SEED
         self.train_seed = int(self.train_seed)
 
+        # cumulative minibatch updates of the estimator itself (discriminator
+        # and generator steps are not counted), so a row in the history CSV
+        # can be placed on an optimization axis and not just an epoch axis
+        self.total_grad_steps = 0
+
         # Dedicated RNG streams for the per-batch input transforms: random
         # onehot/feature masking (onehot_dropout) and the bitmap index
         # permutation (random_bitmap_idx). Both fire on every training batch.
@@ -340,6 +371,104 @@ class NN(CardinalityEstimationAlg):
             # wandb.watch(net)
 
         return net, optimizer
+
+    def _validate_early_stopping(self):
+        '''
+        early_stopping == 2 stops on the val PostgresPlanCost ratio, which it
+        reads back out of self.all_errs. Only periodic_eval() ever fills that
+        list in, and periodic_eval() returns immediately unless wandb is on --
+        so with wandb off the list stays empty and the first epoch dies on an
+        `IndexError: list index out of range`, several minutes into a run.
+        Same story if PostgresPlanCost was never registered as an eval fn: the
+        entry exists but the key doesn't, giving a KeyError instead.
+
+        Checked up front so a misconfigured sweep fails in seconds with a
+        message that says what to change.
+        '''
+        if self.early_stopping != 2:
+            return
+
+        if not self.use_wandb:
+            raise ValueError(
+                "model.early_stopping = 2 requires eval.use_wandb = 1: it "
+                "stops on PostgresPlanCost-C-Relative-val, which is only "
+                "computed inside periodic_eval(), and that returns early "
+                "when wandb is off. Either set eval.use_wandb = 1 (needs a "
+                "reachable PostgreSQL and 'ppc' in model.eval_fns), or pick "
+                "another early_stopping mode: 1 stops on validation loss "
+                "and needs neither wandb nor postgres, 0 trains the full "
+                "model.max_epochs. For a training-size sweep, 0 is usually "
+                "what you want -- otherwise different training sizes stop "
+                "at different epochs and confound the comparison.")
+
+        if not any(str(f) == "PostgresPlanCost-C" for f in self.eval_fn_handles):
+            raise ValueError(
+                "model.early_stopping = 2 stops on "
+                "PostgresPlanCost-C-Relative-val, but model.eval_fns = "
+                f"{self.eval_fns!r} does not include the plan-cost eval "
+                "('ppc'), so that number is never computed. Add 'ppc' to "
+                "model.eval_fns, or use early_stopping = 1 (validation "
+                "loss) or 0 (no early stopping).")
+
+    def _init_model_weight_tracking(self):
+        '''
+        State behind the two early_stopping modes' weight restore. Nothing
+        here holds more than two state dicts at a time: mode 1 keeps a running
+        best, mode 2 keeps the previous epoch to roll back to, mode 0 keeps
+        neither.
+        '''
+        self.best_model_epoch = -1
+        self.best_model_loss = None
+        self.best_model_weights = None
+        self.cur_model_weights = None
+        self.prev_model_weights = None
+
+    def _track_prev_epoch_weights(self):
+        '''
+        Called once per epoch. early_stopping == 2 rolls back to the epoch
+        before the one that regressed, so it needs exactly one epoch of
+        history; mode 1 snapshots its own best in _update_best_model() and
+        mode 0 never restores anything. This used to be an unconditional
+        deepcopy appended to a list that was never trimmed -- with
+        max_epochs = -1 that is 1000 state dicts held for the whole run, even
+        at early_stopping = 0 where nothing ever read them.
+        '''
+        if self.early_stopping != 2:
+            return
+        self.prev_model_weights = self.cur_model_weights
+        self.cur_model_weights = copy.deepcopy(self.net.state_dict())
+
+    def _update_best_model(self, eploss):
+        '''
+        Running argmin over @eploss for early_stopping == 1, so the restored
+        model is the lowest-validation-loss epoch rather than whichever epoch
+        happened to trip the stop. Snapshotting only on improvement costs one
+        state dict instead of one per epoch.
+        '''
+        if self.best_model_loss is not None and eploss >= self.best_model_loss:
+            return
+        self.best_model_loss = eploss
+        self.best_model_epoch = self.epoch
+        self.best_model_weights = copy.deepcopy(self.net.state_dict())
+
+    def _set_best_model_to_prev_epoch(self):
+        '''
+        early_stopping == 2: revert to the model as of before this epoch's
+        training, i.e. the last one whose plan cost had not regressed.
+        '''
+        assert self.prev_model_weights is not None, (
+            "early_stopping = 2 tried to roll back at epoch "
+            "{} with no previous epoch recorded".format(self.epoch))
+        self.best_model_epoch = self.epoch - 1
+        self.best_model_weights = self.prev_model_weights
+
+    def _restore_best_model(self):
+        if self.best_model_epoch == -1:
+            return
+        assert self.best_model_weights is not None
+        print("training done, restoring the model from epoch {}".format(
+            self.best_model_epoch))
+        self.net.load_state_dict(self.best_model_weights)
 
     def periodic_eval(self):
         if not self.use_wandb:
@@ -1293,9 +1422,31 @@ class NN(CardinalityEstimationAlg):
             "p99": float(np.percentile(losses_np, 99)) if len(losses_np) > 0 else None,
         }
 
-    def _compute_qerror_metrics_from_numpy(self, preds, samples, subplan_mask=None):
+    # every q-error stat we track per split; "mean" is what the plot's headline
+    # panel uses, the rest are the tail the CSV carries
+    QERR_STAT_KEYS = ["mean", "median", "p90", "p99", "max"]
+
+    def _qerror_stats(self, errors):
+        if errors is None or len(errors) == 0:
+            return {stat: None for stat in self.QERR_STAT_KEYS}
+
+        return {
+            "mean": float(np.mean(errors)),
+            "median": float(np.median(errors)),
+            "p90": float(np.percentile(errors, 90)),
+            "p99": float(np.percentile(errors, 99)),
+            "max": float(np.max(errors)),
+        }
+
+    def _format_and_score_preds(self, preds, samples, subplan_mask=None):
+        '''
+        (per-query estimates, q-error stats) from one dataset's raw model
+        outputs. The two are produced together so a checkpoint dump of the
+        estimates can reuse the forward pass the q-error curve already paid
+        for, instead of running the model over the split twice.
+        '''
         if samples is None or len(samples) == 0:
-            return {"mean": None, "median": None, "p99": None}
+            return None, self._qerror_stats(None)
 
         if getattr(self.featurizer, "card_type", None) == "joinkey":
             # NOTE: format_model_test_output_joinkey doesn't support
@@ -1321,19 +1472,17 @@ class NN(CardinalityEstimationAlg):
                 result_dir=None,
             )
 
-        if len(errors) == 0:
-            return {"mean": None, "median": None, "p99": None}
+        return formatted_preds, self._qerror_stats(errors)
 
-        return {
-            "mean": float(np.mean(errors)),
-            "median": float(np.median(errors)),
-            "p99": float(np.percentile(errors, 99)),
-        }
+    def _compute_qerror_metrics_from_numpy(self, preds, samples, subplan_mask=None):
+        return self._format_and_score_preds(preds, samples,
+                subplan_mask=subplan_mask)[1]
 
     def _compute_train_qerror_metrics(self, subplan_mask=None):
         '''
         Q-error over the training queries, so the val q-error curve can be read
-        against it (fit vs. generalization).
+        against it (fit vs. generalization). Returns (estimates, stats); the
+        estimates are None when the split was skipped.
 
         Reuses self.trainds instead of featurizing a second copy of the
         training set -- QueryDataset keeps all feature vectors in memory, so a
@@ -1344,7 +1493,7 @@ class NN(CardinalityEstimationAlg):
         format_model_test_output still walks over), so bail out otherwise
         rather than report drifted numbers.
         '''
-        skipped = {"mean": None, "median": None, "p99": None}
+        skipped = (None, self._qerror_stats(None))
 
         if getattr(self, "trainds", None) is None:
             return skipped
@@ -1354,7 +1503,7 @@ class NN(CardinalityEstimationAlg):
             return skipped
 
         train_preds, _ = self._eval_ds(self.trainds, self.training_samples)
-        return self._compute_qerror_metrics_from_numpy(
+        return self._format_and_score_preds(
             train_preds,
             self.training_samples,
             subplan_mask=subplan_mask,
@@ -1364,14 +1513,16 @@ class NN(CardinalityEstimationAlg):
         '''
         Q-error on every registered eval dataset -- the held-out test split
         plus each eval workload (JOB, CEB-IMDb, ...) -- keyed by the same name
-        self.eval_ds uses. "val" is skipped: it gets its own curve from the
-        caller, and re-doing it here would just be a second forward pass.
+        self.eval_ds uses. Returns ({name: estimates}, {name: stats}). "val" is
+        skipped: it gets its own curve from the caller, and re-doing it here
+        would just be a second forward pass.
 
         Note this does its own forward passes rather than piggybacking on
         periodic_eval(): that one returns early unless wandb is on, and it
         formats predictions without each dataset's subplan_mask, so its
         numbers are only right for unmasked eval sets.
         '''
+        eval_ests = {}
         eval_qerrs = {}
 
         for name, ds in getattr(self, "eval_ds", {}).items():
@@ -1383,7 +1534,7 @@ class NN(CardinalityEstimationAlg):
                 continue
 
             preds, _ = self._eval_ds(ds, samples)
-            metrics = self._compute_qerror_metrics_from_numpy(
+            ests, metrics = self._format_and_score_preds(
                 preds,
                 samples,
                 subplan_mask=getattr(self, "eval_subplan_masks", {}).get(name),
@@ -1391,16 +1542,279 @@ class NN(CardinalityEstimationAlg):
             if metrics["mean"] is None:
                 continue
 
+            eval_ests[name] = ests
             eval_qerrs[name] = metrics
 
-        return eval_qerrs
+        return eval_ests, eval_qerrs
+
+    def _record_qerror_stats(self, epoch_metrics, split_key, stats):
+        '''
+        Lay one split's stats into epoch_metrics as <split>_qerr,
+        _qerr_median, _qerr_p90, _qerr_p99, _qerr_max. Returns whether there
+        was anything to record.
+        '''
+        if stats is None or stats.get("mean") is None:
+            return False
+
+        suffixes = {"mean": "", "median": "_median", "p90": "_p90",
+                "p99": "_p99", "max": "_max"}
+        for stat, suffix in suffixes.items():
+            epoch_metrics[split_key + "_qerr" + suffix] = stats[stat]
+
+        return True
+
+    def _run_epoch_qerror_eval(self, epoch_metrics, train_subplan_mask,
+            val_preds=None, val_subplan_mask=None, verbose=False):
+        '''
+        One epoch's q-error over every split -- train, val, and each eval
+        dataset -- recorded into epoch_metrics, plus the per-query estimate
+        dump if this epoch is a checkpoint.
+
+        @val_preds: the val forward pass the caller already ran for val_loss,
+        so val isn't predicted twice.
+        @verbose: print the train/val lines. The adversarial loops fold those
+        numbers into their own per-epoch line instead.
+        '''
+        # split -> (qreps, per-query estimates), for the checkpoint dump
+        split_ests = {}
+
+        train_ests, train_stats = self._compute_train_qerror_metrics(
+                train_subplan_mask)
+        if self._record_qerror_stats(epoch_metrics, "train", train_stats):
+            split_ests["train"] = (self.training_samples, train_ests)
+            if verbose:
+                print(
+                    "Epoch {} train_qerr={:.6f}(median={:.6f}, 90p={:.6f}, 99p={:.6f}, max={:.6f})".format(
+                        self.epoch,
+                        epoch_metrics["train_qerr"],
+                        epoch_metrics["train_qerr_median"],
+                        epoch_metrics["train_qerr_p90"],
+                        epoch_metrics["train_qerr_p99"],
+                        epoch_metrics["train_qerr_max"],
+                    )
+                )
+
+        val_samples = self.samples.get("val")
+        if val_preds is not None and val_samples is not None and len(val_samples) > 0:
+            val_ests, val_stats = self._format_and_score_preds(
+                val_preds,
+                val_samples,
+                subplan_mask=val_subplan_mask,
+            )
+            if self._record_qerror_stats(epoch_metrics, "val", val_stats):
+                split_ests["val"] = (val_samples, val_ests)
+                if verbose:
+                    print(
+                        "Epoch {} val_qerr={:.6f}(median={:.6f}, 90p={:.6f}, 99p={:.6f}, max={:.6f})".format(
+                            self.epoch,
+                            epoch_metrics["val_qerr"],
+                            epoch_metrics["val_qerr_median"],
+                            epoch_metrics["val_qerr_p90"],
+                            epoch_metrics["val_qerr_p99"],
+                            epoch_metrics["val_qerr_max"],
+                        )
+                    )
+
+        eval_ests, eval_qerrs = self._compute_eval_qerror_metrics()
+        if len(eval_qerrs) > 0:
+            epoch_metrics["eval_qerrs"] = eval_qerrs
+            for name, ests in eval_ests.items():
+                split_ests[name] = (self.samples[name], ests)
+            print(
+                "Epoch {} eval_qerrs={}".format(
+                    self.epoch,
+                    self._format_eval_qerrs(eval_qerrs),
+                )
+            )
+
+        self._maybe_save_checkpoint_preds(split_ests)
 
     def _format_eval_qerrs(self, eval_qerrs):
         return {
-            name: "{:.4f}(median={:.4f}, 99p={:.4f})".format(
-                metrics["mean"], metrics["median"], metrics["p99"])
+            name: "{:.4f}(median={:.4f}, 90p={:.4f}, 99p={:.4f}, max={:.4f})".format(
+                metrics["mean"], metrics["median"], metrics["p90"],
+                metrics["p99"], metrics["max"])
             for name, metrics in eval_qerrs.items()
         }
+
+    def _model_save_dir(self):
+        # same place save_model() writes its checkpoints
+        return getattr(self, "model_dir", "./saved_models")
+
+    def _artifact_prefix(self):
+        '''
+        Filename prefix for everything this run writes into the model dir. The
+        experiment name alone is a random id, so in a training-size sweep the
+        files from every size land in one flat directory indistinguishable from
+        each other -- the size tag is what tells them apart.
+        '''
+        name = self.get_exp_name()
+        tag = train_size_tag(getattr(self, "train_size", None))
+        if tag is not None:
+            name += "_" + tag
+        return name
+
+    def _checkpoint_epochs(self):
+        '''
+        Epochs whose per-query predictions get dumped. Override with
+        model.pred_checkpoint_epochs in the config; [] turns the dumps off.
+        '''
+        epochs = getattr(self, "pred_checkpoint_epochs", None)
+        if epochs is None:
+            epochs = DEFAULT_PRED_CHECKPOINT_EPOCHS
+        return set(int(e) for e in epochs)
+
+    def _is_checkpoint_epoch(self):
+        return self.epoch in self._checkpoint_epochs()
+
+    def _maybe_save_checkpoint_preds(self, split_ests):
+        '''
+        Per-query estimates at a few checkpoint epochs, one pickle per split:
+        {query name: {subplan node: estimated cardinality}} -- the same shape
+        main.py's save_test_preds writes, but for every split and while
+        training rather than only at the end.
+
+        @split_ests: {split name: (qreps, estimates aligned with qreps)}.
+        '''
+        if not self._is_checkpoint_epoch():
+            return []
+
+        save_dir = self._model_save_dir()
+        os.makedirs(save_dir, exist_ok=True)
+        prefix = self._artifact_prefix()
+
+        written = []
+        for split, (samples, ests) in split_ests.items():
+            if ests is None or samples is None:
+                continue
+
+            payload = {}
+            for qrep, cur_ests in zip(samples, ests):
+                payload[qrep["name"]] = cur_ests
+
+            fname = "{}_preds_epoch{:04d}_{}.pkl".format(
+                    prefix, self.epoch, split.replace(os.sep, "_"))
+            fpath = os.path.join(save_dir, fname)
+            with open(fpath, "wb") as f:
+                pickle.dump(payload, f)
+
+            written.append(fpath)
+            print("Epoch {} saved {} {} query predictions to {} ({:.1f} MB)".format(
+                self.epoch, len(payload), split, fpath,
+                os.path.getsize(fpath) / (1024.0*1024.0)))
+
+        return written
+
+    def _flatten_epoch_metrics(self, metrics):
+        '''
+        One epoch's metrics as a flat {column: scalar}. The per-eval-dataset
+        dicts become one column per dataset, named exactly the way train/val's
+        own keys are, so every split reads the same in the CSV:
+        <split>_qerr, _qerr_median, _qerr_p90, _qerr_p99, _qerr_max.
+        '''
+        stat_suffixes = {"mean": "_qerr", "median": "_qerr_median",
+                "p90": "_qerr_p90", "p99": "_qerr_p99", "max": "_qerr_max"}
+
+        row = {}
+        for key, val in metrics.items():
+            if key == "eval_qerrs":
+                for name, stats in val.items():
+                    for stat, statval in stats.items():
+                        suffix = stat_suffixes.get(stat, "_qerr_" + str(stat))
+                        row[name + suffix] = statval
+            elif key == "eval_latent_mmds":
+                for name, mmd in val.items():
+                    row[name + "_latent_mmd"] = mmd
+            elif isinstance(val, dict):
+                # some other nested metric we don't know how to lay out flat
+                continue
+            else:
+                row[key] = val
+
+        return row
+
+    def _history_csv_columns(self, rows):
+        '''
+        epoch and grad_steps first, then each split's q-error stats grouped
+        together, then whatever else the epoch recorded (losses, adversarial
+        accuracies, latent MMDs).
+        '''
+        seen = []
+        for row in rows:
+            for key in row:
+                if key not in seen:
+                    seen.append(key)
+
+        suffixes = ["_qerr", "_qerr_median", "_qerr_p90", "_qerr_p99",
+                "_qerr_max"]
+
+        splits = []
+        for key in seen:
+            if not key.endswith("_qerr"):
+                continue
+            split = key[:-len("_qerr")]
+            if split not in splits:
+                splits.append(split)
+
+        columns = ["epoch", "grad_steps"]
+        for split in splits:
+            for suffix in suffixes:
+                col = split + suffix
+                if col in seen:
+                    columns.append(col)
+
+        for key in seen:
+            if key not in columns:
+                columns.append(key)
+
+        return columns
+
+    def _save_training_history_csv(self, history, csv_name, save_dir=None):
+        '''
+        The per-epoch numbers behind the plots, as a CSV in the model dir, so
+        they can be recovered afterwards instead of only being looked at: one
+        row per epoch with the cumulative gradient step count and every
+        split's q-error median/90p/99p/max (and mean).
+
+        Rewritten every epoch rather than once at the end: these runs are long,
+        and self.*_train_history only lives as long as the process, so a run
+        that is killed or crashes partway would otherwise take its whole
+        history with it.
+        '''
+        if history is None or len(history) == 0:
+            return None
+
+        rows = [self._flatten_epoch_metrics(m) for m in history]
+        for ei, row in enumerate(rows):
+            row["epoch"] = ei
+            row.setdefault("grad_steps", None)
+
+        if save_dir is None:
+            save_dir = self._model_save_dir()
+        os.makedirs(save_dir, exist_ok=True)
+
+        csv_path = os.path.join(save_dir,
+                "{}_{}".format(self._artifact_prefix(), csv_name))
+        pd.DataFrame(rows, columns=self._history_csv_columns(rows)).to_csv(
+                csv_path, index=False)
+        return csv_path
+
+    def _history_x_axis(self, history):
+        '''
+        (x values, axis label) for the per-epoch plots.
+
+        Cumulative gradient steps when every epoch recorded them: an epoch is a
+        different amount of optimization depending on the training set size and
+        the batch size, so steps are the axis that stays comparable across
+        runs. Falls back to the epoch index for histories that predate the
+        counter.
+        '''
+        steps = np.asarray([m.get("grad_steps", np.nan) for m in history],
+                dtype=np.float64)
+        if len(steps) > 0 and np.isfinite(steps).all():
+            return steps, "Gradient steps"
+
+        return np.arange(len(history), dtype=np.float64), "Epoch"
 
     def _save_adversarial_training_plot(self, save_dir):
         if not hasattr(self, "adversarial_train_history"):
@@ -1410,7 +1824,7 @@ class NN(CardinalityEstimationAlg):
 
         os.makedirs(save_dir, exist_ok=True)
 
-        epochs = np.arange(len(self.adversarial_train_history))
+        epochs, xlabel = self._history_x_axis(self.adversarial_train_history)
         reg_loss = [m["loss_reg"] for m in self.adversarial_train_history]
         recon_loss = [m.get("loss_recon", np.nan) for m in self.adversarial_train_history]
         phase1_loss = [m.get("loss_phase1", np.nan) for m in self.adversarial_train_history]
@@ -1439,7 +1853,7 @@ class NN(CardinalityEstimationAlg):
                 markersize=3,
             )
         axes[0].set_title("Regression And Reconstruction")
-        axes[0].set_xlabel("Epoch")
+        axes[0].set_xlabel(xlabel)
         axes[0].set_ylabel("Loss")
         axes[0].grid(True, alpha=0.3)
         axes[0].legend()
@@ -1447,7 +1861,7 @@ class NN(CardinalityEstimationAlg):
         axes[1].plot(epochs, disc_loss, label="Discriminator Loss")
         axes[1].plot(epochs, gen_loss, label="Generator Loss")
         axes[1].set_title("Adversarial Losses")
-        axes[1].set_xlabel("Epoch")
+        axes[1].set_xlabel(xlabel)
         axes[1].set_ylabel("Loss")
         axes[1].grid(True, alpha=0.3)
         axes[1].legend()
@@ -1457,7 +1871,7 @@ class NN(CardinalityEstimationAlg):
         axes[2].plot(epochs, target_acc, label="Target Acc")
         axes[2].plot(epochs, fool_acc, label="Fool Acc")
         axes[2].set_title("Adversarial Accuracy")
-        axes[2].set_xlabel("Epoch")
+        axes[2].set_xlabel(xlabel)
         axes[2].set_ylabel("Accuracy")
         axes[2].set_ylim(0.0, 1.0)
         axes[2].grid(True, alpha=0.3)
@@ -1477,7 +1891,7 @@ class NN(CardinalityEstimationAlg):
 
         os.makedirs(save_dir, exist_ok=True)
 
-        epochs = np.arange(len(self.standard_train_history))
+        epochs, xlabel = self._history_x_axis(self.standard_train_history)
         train_loss = [m.get("train_loss", np.nan) for m in self.standard_train_history]
         val_loss = [m.get("val_loss", np.nan) for m in self.standard_train_history]
 
@@ -1505,7 +1919,7 @@ class NN(CardinalityEstimationAlg):
             )
 
         ax.set_title("Training Curves")
-        ax.set_xlabel("Epoch")
+        ax.set_xlabel(xlabel)
         ax.set_ylabel("Loss")
         ax.grid(True, alpha=0.3)
         ax.legend()
@@ -1531,7 +1945,7 @@ class NN(CardinalityEstimationAlg):
             return None
 
         os.makedirs(save_dir, exist_ok=True)
-        epochs = np.arange(len(history))
+        epochs, xlabel = self._history_x_axis(history)
         fig, ax = plt.subplots(1, 1, figsize=(10, 4))
 
         for series_name in series_names:
@@ -1556,7 +1970,7 @@ class NN(CardinalityEstimationAlg):
             )
 
         ax.set_title(title)
-        ax.set_xlabel("Epoch")
+        ax.set_xlabel(xlabel)
         ax.set_ylabel("MMD")
         ax.grid(True, alpha=0.3)
         ax.legend()
@@ -1636,7 +2050,7 @@ class NN(CardinalityEstimationAlg):
             return None
 
         os.makedirs(save_dir, exist_ok=True)
-        epochs = np.arange(len(history))
+        epochs, xlabel = self._history_x_axis(history)
         fig, axes = plt.subplots(1, len(stats), figsize=(6*len(stats), 4),
                 squeeze=False)
 
@@ -1664,7 +2078,7 @@ class NN(CardinalityEstimationAlg):
                 legend_handles.setdefault(label, lines[0])
 
             ax.set_title("{} Q-Error".format(stat_label))
-            ax.set_xlabel("Epoch")
+            ax.set_xlabel(xlabel)
             ax.set_ylabel("Q-Error")
             # q-error is a ratio >= 1 and the splits routinely sit orders of
             # magnitude apart (train ~2, a shifted eval workload ~100), so a
@@ -1763,6 +2177,7 @@ class NN(CardinalityEstimationAlg):
                     self.clip_gradient,
                 )
             self.opt_regression.step()
+            self.total_grad_steps += 1
 
             # Phase 2: train discriminator (source vs target).
             if self.epoch >= getattr(self, "discriminator_warmup_epochs", 5):
@@ -1928,6 +2343,7 @@ class NN(CardinalityEstimationAlg):
                     self.clip_gradient,
                 )
             self.opt_regression.step()
+            self.total_grad_steps += 1
 
             # Phase 2: train discriminator on source vs generated fake target.
             self.opt_discriminator.zero_grad()
@@ -2000,10 +2416,12 @@ class NN(CardinalityEstimationAlg):
 
     def train(self, training_samples, **kwargs):
 
+        self._validate_early_stopping()
         self.all_errs = []
-        self.best_model_epoch = -1
-        self.model_weights = []
+        self._init_model_weight_tracking()
         self.standard_train_history = []
+        self.train_size = kwargs.get("train_size", None)
+        self.total_grad_steps = 0
         self.adv_weights = None
         self.adv_weight_level = kwargs.get("adv_weight_level", "dataset")
 
@@ -2263,25 +2681,16 @@ class NN(CardinalityEstimationAlg):
 
             train_loss = self.train_one_epoch()
 
-            epoch_metrics = {"train_loss": train_loss}
+            epoch_metrics = {"train_loss": train_loss,
+                    "grad_steps": self.total_grad_steps}
 
-            if should_eval:
-                train_qerr_metrics = self._compute_train_qerror_metrics(
-                        subplan_mask)
-                if train_qerr_metrics["mean"] is not None:
-                    epoch_metrics["train_qerr"] = train_qerr_metrics["mean"]
-                    epoch_metrics["train_qerr_median"] = train_qerr_metrics["median"]
-                    epoch_metrics["train_qerr_p99"] = train_qerr_metrics["p99"]
-                    print(
-                        "Epoch {} train_qerr={:.6f}(median={:.6f}, 99p={:.6f})".format(
-                            self.epoch,
-                            epoch_metrics["train_qerr"],
-                            epoch_metrics["train_qerr_median"],
-                            epoch_metrics["train_qerr_p99"],
-                        )
-                    )
+            # a checkpoint epoch gets the q-error eval too, even if eval_epoch
+            # would have skipped it, so the predictions dumped at a checkpoint
+            # and the numbers recorded for it come from the same weights
+            should_qerr = should_eval or self._is_checkpoint_epoch()
 
-            if should_eval and "val" in self.eval_ds:
+            val_preds = None
+            if should_qerr and "val" in self.eval_ds:
                 val_preds, val_ys = self._eval_ds(self.eval_ds["val"], self.samples["val"])
                 val_loss_metrics = self._compute_loss_metrics_from_numpy(val_preds, val_ys)
                 if val_loss_metrics["mean"] is not None:
@@ -2289,42 +2698,22 @@ class NN(CardinalityEstimationAlg):
                     epoch_metrics["val_loss_median"] = val_loss_metrics["median"]
                     epoch_metrics["val_loss_p99"] = val_loss_metrics["p99"]
 
-                val_qerr_metrics = self._compute_qerror_metrics_from_numpy(
-                    val_preds,
-                    self.samples.get("val"),
-                    subplan_mask=val_subplan_mask,
+            if should_qerr:
+                self._run_epoch_qerror_eval(
+                    epoch_metrics,
+                    subplan_mask,
+                    val_preds=val_preds,
+                    val_subplan_mask=val_subplan_mask,
+                    verbose=True,
                 )
-                if val_qerr_metrics["mean"] is not None:
-                    epoch_metrics["val_qerr"] = val_qerr_metrics["mean"]
-                    epoch_metrics["val_qerr_median"] = val_qerr_metrics["median"]
-                    epoch_metrics["val_qerr_p99"] = val_qerr_metrics["p99"]
-                    print(
-                        "Epoch {} val_qerr={:.6f}(median={:.6f}, 99p={:.6f})".format(
-                            self.epoch,
-                            epoch_metrics["val_qerr"],
-                            epoch_metrics["val_qerr_median"],
-                            epoch_metrics["val_qerr_p99"],
-                        )
-                    )
-
-            if should_eval:
-                eval_qerrs = self._compute_eval_qerror_metrics()
-                if len(eval_qerrs) > 0:
-                    epoch_metrics["eval_qerrs"] = eval_qerrs
-                    print(
-                        "Epoch {} eval_qerrs={}".format(
-                            self.epoch,
-                            self._format_eval_qerrs(eval_qerrs),
-                        )
-                    )
-                    if self.use_wandb:
-                        for name, metrics in eval_qerrs.items():
-                            wandb.log({
-                                "EvalQError-" + name: metrics["mean"],
-                                "EvalQError-" + name + "-Median": metrics["median"],
-                                "EvalQError-" + name + "-99p": metrics["p99"],
-                                "epoch": self.epoch,
-                            })
+                if self.use_wandb:
+                    for name, metrics in epoch_metrics.get("eval_qerrs", {}).items():
+                        wandb.log({
+                            "EvalQError-" + name: metrics["mean"],
+                            "EvalQError-" + name + "-Median": metrics["median"],
+                            "EvalQError-" + name + "-99p": metrics["p99"],
+                            "epoch": self.epoch,
+                        })
 
             if should_eval:
                 eval_latent_mmds = self.compute_eval_latent_mmds()
@@ -2363,8 +2752,12 @@ class NN(CardinalityEstimationAlg):
             self._maybe_save_latent_visualization(run_plot_dir)
 
             self.standard_train_history.append(epoch_metrics)
+            self._save_training_history_csv(
+                self.standard_train_history,
+                "standard_training_history.csv",
+            )
 
-            self.model_weights.append(copy.deepcopy(self.net.state_dict()))
+            self._track_prev_epoch_weights()
 
             # TODO: needs to decide if we should stop training
             if self.early_stopping == 1:
@@ -2377,12 +2770,18 @@ class NN(CardinalityEstimationAlg):
                 losses = self.loss_func(torch.from_numpy(preds), torch.from_numpy(ys))
                 eploss = torch.mean(losses).item()
                 if len(eplosses) >= 1:
-                    pct = 100* ((eploss-eplosses[-1])/eplosses[-1])
+                    pct = 100 * ((eploss - eplosses[-1]) / eplosses[-1])
                     pct_chngs.append(pct)
 
                 eplosses.append(eploss)
-                if len(pct_chngs) > 5:
-                    trailing_chng = np.mean(pct_chngs[-5:-1])
+
+                # running argmin over the val losses seen so far, so the
+                # weights restored after the loop are the best epoch's and not
+                # those of the epoch that happened to trip the stop below.
+                self._update_best_model(eploss)
+
+                if len(pct_chngs) > EARLY_STOP_WARMUP_EPOCHS:
+                    trailing_chng = np.mean(pct_chngs[-EARLY_STOP_WINDOW:])
                     if trailing_chng > -0.1:
                         print("Going to exit training at epoch: ", self.epoch)
                         break
@@ -2404,7 +2803,7 @@ class NN(CardinalityEstimationAlg):
                     # print(pct_chngs[-5:-1])
                     # revert to model before this epoch's training
                     print("Going to exit training at epoch: ", self.epoch)
-                    self.best_model_epoch = self.epoch-1
+                    self._set_best_model_to_prev_epoch()
                     break
 
         # self.periodic_eval()
@@ -2412,10 +2811,7 @@ class NN(CardinalityEstimationAlg):
         if self.training_opt == "swa":
             torch.optim.swa_utils.update_bn(self.trainloader, self.swa_net)
 
-        if self.best_model_epoch != -1:
-            print("""training done, will update our model based on validation set""")
-            assert len(self.model_weights) > 0
-            self.net.load_state_dict(self.model_weights[self.best_model_epoch])
+        self._restore_best_model()
 
             # self.nets[0].load_state_dict(self.best_model_dict)
             # self.nets[0].eval()
@@ -2428,10 +2824,17 @@ class NN(CardinalityEstimationAlg):
             self.standard_train_history,
             run_plot_dir,
             "standard_val_qerror.png",
-            "Q-Error by Epoch",
+            "Q-Error",
         )
         if std_qerr_plot_path is not None:
             print("Saved standard q-error plot to:", std_qerr_plot_path)
+
+        std_history_csv = self._save_training_history_csv(
+            self.standard_train_history,
+            "standard_training_history.csv",
+        )
+        if std_history_csv is not None:
+            print("Saved standard per-epoch metrics to:", std_history_csv)
 
         std_mmd_plot_path = self._save_latent_mmd_plot(
             self.standard_train_history,
@@ -2446,12 +2849,14 @@ class NN(CardinalityEstimationAlg):
         self.save_model(save_dir='./saved_models', suffix_name="_epoch"+str(self.epoch))
 
     def train_with_new_discriminator(self, training_samples, **kwargs):
+        self._validate_early_stopping()
         self.all_errs = []
-        self.best_model_epoch = -1
-        self.model_weights = []
+        self._init_model_weight_tracking()
         self.adv_weights = None
         self.adv_weight_level = kwargs.get("adv_weight_level", "dataset")
         self.adversarial_train_history = []
+        self.train_size = kwargs.get("train_size", None)
+        self.total_grad_steps = 0
 
         if self.loss_func_name == "flowloss" or self.load_query_together:
             raise RuntimeError(
@@ -2673,42 +3078,27 @@ class NN(CardinalityEstimationAlg):
                 self.periodic_eval()
 
             epoch_metrics = train_epoch_fn(self.target_loader)
+            epoch_metrics["grad_steps"] = self.total_grad_steps
 
-            if should_eval:
-                train_qerr_metrics = self._compute_train_qerror_metrics(
-                        subplan_mask)
-                if train_qerr_metrics["mean"] is not None:
-                    epoch_metrics["train_qerr"] = train_qerr_metrics["mean"]
-                    epoch_metrics["train_qerr_median"] = train_qerr_metrics["median"]
-                    epoch_metrics["train_qerr_p99"] = train_qerr_metrics["p99"]
+            # see train(): checkpoint epochs run the q-error eval as well
+            should_qerr = should_eval or self._is_checkpoint_epoch()
 
-            if should_eval and "val" in self.eval_ds:
+            val_preds = None
+            if should_qerr and "val" in self.eval_ds:
                 val_preds, val_ys = self._eval_ds(self.eval_ds["val"], self.samples["val"])
                 val_loss_metrics = self._compute_loss_metrics_from_numpy(val_preds, val_ys)
                 if val_loss_metrics["mean"] is not None:
                     epoch_metrics["val_loss"] = val_loss_metrics["mean"]
                     epoch_metrics["val_loss_median"] = val_loss_metrics["median"]
                     epoch_metrics["val_loss_p99"] = val_loss_metrics["p99"]
-                val_qerr_metrics = self._compute_qerror_metrics_from_numpy(
-                    val_preds,
-                    self.samples.get("val"),
-                    subplan_mask=val_subplan_mask,
-                )
-                if val_qerr_metrics["mean"] is not None:
-                    epoch_metrics["val_qerr"] = val_qerr_metrics["mean"]
-                    epoch_metrics["val_qerr_median"] = val_qerr_metrics["median"]
-                    epoch_metrics["val_qerr_p99"] = val_qerr_metrics["p99"]
 
-            if should_eval:
-                eval_qerrs = self._compute_eval_qerror_metrics()
-                if len(eval_qerrs) > 0:
-                    epoch_metrics["eval_qerrs"] = eval_qerrs
-                    print(
-                        "Epoch {} eval_qerrs={}".format(
-                            self.epoch,
-                            self._format_eval_qerrs(eval_qerrs),
-                        )
-                    )
+            if should_qerr:
+                self._run_epoch_qerror_eval(
+                    epoch_metrics,
+                    subplan_mask,
+                    val_preds=val_preds,
+                    val_subplan_mask=val_subplan_mask,
+                )
 
             if should_eval:
                 eval_latent_mmds = self.compute_eval_latent_mmds()
@@ -2726,7 +3116,11 @@ class NN(CardinalityEstimationAlg):
             self._maybe_save_latent_visualization(run_plot_dir)
 
             self.adversarial_train_history.append(epoch_metrics)
-            self.model_weights.append(copy.deepcopy(self.net.state_dict()))
+            self._save_training_history_csv(
+                self.adversarial_train_history,
+                "adversarial_training_history.csv",
+            )
+            self._track_prev_epoch_weights()
 
             if self.epoch % 2 == 0:
                 print(
@@ -2800,8 +3194,14 @@ class NN(CardinalityEstimationAlg):
                     pct_chngs.append(pct)
 
                 eplosses.append(eploss)
-                if len(pct_chngs) > 5:
-                    trailing_chng = np.mean(pct_chngs[-5:-1])
+
+                # running argmin over the val losses seen so far, so the
+                # weights restored after the loop are the best epoch's and not
+                # those of the epoch that happened to trip the stop below.
+                self._update_best_model(eploss)
+
+                if len(pct_chngs) > EARLY_STOP_WARMUP_EPOCHS:
+                    trailing_chng = np.mean(pct_chngs[-EARLY_STOP_WINDOW:])
                     if trailing_chng > -0.1:
                         print("Going to exit training at epoch: ", self.epoch)
                         break
@@ -2820,13 +3220,10 @@ class NN(CardinalityEstimationAlg):
                     print(eplosses)
                     print(pct_chngs)
                     print("Going to exit training at epoch: ", self.epoch)
-                    self.best_model_epoch = self.epoch - 1
+                    self._set_best_model_to_prev_epoch()
                     break
 
-        if self.best_model_epoch != -1:
-            print("training done, will update our model based on validation set")
-            assert len(self.model_weights) > 0
-            self.net.load_state_dict(self.model_weights[self.best_model_epoch])
+        self._restore_best_model()
 
         adv_plot_path = self._save_adversarial_training_plot(run_plot_dir)
         if adv_plot_path is not None:
@@ -2836,10 +3233,17 @@ class NN(CardinalityEstimationAlg):
             self.adversarial_train_history,
             run_plot_dir,
             "adversarial_val_qerror.png",
-            "Q-Error by Epoch",
+            "Q-Error",
         )
         if adv_qerr_plot_path is not None:
             print("Saved adversarial q-error plot to:", adv_qerr_plot_path)
+
+        adv_history_csv = self._save_training_history_csv(
+            self.adversarial_train_history,
+            "adversarial_training_history.csv",
+        )
+        if adv_history_csv is not None:
+            print("Saved adversarial per-epoch metrics to:", adv_history_csv)
 
         adv_mmd_plot_path = self._save_latent_mmd_plot(
             self.adversarial_train_history,
@@ -2862,12 +3266,14 @@ class NN(CardinalityEstimationAlg):
                 del self._adversarial_epoch_train_fn
 
     def train_with_latent_generator(self, training_samples, **kwargs):
+        self._validate_early_stopping()
         self.all_errs = []
-        self.best_model_epoch = -1
-        self.model_weights = []
+        self._init_model_weight_tracking()
         self.adv_weights = None
         self.adv_weight_level = kwargs.get("adv_weight_level", "dataset")
         self.adversarial_train_history = []
+        self.train_size = kwargs.get("train_size", None)
+        self.total_grad_steps = 0
 
         if self.loss_func_name == "flowloss" or self.load_query_together:
             raise RuntimeError(
@@ -3060,42 +3466,27 @@ class NN(CardinalityEstimationAlg):
                 self.periodic_eval()
 
             epoch_metrics = self.train_one_epoch_with_latent_generator()
+            epoch_metrics["grad_steps"] = self.total_grad_steps
 
-            if should_eval:
-                train_qerr_metrics = self._compute_train_qerror_metrics(
-                        subplan_mask)
-                if train_qerr_metrics["mean"] is not None:
-                    epoch_metrics["train_qerr"] = train_qerr_metrics["mean"]
-                    epoch_metrics["train_qerr_median"] = train_qerr_metrics["median"]
-                    epoch_metrics["train_qerr_p99"] = train_qerr_metrics["p99"]
+            # see train(): checkpoint epochs run the q-error eval as well
+            should_qerr = should_eval or self._is_checkpoint_epoch()
 
-            if should_eval and "val" in self.eval_ds:
+            val_preds = None
+            if should_qerr and "val" in self.eval_ds:
                 val_preds, val_ys = self._eval_ds(self.eval_ds["val"], self.samples["val"])
                 val_loss_metrics = self._compute_loss_metrics_from_numpy(val_preds, val_ys)
                 if val_loss_metrics["mean"] is not None:
                     epoch_metrics["val_loss"] = val_loss_metrics["mean"]
                     epoch_metrics["val_loss_median"] = val_loss_metrics["median"]
                     epoch_metrics["val_loss_p99"] = val_loss_metrics["p99"]
-                val_qerr_metrics = self._compute_qerror_metrics_from_numpy(
-                    val_preds,
-                    self.samples.get("val"),
-                    subplan_mask=val_subplan_mask,
-                )
-                if val_qerr_metrics["mean"] is not None:
-                    epoch_metrics["val_qerr"] = val_qerr_metrics["mean"]
-                    epoch_metrics["val_qerr_median"] = val_qerr_metrics["median"]
-                    epoch_metrics["val_qerr_p99"] = val_qerr_metrics["p99"]
 
-            if should_eval:
-                eval_qerrs = self._compute_eval_qerror_metrics()
-                if len(eval_qerrs) > 0:
-                    epoch_metrics["eval_qerrs"] = eval_qerrs
-                    print(
-                        "Epoch {} eval_qerrs={}".format(
-                            self.epoch,
-                            self._format_eval_qerrs(eval_qerrs),
-                        )
-                    )
+            if should_qerr:
+                self._run_epoch_qerror_eval(
+                    epoch_metrics,
+                    subplan_mask,
+                    val_preds=val_preds,
+                    val_subplan_mask=val_subplan_mask,
+                )
 
             if should_eval:
                 eval_latent_mmds = self.compute_eval_latent_mmds()
@@ -3113,7 +3504,11 @@ class NN(CardinalityEstimationAlg):
             self._maybe_save_latent_visualization(run_plot_dir)
 
             self.adversarial_train_history.append(epoch_metrics)
-            self.model_weights.append(copy.deepcopy(self.net.state_dict()))
+            self._save_training_history_csv(
+                self.adversarial_train_history,
+                "latent_generator_training_history.csv",
+            )
+            self._track_prev_epoch_weights()
 
             if self.epoch % 2 == 0:
                 print(
@@ -3184,8 +3579,14 @@ class NN(CardinalityEstimationAlg):
                     pct_chngs.append(pct)
 
                 eplosses.append(eploss)
-                if len(pct_chngs) > 5:
-                    trailing_chng = np.mean(pct_chngs[-5:-1])
+
+                # running argmin over the val losses seen so far, so the
+                # weights restored after the loop are the best epoch's and not
+                # those of the epoch that happened to trip the stop below.
+                self._update_best_model(eploss)
+
+                if len(pct_chngs) > EARLY_STOP_WARMUP_EPOCHS:
+                    trailing_chng = np.mean(pct_chngs[-EARLY_STOP_WINDOW:])
                     if trailing_chng > -0.1:
                         print("Going to exit training at epoch: ", self.epoch)
                         break
@@ -3204,13 +3605,10 @@ class NN(CardinalityEstimationAlg):
                     print(eplosses)
                     print(pct_chngs)
                     print("Going to exit training at epoch: ", self.epoch)
-                    self.best_model_epoch = self.epoch - 1
+                    self._set_best_model_to_prev_epoch()
                     break
 
-        if self.best_model_epoch != -1:
-            print("training done, will update our model based on validation set")
-            assert len(self.model_weights) > 0
-            self.net.load_state_dict(self.model_weights[self.best_model_epoch])
+        self._restore_best_model()
 
         adv_plot_path = self._save_adversarial_training_plot(run_plot_dir)
         if adv_plot_path is not None:
@@ -3220,10 +3618,17 @@ class NN(CardinalityEstimationAlg):
             self.adversarial_train_history,
             run_plot_dir,
             "latent_generator_val_qerror.png",
-            "Q-Error by Epoch",
+            "Q-Error",
         )
         if adv_qerr_plot_path is not None:
             print("Saved latent-generator q-error plot to:", adv_qerr_plot_path)
+
+        adv_history_csv = self._save_training_history_csv(
+            self.adversarial_train_history,
+            "latent_generator_training_history.csv",
+        )
+        if adv_history_csv is not None:
+            print("Saved latent-generator per-epoch metrics to:", adv_history_csv)
 
         adv_mmd_plot_path = self._save_latent_mmd_plot(
             self.adversarial_train_history,
@@ -3588,6 +3993,7 @@ class NN(CardinalityEstimationAlg):
                 self.optimizer.zero_grad()
                 loss.backward()
                 self.optimizer.step()
+                self.total_grad_steps += 1
                 if self.epoch > self.swa_start:
                     self.swa_net.update_parameters(self.net)
                     self.swa_scheduler.step()
@@ -3599,6 +4005,7 @@ class NN(CardinalityEstimationAlg):
                 if self.clip_gradient is not None:
                     clip_grad_norm_(self.net.parameters(), self.clip_gradient)
                 self.optimizer.step()
+                self.total_grad_steps += 1
 
         curloss = round(float(sum(epoch_losses))/len(epoch_losses),6)
 
@@ -3703,11 +4110,11 @@ class NN(CardinalityEstimationAlg):
             raise RuntimeError("Model network is not initialized; train or init_net first.")
 
         os.makedirs(save_dir, exist_ok=True)
-        exp_name = self.get_exp_name()
+        prefix = self._artifact_prefix()
         if suffix_name:
-            fname = "{}_{}.pt".format(exp_name, suffix_name)
+            fname = "{}_{}.pt".format(prefix, suffix_name)
         else:
-            fname = "{}.pt".format(exp_name)
+            fname = "{}.pt".format(prefix)
         save_path = os.path.join(save_dir, fname)
 
         payload = {

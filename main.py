@@ -1027,6 +1027,13 @@ def subsample_train_split(trainqs, train_mask, train_size,
         mask = train_mask if train_mask is not None else _materialize_full_mask(trainqs)
         flat = [(qi, node) for qi, per_qrep in enumerate(mask)
                 for node in per_qrep if tuple(node) != SOURCE_NODE]
+        # Sort before drawing: we sample INDICES into this list, so its order
+        # decides which subqueries get picked. _intersect_masks builds its
+        # lists by iterating a set of alias tuples, and CPython randomizes
+        # string hashing per process (PYTHONHASHSEED), so without this the
+        # same seed picks a different training subset in every process
+        # whenever --remove_duplicate_subqueries/--remove_leakage are on.
+        flat.sort(key=lambda qi_node: (qi_node[0], tuple(qi_node[1])))
         idxs = rng.choice(len(flat), size=target, replace=False)
         kept = defaultdict(list)
         for i in sorted(idxs):
@@ -1249,7 +1256,7 @@ def get_featurizer(trainqs, valqs, testqs, eval_qs):
                 'max_in_degree', 'max_joins', 'max_out_degree', 'max_preds',
                 'max_tables', 'regex_cols', 'tables', 'join_key_stats',
                 'primary_join_keys', 'join_key_normalizers',
-                'join_key_stat_names', 'join_key_stat_tmps'
+                'join_key_stat_names', 'join_key_stat_tmps',
                 'max_tables', 'regex_cols', 'tables',
                 'mcvs']
 
@@ -1263,9 +1270,11 @@ def get_featurizer(trainqs, valqs, testqs, eval_qs):
             featdata[k] = attrvals
 
         if args.save_featstats:
-            f = open(featdata_fn, "w")
-            json.dumps(featdata, f)
-            f.close()
+            tmp_fn = featdata_fn + ".tmp"
+            with open(tmp_fn, "w") as f:
+                json.dump(featdata, f)
+            os.replace(tmp_fn, featdata_fn)
+            print("Saved featurizer db stats to:", featdata_fn)
     else:
         f = open(featdata_fn, "r")
         featdata = json.load(f)
@@ -1620,6 +1629,7 @@ def main():
                 result_dir=args.result_dir,
                 adv_weights=disc_weights,
                 adv_weight_level="dataset",
+                train_size=args.train_size,
                 subplan_mask=train_subplan_mask,
                 val_subplan_mask=val_subplan_mask,
                 test_subplan_mask=test_subplan_mask,
@@ -1639,6 +1649,7 @@ def main():
                 result_dir=args.result_dir,
                 adv_weights=disc_weights,
                 adv_weight_level="dataset",
+                train_size=args.train_size,
                 subplan_mask=train_subplan_mask,
                 val_subplan_mask=val_subplan_mask,
                 test_subplan_mask=test_subplan_mask,
@@ -1658,6 +1669,7 @@ def main():
                 result_dir=args.result_dir,
                 adv_weights=disc_weights,
                 adv_weight_level="dataset",
+                train_size=args.train_size,
                 subplan_mask=train_subplan_mask,
                 val_subplan_mask=val_subplan_mask,
                 test_subplan_mask=test_subplan_mask,
@@ -1671,6 +1683,7 @@ def main():
                     eval_qdirs = mscn_eval_qdirs, featurizer=featurizer,
                     result_dir=args.result_dir,
                     adv_weights=disc_weights, adv_weight_level="dataset",
+                    train_size=args.train_size,
                     subplan_mask=train_subplan_mask,
                     val_subplan_mask=val_subplan_mask,
                     test_subplan_mask=test_subplan_mask,
@@ -1691,6 +1704,7 @@ def main():
                 result_dir=args.result_dir,
                 adv_weights=disc_weights,
                 adv_weight_level="dataset",
+                train_size=args.train_size,
                 subplan_mask=train_subplan_mask,
                 val_subplan_mask=val_subplan_mask,
             )
@@ -1709,6 +1723,7 @@ def main():
                 result_dir=args.result_dir,
                 adv_weights=disc_weights,
                 adv_weight_level="dataset",
+                train_size=args.train_size,
                 subplan_mask=train_subplan_mask,
                 val_subplan_mask=val_subplan_mask,
             )
@@ -1727,6 +1742,7 @@ def main():
                 result_dir=args.result_dir,
                 adv_weights=disc_weights,
                 adv_weight_level="dataset",
+                train_size=args.train_size,
                 subplan_mask=train_subplan_mask,
                 val_subplan_mask=val_subplan_mask,
             )
@@ -1735,6 +1751,7 @@ def main():
                     eval_qdirs = mscn_eval_qdirs, featurizer=featurizer,
                     result_dir=args.result_dir,
                     adv_weights=disc_weights, adv_weight_level="dataset",
+                    train_size=args.train_size,
                     subplan_mask=train_subplan_mask,
                     val_subplan_mask=val_subplan_mask)
 

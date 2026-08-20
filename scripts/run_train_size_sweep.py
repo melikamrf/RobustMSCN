@@ -1,3 +1,6 @@
+""" TODO: Fix the summary,  Error: in ./results/train_size_sweep/original/frac_1/seed1, skipping in summary
+it should look in the model subdir and for cardinality_distributions_joblight.csv"""
+
 """
 Trains the model at several training-set sizes and summarizes the effect on
 accuracy, for either or both of the two train/val split options:
@@ -51,9 +54,11 @@ applied before the subsample, so they shrink the pool a fractional
   python scripts/run_train_size_sweep.py \
       --remove_duplicate_subqueries 1 --remove_leakage 1
 
-Re-summarize finished runs without retraining:
+To re-summarize finished runs without retraining, the arguments should be passed exactly as they were for the original sweep, 
+except for --summarize_only 1. For example:
 
-  python scripts/run_train_size_sweep.py --summarize_only ...
+  python scripts/run_train_size_sweep.py --summarize_only 1 --modes original \
+          --remove_duplicate_subqueries 1 --remove_leakage 1
 
 Anything after a bare `--` is forwarded verbatim to every main.py call,
 e.g. `-- --learn_residual 1`. Flags the sweep sets itself (see
@@ -81,12 +86,39 @@ MANAGED_FLAGS = {
     "--config", "--alg", "--eval_fns", "--result_dir",
     "--train_size", "--train_size_level", "--train_size_seed",
     "--random_seed", "--train_seed",
-    "--train_csv", "--eval_csv", "--use_csv_split_cache",
+    "--train_csv", "--eval_csv",
     "--remove_duplicate_subqueries", "--detect_leakage", "--remove_leakage",
 }
 
 
+def flag_given(flag):
+    """
+    Was @flag actually typed on the command line? Only looks before a bare
+    `--`, so args forwarded to main.py don't count as sweep flags.
+    """
+    argv = sys.argv[1:]
+    if "--" in argv:
+        argv = argv[:argv.index("--")]
+    return any(a == flag or a.startswith(flag + "=") for a in argv)
+
+
+# Flags that used to exist and no longer do. parse_known_args() would sweep
+# an old command line's copy into `passthrough` and forward it to main.py,
+# which dies with a bare "unrecognized arguments" -- explain it here instead.
+REMOVED_FLAGS = {
+    "--use_csv_split_cache":
+        "the CSV split cache was removed from main.py; the split is now "
+        "always computed fresh, so there is nothing to toggle. Drop this "
+        "flag from your command line.",
+}
+
+
 def check_passthrough(passthrough):
+    gone = sorted({tok for tok in passthrough if tok in REMOVED_FLAGS})
+    if gone:
+        raise ValueError("; ".join(
+            [f"{flag}: {REMOVED_FLAGS[flag]}" for flag in gone]))
+
     clashes = sorted({tok for tok in passthrough if tok in MANAGED_FLAGS})
     if clashes:
         raise ValueError(
@@ -191,8 +223,7 @@ def build_cmd(args, mode, size, train_size_seed, run_dir, passthrough):
         "--remove_leakage", str(args.remove_leakage),
     ]
     if mode == "csv":
-        cmd += ["--train_csv", args.train_csv, "--eval_csv", args.eval_csv,
-                "--use_csv_split_cache", str(args.use_csv_split_cache)]
+        cmd += ["--train_csv", args.train_csv, "--eval_csv", args.eval_csv]
     cmd += passthrough
     return cmd
 
@@ -372,6 +403,34 @@ def main():
         if not os.path.exists(os.path.join(REPO_ROOT, config)):
             raise ValueError(f"config for mode {mode!r} not found: {config}")
 
+    # --modes decides WHICH config flag is read (orig_config vs csv_config),
+    # so a config passed for a mode that is not selected is silently ignored,
+    # and the selected mode quietly falls back to its own default config --
+    # swapping query_dir/max_epochs out from under the experiment without a
+    # word. Say what each mode resolved to, and refuse the ignored-config case.
+    for mode in modes:
+        chosen = args.orig_config if mode == "original" else args.csv_config
+        print(f"[{mode}] config: {chosen}")
+
+    for unused_mode, flag, dest in (("csv", "--csv_config", "csv_config"),
+                                    ("original", "--orig_config", "orig_config")):
+        if unused_mode in modes:
+            continue
+        # Scan argv rather than comparing against the parser default: the
+        # whole point is to catch someone passing a config for the mode they
+        # didn't select, and that config is very often exactly the default
+        # value, which a default-comparison can't see.
+        if not flag_given(flag):
+            continue
+        other = "--orig_config" if unused_mode == "csv" else "--csv_config"
+        raise ValueError(
+            f"{flag}={getattr(args, dest)!r} was given, but mode "
+            f"{unused_mode!r} is not in --modes={args.modes!r}. That config "
+            f"would be silently ignored and the selected mode(s) would run "
+            f"with a different config (different query_dir / max_epochs / "
+            f"eval set). Either add {unused_mode!r} to --modes, or pass the "
+            f"config you actually want as {other}.")
+
     sizes = parse_sizes(args.sizes)
     seeds = parse_seeds(args.train_size_seeds)
     os.makedirs(args.result_root, exist_ok=True)
@@ -469,10 +528,6 @@ def read_flags():
             help="Subquery-level train-pool CSV (required for mode csv)")
     parser.add_argument("--eval_csv", type=str, default=None,
             help="Subquery-level held-out eval CSV (required for mode csv)")
-    parser.add_argument("--use_csv_split_cache", type=int, default=1,
-            help="Passed through to main.py; the cache makes repeated runs "
-                 "over the same CSVs much faster, so keep it at 1")
-
     parser.add_argument("--alg", type=str, default="mscn")
     parser.add_argument("--eval_fns", type=str, default="qerr",
             help="Passed to main.py. Default qerr only: plan-cost eval "

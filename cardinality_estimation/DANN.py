@@ -159,6 +159,7 @@ def train_one_epoch_dann(self, target_loader):
 
         # Both optimizers are stepped from the same backward pass.
         self.opt_regression.step()
+        self.total_grad_steps += 1
         self.opt_discriminator.step()
 
         # ── Metrics (no_grad) ──────────────────────────────────────────────
