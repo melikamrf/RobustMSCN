@@ -504,24 +504,51 @@ def _assert_csv_matched_something(csv_path, query_dir, rows_df, path_index, matc
     )
 
 
-def load_eval_set_from_csv(csv_path, query_dir):
-    """
-    Loads a subquery-level eval CSV (template,join_tables,predicates,...)
-    entirely as one held-out eval split -- no further train/val/test split.
-    Returns (qreps, subplan_mask) ready to become evalqs/eval_qdirs.
-    """
-    rows_df = pd.read_csv(csv_path)
-    path_index = _index_query_dir_by_basename(query_dir)
-    matches = _match_csv_rows_to_nodes(rows_df, path_index)
-    _assert_csv_matched_something(csv_path, query_dir, rows_df, path_index, matches)
-
+def _matches_to_qreps_mask(matches):
     qreps = []
     subplan_mask = []
     for qrep, nodes in matches.values():
         qreps.append(qrep)
         subplan_mask.append([list(node) for node in dict.fromkeys(nodes)])
-
     return qreps, subplan_mask
+
+
+def load_eval_set_from_csv(csv_path, query_dir):
+    """
+    Loads a subquery-level eval CSV (template,join_tables,predicates,...) as
+    held-out eval group(s) -- no further train/val/test split.
+
+    If the CSV has a `seen_or_unseen` column (GRASP's test CSV does), its rows
+    are split into two independent groups, "eval_seen" and "eval_unseen", so
+    each gets its own per-epoch q-error curve (the label is per-subquery, not
+    per-file: the same .pkl can contribute seen subplans to one group and
+    unseen subplans to the other). Otherwise a single "eval" group is used.
+
+    Returns [(label, qreps, subplan_mask), ...].
+    """
+    rows_df = pd.read_csv(csv_path)
+    path_index = _index_query_dir_by_basename(query_dir)
+
+    groups = []
+    if "seen_or_unseen" in rows_df.columns:
+        for label in ("seen", "unseen"):
+            sub_df = rows_df[rows_df["seen_or_unseen"] == label]
+            if len(sub_df) == 0:
+                continue
+            matches = _match_csv_rows_to_nodes(sub_df, path_index)
+            qreps, mask = _matches_to_qreps_mask(matches)
+            if qreps:
+                groups.append(("eval_" + label, qreps, mask))
+        if not groups:
+            # nothing matched at all -> raise the actionable query_dir error
+            _assert_csv_matched_something(csv_path, query_dir, rows_df, path_index, {})
+    else:
+        matches = _match_csv_rows_to_nodes(rows_df, path_index)
+        _assert_csv_matched_something(csv_path, query_dir, rows_df, path_index, matches)
+        qreps, mask = _matches_to_qreps_mask(matches)
+        groups.append(("eval", qreps, mask))
+
+    return groups
 
 
 def load_train_pool_from_csv(csv_path, query_dir, val_size, test_size, seed):
@@ -588,14 +615,14 @@ def load_csv_split_data(train_csv, eval_csv, query_dir, val_size, test_size, see
     """
     Matches the train/eval CSVs to subplan nodes and builds the split.
     Returns (trainqs, train_mask, valqs, val_mask, testqs, test_mask,
-    eval_qreps, eval_mask).
+    eval_groups), where eval_groups is [(label, qreps, mask), ...] (split into
+    eval_seen/eval_unseen when the eval CSV carries a seen_or_unseen column).
     """
     trainqs, train_mask, valqs, val_mask, testqs, test_mask = \
             load_train_pool_from_csv(train_csv, query_dir, val_size, test_size, seed)
-    eval_qreps, eval_mask = load_eval_set_from_csv(eval_csv, query_dir)
+    eval_groups = load_eval_set_from_csv(eval_csv, query_dir)
 
-    return (trainqs, train_mask, valqs, val_mask, testqs, test_mask,
-            eval_qreps, eval_mask)
+    return (trainqs, train_mask, valqs, val_mask, testqs, test_mask, eval_groups)
 
 
 def remove_duplicate_subqueries(qreps, split_name="split"):
@@ -1388,7 +1415,7 @@ def main():
     # filtering" (the original, possibly-duplicated/leaky data).
     if args.train_csv and args.eval_csv:
         trainqs, train_subplan_mask, valqs, val_subplan_mask, \
-                testqs, test_subplan_mask, csv_eval_qreps, csv_eval_subplan_mask = \
+                testqs, test_subplan_mask, csv_eval_groups = \
                 load_csv_split_data(
                         args.train_csv, args.eval_csv, cfg["data"]["query_dir"],
                         cfg["data"]["val_size"], cfg["data"]["test_size"],
@@ -1447,17 +1474,21 @@ def main():
         testqs = update_labels(testqs)
     
     if args.train_csv and args.eval_csv:
-        eval_qreps, eval_subplan_mask = csv_eval_qreps, csv_eval_subplan_mask
-        # Short, fixed label (not the raw CSV basename): save_subquery_split_
-        # dataframes() builds this split's filename as f"{label}_{label}.csv"
-        # (main.py, save_subquery_split_dataframes), so a long/comma-laden
-        # CSV filename doubled can exceed Windows' path length limit.
-        eval_qdirs = ["eval"]
-        if args.learn_residual:
-            eval_qreps = update_labels(eval_qreps)
-        evalqs = [eval_qreps]
+        # One eval group per (label, qreps, mask) from the eval CSV. With a
+        # seen_or_unseen column this is [eval_seen, eval_unseen], so each gets
+        # its own per-epoch q-error curve; the short labels also keep
+        # save_subquery_split_dataframes' f"{label}_{label}.csv" filenames
+        # well within Windows' path length limit.
+        eval_qdirs = [label for label, _, _ in csv_eval_groups]
+        evalqs = []
+        eval_masks = []
+        for _, group_qreps, group_mask in csv_eval_groups:
+            if args.learn_residual:
+                group_qreps = update_labels(group_qreps)
+            evalqs.append(group_qreps)
+            eval_masks.append(group_mask)
     else:
-        eval_subplan_mask = None
+        eval_masks = None
         eval_qdirs = cfg["data"]["eval_query_dir"].split(",")
 
         evalqs = []
@@ -1469,14 +1500,10 @@ def main():
             evalqs.append(temp_evalqs)
 
     eqs = [len(eq) for eq in evalqs]
-    print("""Selected Queries: {} train, {} test, {} val, {} eval"""\
-            .format(len(trainqs), len(testqs), len(valqs), sum(eqs)))
-
-    # Per-split subplan masks (from --train_csv/--eval_csv, and/or
-    # --remove_duplicate_subqueries/--remove_leakage) restrict the reporting
-    # helpers to the subqueries actually used in each split. eval_masks is a
-    # list aligned with evalqs.
-    eval_masks = [eval_subplan_mask] if eval_subplan_mask is not None else None
+    eval_summary = ", ".join("{}={}".format(name or "eval", n)
+            for name, n in zip(eval_qdirs, eqs)) or "none"
+    print("Selected Queries: {} train, {} test, {} val | eval: {}".format(
+            len(trainqs), len(testqs), len(valqs), eval_summary))
 
     save_split_sizes(
         args.result_dir,
@@ -1788,12 +1815,15 @@ def main():
             if not eval_dir_name:
                 eval_dir_name = f"eval_{ei}"
 
-            # eval_subplan_mask (from --eval_csv) is only positionally valid
+            # eval_masks[ei] (from --eval_csv) is only positionally valid
             # against evalqs itself; if the discriminator holdout path
             # (prepare_discriminator_weights) resampled it into
             # heldout_evalqs, mscn_evalqs is no longer evalqs and we can't
-            # line the mask back up, so it's skipped in that case.
-            evalq_mask = eval_subplan_mask if (ei == 0 and mscn_evalqs is evalqs) else None
+            # line the masks back up, so they're skipped in that case.
+            if mscn_evalqs is evalqs and eval_masks is not None and ei < len(eval_masks):
+                evalq_mask = eval_masks[ei]
+            else:
+                evalq_mask = None
             if args.remove_duplicate_subqueries:
                 dedup_mask, _ = remove_duplicate_subqueries(evalq, split_name=eval_dir_name)
                 evalq_mask = _intersect_masks(evalq, evalq_mask, dedup_mask)
