@@ -1,6 +1,3 @@
-""" TODO: Fix the summary,  Error: in ./results/train_size_sweep/original/frac_1/seed1, skipping in summary
-it should look in the model subdir and for cardinality_distributions_joblight.csv"""
-
 """
 Trains the model at several training-set sizes and summarizes the effect on
 accuracy, for either or both of the two train/val split options:

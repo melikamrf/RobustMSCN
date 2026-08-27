@@ -840,44 +840,59 @@ def prepare_discriminator_weights(trainqs, evalqs, eval_qdirs, featurizer,
     disc_weights = disc_result["source_density_ratios"]
     return disc_weights, mscn_evalqs, mscn_eval_qdirs
 
-def extract_cardinalities(qreps, ests):
+def extract_cardinalities(qreps, ests, subplan_mask=None):
     """
-    Extract true, postgres estimated, model estimated cardinalities, and q-error.
+    Extract cardinalities for the subplans that were actually evaluated.
+
+    ``alg.test(..., subplan_mask=...)`` returns estimates only for the masked
+    nodes.  The qreps themselves still retain their complete subset graphs, so
+    iterating those graphs here would emit one row per *unselected* subplan
+    with an empty model estimate.  Use the same mask for reporting; without a
+    mask, use the estimate keys, which also excludes SOURCE_NODE.
     """
     card_data = []
-    
-    for idx, (qrep, est) in enumerate(zip(qreps, ests)):
-        # Access subset_graph nodes (this is where cardinalities are stored)
-        if "subset_graph" in qrep:
-            sg = qrep["subset_graph"]
-            for node, data in sg.nodes(data=True):
-            
-                true_card = data["cardinality"]["actual"]
-                postgres_card = data["cardinality"]["expected"]
-                model_card = est[node] if node in est else None
 
-                if model_card is not None and true_card not in (None, 0) and model_card != 0:
-                    qerror = np.maximum((true_card / model_card), (model_card / true_card))
-                else:
-                    qerror = np.nan
-                
-                # Calculate the ratio to verify update_labels was applied
-                # If update_labels was applied: new_actual = old_actual / old_expected
-                # So the ratio should reflect the updated value
-                ratio = true_card / postgres_card if postgres_card > 0 else None
-                
-                card_data.append({
-                    "name": qrep.get("name", f"query_{idx}"),
-                    "node": node,
-                    "true_cardinality": true_card,
-                    "postgres_estimated": postgres_card,
-                    "model_estimated": model_card,  # Model estimates the root query
-                    "qerror": qerror,
-                    "actual_expected_ratio": ratio,
-                    # Add original values before update if available
-                    "is_ratio_close_to_1": abs(ratio - 1.0) < 0.01 if ratio else False
-                })
-    
+    for idx, (qrep, est) in enumerate(zip(qreps, ests)):
+        if "subset_graph" not in qrep:
+            continue
+
+        sg = qrep["subset_graph"]
+        if subplan_mask is not None and idx < len(subplan_mask):
+            nodes = (tuple(node) for node in subplan_mask[idx])
+        else:
+            nodes = est.keys()
+
+        for node in nodes:
+            if node == SOURCE_NODE or node not in sg:
+                continue
+
+            data = sg.nodes[node]
+            true_card = data["cardinality"]["actual"]
+            postgres_card = data["cardinality"]["expected"]
+            model_card = est.get(node)
+
+            if model_card is not None and true_card not in (None, 0) and model_card != 0:
+                qerror = np.maximum((true_card / model_card), (model_card / true_card))
+            else:
+                qerror = np.nan
+
+            # Calculate the ratio to verify update_labels was applied
+            # If update_labels was applied: new_actual = old_actual / old_expected
+            # So the ratio should reflect the updated value
+            ratio = true_card / postgres_card if postgres_card > 0 else None
+
+            card_data.append({
+                "name": qrep.get("name", f"query_{idx}"),
+                "node": node,
+                "true_cardinality": true_card,
+                "postgres_estimated": postgres_card,
+                "model_estimated": model_card,
+                "qerror": qerror,
+                "actual_expected_ratio": ratio,
+                # Add original values before update if available
+                "is_ratio_close_to_1": abs(ratio - 1.0) < 0.01 if ratio else False
+            })
+
     return pd.DataFrame(card_data)
 
 def undersample_train_queries(trainqs, eqs, seed=None):
@@ -1210,7 +1225,7 @@ def eval_alg(alg, eval_funcs, qreps, cfg,
         with open(args_fn, 'w', encoding='utf-8') as f:
             json.dump(cfg, f, ensure_ascii=False, indent=4)
             
-    df = extract_cardinalities(qreps, ests)
+    df = extract_cardinalities(qreps, ests, subplan_mask=subplan_mask)
     card_path = os.path.join(args.result_dir, exp_name, f"cardinality_distributions_{samples_label}.csv")
     df.to_csv(card_path, index=False)
     print(f"Saved {len(df)} query cardinalities to CSV")
