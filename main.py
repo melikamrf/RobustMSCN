@@ -235,11 +235,9 @@ def _build_subquery_level_dataframe(qreps, allowed_nodes_per_qrep=None):
         allowed = None
         if allowed_nodes_per_qrep is not None and qi < len(allowed_nodes_per_qrep):
             allowed = allowed_nodes_per_qrep[qi]
-        for subquery_row in extract_subquery_rows(qrep, num_joins=None):
+        for subquery_row in extract_subquery_rows(qrep, num_joins=None, restrict_to=allowed):
             subquery_id = subquery_row["subquery_id"]
             if not subquery_id:
-                continue
-            if allowed is not None and subquery_id not in allowed:
                 continue
             card_info = subset_graph.nodes()[subquery_id].get("cardinality", {})
             rows.append({
@@ -314,15 +312,24 @@ def save_subquery_split_dataframes(trainqs, valqs, testqs, evalqs, eval_qdirs, r
     return saved_paths
 
 
-def _qrep_subquery_signatures(qrep):
+def _qrep_subquery_signatures(qrep, allowed_nodes=None):
     """
     Maps each subquery node (subset_graph node) in qrep to a hashable
     signature of its (tables, joins, predicates) -- two subqueries with the
     same signature are the same subquery, regardless of which top-level
     query/pkl file they came from.
+
+    @allowed_nodes: optional set of node tuples to restrict to (see
+    extract_subquery_rows's restrict_to) -- pass the split's existing
+    subplan_mask (converted via _mask_to_allowed_sets) whenever qrep's
+    subset_graph can contain more nodes than are actually selected for
+    this split, e.g. --train_csv/--eval_csv row-level splitting. Without
+    it, duplicate/leakage detection would scan every combinatorial
+    subplan of the template instead of just the ones in use, wildly
+    over-counting both.
     """
     sigs = {}
-    for row in extract_subquery_rows(qrep, num_joins=None):
+    for row in extract_subquery_rows(qrep, num_joins=None, restrict_to=allowed_nodes):
         sigs[row["subquery_id"]] = (
             tuple(row["tables"]),
             tuple(row["joins"]),
@@ -625,7 +632,7 @@ def load_csv_split_data(train_csv, eval_csv, query_dir, val_size, test_size, see
     return (trainqs, train_mask, valqs, val_mask, testqs, test_mask, eval_groups)
 
 
-def remove_duplicate_subqueries(qreps, split_name="split"):
+def remove_duplicate_subqueries(qreps, split_name="split", allowed_mask=None):
     """
     Computes a subplan_mask (see QueryDataset/cardinality_estimation's
     train() methods) that keeps only the first occurrence -- by qrep
@@ -640,16 +647,28 @@ def remove_duplicate_subqueries(qreps, split_name="split"):
     regardless of what this mask excludes elsewhere in the same graph.
     Only which nodes get turned into dataset rows is affected.
 
+    @allowed_mask: optional pre-existing subplan_mask restricting which
+    nodes of each qrep are actually "in" this split already (e.g. from
+    --train_csv/--eval_csv row-level loading, where the same template's
+    complete, un-split subset_graph is shared across splits and only
+    specific rows/nodes belong to any given split). When given, duplicate
+    detection only considers those nodes instead of a qrep's full
+    subset_graph -- without it, this would scan every combinatorial
+    subplan of the template, wildly over-counting duplicates that were
+    never actually selected into any split to begin with.
+
     Returns (mask, num_excluded): mask is a list, same length/order as
     qreps, of lists of `list(node)` -- pass it as `subplan_mask` (train),
     `val_subplan_mask`, or `test_subplan_mask` to alg.train()/
     train_with_dann()/train_with_new_discriminator().
     """
+    allowed_sets = _mask_to_allowed_sets(allowed_mask)
     seen = {}
     excluded_by_qrep = defaultdict(set)
     num_excluded = 0
     for qi, qrep in enumerate(qreps):
-        for subquery_id, sig in _qrep_subquery_signatures(qrep).items():
+        allowed = allowed_sets[qi] if allowed_sets is not None and qi < len(allowed_sets) else None
+        for subquery_id, sig in _qrep_subquery_signatures(qrep, allowed_nodes=allowed).items():
             if sig in seen:
                 excluded_by_qrep[qi].add(subquery_id)
                 num_excluded += 1
@@ -665,7 +684,7 @@ def remove_duplicate_subqueries(qreps, split_name="split"):
     return mask, num_excluded
 
 
-def detect_leakage(named_splits, remove=False, priority=None):
+def detect_leakage(named_splits, remove=False, priority=None, allowed_masks=None):
     """
     @named_splits: [(split_name, qreps), ...], e.g.
         [("train", trainqs), ("val", valqs), ("test", testqs)]
@@ -680,6 +699,16 @@ def detect_leakage(named_splits, remove=False, priority=None):
     remove_duplicate_subqueries -- only which nodes get turned into
     dataset rows is affected.
 
+    @allowed_masks: optional {split_name: subplan_mask or None}
+    restricting which nodes of each split's qreps are actually eligible
+    already (see remove_duplicate_subqueries's allowed_mask for why this
+    matters, e.g. --train_csv/--eval_csv row-level splitting). Without
+    it, splits that share the same underlying template qreps (just
+    different rows/nodes selected per split) would appear to leak
+    almost entirely into each other, since their *complete* subset_graphs
+    are identical regardless of which specific rows each split actually
+    uses.
+
     Returns (report, masks): report is a dict with leaked signature
     counts and pairwise overlap counts; masks is {split_name: mask or
     None} (None meaning "no filtering needed for this split").
@@ -688,12 +717,15 @@ def detect_leakage(named_splits, remove=False, priority=None):
     if priority is None:
         priority = split_names
     priority_rank = {name: i for i, name in enumerate(priority)}
+    allowed_masks = allowed_masks or {}
 
     # signature -> {split_name: [(qrep_idx, subquery_id), ...]}
     sig_to_splits = defaultdict(lambda: defaultdict(list))
     for split_name, qreps in named_splits:
+        allowed_sets = _mask_to_allowed_sets(allowed_masks.get(split_name))
         for qi, qrep in enumerate(qreps):
-            for subquery_id, sig in _qrep_subquery_signatures(qrep).items():
+            allowed = allowed_sets[qi] if allowed_sets is not None and qi < len(allowed_sets) else None
+            for subquery_id, sig in _qrep_subquery_signatures(qrep, allowed_nodes=allowed).items():
                 sig_to_splits[sig][split_name].append((qi, subquery_id))
 
     overlap_counts = Counter()
@@ -1451,18 +1483,35 @@ def main():
         # Compose onto (not overwrite) whatever train/val/test_subplan_mask
         # were initialized to above -- in --train_csv/--eval_csv mode those
         # already restrict samples to the CSV-selected subqueries, and
-        # deduping must narrow that further rather than replace it.
-        dedup_train_mask, _ = remove_duplicate_subqueries(trainqs, split_name="train")
-        dedup_val_mask, _ = remove_duplicate_subqueries(valqs, split_name="val")
-        dedup_test_mask, _ = remove_duplicate_subqueries(testqs, split_name="test")
+        # deduping must narrow that further rather than replace it. Passing
+        # them in as allowed_mask also makes duplicate detection itself only
+        # consider those already-selected nodes, not every combinatorial
+        # subplan of the underlying template (see remove_duplicate_subqueries
+        # docstring -- without this, CSV row-level splitting massively
+        # over-counts duplicates since a qrep's subset_graph is the
+        # template's full, un-split one).
+        dedup_train_mask, _ = remove_duplicate_subqueries(trainqs, split_name="train",
+                allowed_mask=train_subplan_mask)
+        dedup_val_mask, _ = remove_duplicate_subqueries(valqs, split_name="val",
+                allowed_mask=val_subplan_mask)
+        dedup_test_mask, _ = remove_duplicate_subqueries(testqs, split_name="test",
+                allowed_mask=test_subplan_mask)
         train_subplan_mask = _intersect_masks(trainqs, train_subplan_mask, dedup_train_mask)
         val_subplan_mask = _intersect_masks(valqs, val_subplan_mask, dedup_val_mask)
         test_subplan_mask = _intersect_masks(testqs, test_subplan_mask, dedup_test_mask)
 
     if args.remove_leakage or args.detect_leakage:
+        # Same reasoning as above: restrict leakage scanning to whatever
+        # each split's mask already narrowed it to (CSV selection, and/or
+        # the dedup pass just above), not each qrep's full subset_graph.
         _, leakage_masks = detect_leakage(
                 [("train", trainqs), ("val", valqs), ("test", testqs)],
-                remove=bool(args.remove_leakage))
+                remove=bool(args.remove_leakage),
+                allowed_masks={
+                    "train": train_subplan_mask,
+                    "val": val_subplan_mask,
+                    "test": test_subplan_mask,
+                })
         if args.remove_leakage:
             train_subplan_mask = _intersect_masks(trainqs, train_subplan_mask,
                     leakage_masks.get("train"))
@@ -1840,7 +1889,13 @@ def main():
             else:
                 evalq_mask = None
             if args.remove_duplicate_subqueries:
-                dedup_mask, _ = remove_duplicate_subqueries(evalq, split_name=eval_dir_name)
+                # allowed_mask=evalq_mask: restrict duplicate detection to
+                # whatever this eval group's rows already are (from
+                # --eval_csv), not the underlying template's full
+                # subset_graph -- same reasoning as the train/val/test
+                # dedup calls above.
+                dedup_mask, _ = remove_duplicate_subqueries(evalq, split_name=eval_dir_name,
+                        allowed_mask=evalq_mask)
                 evalq_mask = _intersect_masks(evalq, evalq_mask, dedup_mask)
 
             eval_alg(alg, eval_fns, evalq, cfg, eval_dir_name, featurizer=featurizer,

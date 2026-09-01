@@ -135,7 +135,19 @@ def build_predicate_tuple(alias_hint, pred_col, pred_type, pred_val, pred_str):
     return (alias, col, op, value)
 
 
-def extract_subquery_rows(qrep, num_joins=None):
+def extract_subquery_rows(qrep, num_joins=None, restrict_to=None):
+    '''
+    @restrict_to: optional set of subquery_id tuples. When given, only
+    those subset_graph nodes are processed -- everything else is skipped
+    before any of the (relatively expensive) join/predicate extraction
+    below runs. Needed whenever a qrep's subset_graph is bigger than what
+    was actually selected for the split it's in (e.g. --train_csv/
+    --eval_csv row-level splitting: the same template's full,
+    un-split subset_graph is shared across splits, only specific rows/
+    nodes are "in" any given split) -- without it, callers would compute
+    over every combinatorial subplan of the template, not just the ones
+    actually in use.
+    '''
 
     join_graph = qrep["join_graph"]
     subset_graph = qrep["subset_graph"]
@@ -144,6 +156,8 @@ def extract_subquery_rows(qrep, num_joins=None):
     joins = []
     for subquery_id in subset_graph.nodes():
         if not subquery_id:
+            continue
+        if restrict_to is not None and subquery_id not in restrict_to:
             continue
         tables = canonicalize_tables(subquery_id)
 
