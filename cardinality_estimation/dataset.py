@@ -102,6 +102,12 @@ def mscn_collate_fn(data):
 
     return data,ys,infos
 
+# Featurizer attributes left out of the saved-feature hash: they only matter
+# when scoring an unseen workload (Featurizer.prepare_for_unseen_workload),
+# which never uses saved features, and leaving them out keeps the hashes of
+# feature directories saved before they existed unchanged.
+_FEATHASH_SKIP_ATTRS = {"frozen_vocab", "join_bitmap_table_slots"}
+
 def _handle_set_padding(features, max_set_vals):
 
     if len(features) == 0:
@@ -220,6 +226,8 @@ class QueryDataset(data.Dataset):
             fkeys.sort()
             attrs = ""
             for k in fkeys:
+                if k in _FEATHASH_SKIP_ATTRS:
+                    continue
                 attrvals = getattr(featurizer, k)
                 if not hasattr(attrvals, "__len__") and \
                     "method" not in str(attrvals):
@@ -232,10 +240,9 @@ class QueryDataset(data.Dataset):
             if os.path.exists(self.featdir):
                 print("features saved before")
                 if not self.featurizer.use_saved_feats:
-                    print("going to delete feature directory, and save again")
-                    # delete these and save again
-                    self.save_mscn_feats = True
-                    os.remove(self.featdir)
+                    # This used to os.remove() the directory, which always
+                    # raised; now the saved features are just not used.
+                    print("use_saved_feats is off: not using the saved features")
             else:
                 print("Features not saved before.")
 

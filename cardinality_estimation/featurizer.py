@@ -385,6 +385,65 @@ class Featurizer():
         self.max_preds = 0
         self.max_pred_vals = 0
 
+        # True once prepare_for_unseen_workload() ran: the feature layout is
+        # fixed by the trained model, and tables / joins / operators outside it
+        # are left out instead of stopping the run.
+        self.frozen_vocab = False
+
+    def prepare_for_unseen_workload(self, qreps):
+        '''
+        Lets an already set up featurizer (and a model trained with it) score
+        queries from a workload that was not part of its vocabulary, e.g. CEB
+        or JOB for a model built on JOB-light. The feature layout, and so every
+        feature length the network was built with, stays exactly the same:
+
+        - aliases the new workload uses are mapped to their real tables, so
+          join strings resolve (aliases do not size any feature here);
+        - tables, joins, columns and comparison operators without a slot are
+          left out, which is what the model sees for a masked one-hot;
+        - max_tables / max_preds / max_pred_vals grow to fit the new queries.
+          Those only size the padding of the MSCN sets, which the masked
+          pooling ignores; the join bitmap layout uses join_bitmap_table_slots.
+
+        Call this only after init_feature_mapping(), and only for evaluation.
+        '''
+        assert hasattr(self, "table_featurizer"), \
+                "call prepare_for_unseen_workload after init_feature_mapping"
+        lens_before = (self.table_features_len, self.join_features_len,
+                self.max_pred_len)
+        self.frozen_vocab = True
+
+        new_aliases = set()
+        for qrep in qreps:
+            for node, info in qrep["join_graph"].nodes(data=True):
+                for alias in (node, "".join(ch for ch in node if not ch.isdigit())):
+                    if alias not in self.aliases:
+                        self.aliases[alias] = info["real_name"]
+                        new_aliases.add(alias)
+
+        unseen_tables = set()
+        unseen_ops = set()
+        for qrep in qreps:
+            for node, info in qrep["join_graph"].nodes(data=True):
+                if info["real_name"] not in self.table_featurizer:
+                    unseen_tables.add(info["real_name"])
+                for cmp_op in info.get("pred_types", []):
+                    if cmp_op not in self.cmp_ops_onehot:
+                        unseen_ops.add(cmp_op)
+
+        padding_before = (self.max_tables, self.max_preds, self.max_pred_vals,
+                self.max_joins)
+        self.update_max_sets(qreps)
+
+        assert lens_before == (self.table_features_len, self.join_features_len,
+                self.max_pred_len), "feature lengths must not change"
+        print("Unseen workload: {} new aliases, tables without a slot: {}, "
+                "operators without a slot: {}".format(len(new_aliases),
+                    sorted(unseen_tables), sorted(unseen_ops)))
+        print("Set padding (tables, preds, pred vals, joins): {} -> {}".format(
+            padding_before, (self.max_tables, self.max_preds,
+                self.max_pred_vals, self.max_joins)))
+
     def update_workload_means(self, qreps):
         '''
         this is called for a particular set of samples; calculate mean / std of
@@ -1236,10 +1295,16 @@ class Featurizer():
 
         self.join_features_len = 0
 
+        # Width of the "#tables on this join column" one-hot inside each join
+        # bitmap feature. Pinned here, because max_tables itself can grow later
+        # (prepare_for_unseen_workload raises it for set padding) and the
+        # feature layout must not move when it does.
+        self.join_bitmap_table_slots = self.max_tables
+
         if self.join_bitmap:
             bitmap_feat_len = 0
             # for #tables in the join
-            bitmap_feat_len += self.max_tables
+            bitmap_feat_len += self.join_bitmap_table_slots
             # for which tables are there
             bitmap_feat_len += len(self.tables)
 
@@ -1825,15 +1890,24 @@ class Featurizer():
 
             cur_idx = 0
             features = np.zeros(self.join_features_len)
+            table_slots = getattr(self, "join_bitmap_table_slots", self.max_tables)
             # num tables
             alltabs = real_join_tabs[rc]
             nt_idx = len(alltabs)-1
+            if self.frozen_vocab:
+                # a query from an unseen workload can join more tables on one
+                # column than any training query did; use the last slot
+                # instead of writing into the table one-hot that follows
+                nt_idx = min(len(alltabs), table_slots) - 1
             features[cur_idx + nt_idx] = 1.0
-            cur_idx += self.max_tables
+            cur_idx += table_slots
 
             # which tables
             for table in alltabs:
                 if table not in self.table_featurizer:
+                    if self.frozen_vocab:
+                        # no slot for this table in the trained model
+                        continue
                     print("table: {} not found in featurizer".format(table))
                     pdb.set_trace()
                     continue
@@ -2014,6 +2088,10 @@ class Featurizer():
         if cmp_op in self.cmp_ops_onehot:
             cmp_idx = self.cmp_ops_onehot[cmp_op]
             pfeats[cmp_start + cmp_idx] = 1.00
+        elif self.frozen_vocab:
+            # operator the trained model has no slot for: leave it zero,
+            # the same as a masked one-hot
+            pass
         else:
             assert False
 
@@ -3012,13 +3090,17 @@ class Featurizer():
 
             column_stats = {}
             if table in self.aliases:
+                # ALIAS_FORMAT already yields a properly-quoted table
+                # expression (e.g. "title" AS t). The stats templates below
+                # all use bare `FROM {TABLE}`, so wrapping it in another pair
+                # of quotes here produced FROM " "title" AS t " and made every
+                # min/max/count query fail (falling back to a garbage 1e6
+                # stat). Leave `table` as ALIAS_FORMAT produced it.
                 table = ALIAS_FORMAT.format(TABLE = self.aliases[table],
                                     ALIAS = table)
             else:
                 print(table)
                 pdb.set_trace()
-
-            table = '"' + table + '"'
 
             csplit_idx = column.find(".")
             column = column[0:csplit_idx+1] + '"' + column[csplit_idx+1:]+'"'

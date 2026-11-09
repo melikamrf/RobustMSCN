@@ -1846,15 +1846,16 @@ def main():
                     subplan_mask=train_subplan_mask,
                     val_subplan_mask=val_subplan_mask)
 
-    start_time = time.time()
-    # subplan_mask here is the same mask actually used for training, so
-    # the reported train QError reflects the same (deduped/leakage-
-    # cleaned) subqueries the model was trained on, not the full,
-    # possibly-duplicated set.
-    eval_alg(alg, eval_fns, trainqs, cfg, "train", featurizer=featurizer,
-            subplan_mask=train_subplan_mask)
-    execution_time = time.time() - start_time
-    print(f"{args.alg} Evaluation time on train set: {execution_time:.2f} seconds")
+    if not args.skip_train_eval:
+        start_time = time.time()
+        # subplan_mask here is the same mask actually used for training, so
+        # the reported train QError reflects the same (deduped/leakage-
+        # cleaned) subqueries the model was trained on, not the full,
+        # possibly-duplicated set.
+        eval_alg(alg, eval_fns, trainqs, cfg, "train", featurizer=featurizer,
+                subplan_mask=train_subplan_mask)
+        execution_time = time.time() - start_time
+        print(f"{args.alg} Evaluation time on train set: {execution_time:.2f} seconds")
 
     # if len(valqs) > 0:
     #     start_time = time.time()
@@ -1904,6 +1905,52 @@ def main():
             print(f"Evaluation time on held-out eval set {ei}: {execution_time:.2f} seconds")
             del evalq[:]
 
+    if args.extra_eval_query_dir:
+        eval_extra_workloads(alg, eval_fns, featurizer)
+
+
+def eval_extra_workloads(alg, eval_fns, featurizer):
+    '''
+    --extra_eval_query_dir: score the (trained or loaded) model on workloads
+    that were not part of the run. They are loaded only now, after the
+    featurizer and the model exist, so they cannot change the featurizer's
+    vocabulary or feature lengths: the run's train/val/test/eval data and the
+    model are exactly what they would be without this flag. Whatever the new
+    workload has outside that vocabulary is left out of its features (see
+    Featurizer.prepare_for_unseen_workload).
+    '''
+    data_params = dict(cfg["data"])
+    data_params["eval_query_dir"] = args.extra_eval_query_dir
+    data_params["eval_templates"] = args.extra_eval_templates
+    # same query selection as eval_query_dir (e.g. the CEB runtime subset)
+    _, _, _, extra_qfns = get_query_splits(data_params)
+
+    # saved features are keyed on the featurizer's scalar settings only, not
+    # on its vocabulary or its train-only stats, so a file saved by a
+    # different run could be picked up here; featurize from scratch
+    featurizer.use_saved_feats = False
+
+    for qdir, qfns in zip(args.extra_eval_query_dir.split(","), extra_qfns):
+        name = os.path.basename(os.path.normpath(qdir))
+        start_time = time.time()
+        qreps = load_qdata(qfns)
+        if len(qreps) == 0:
+            print(f"Extra eval set {name}: no queries loaded from {qdir}, skipping")
+            continue
+        if args.learn_residual:
+            qreps = update_labels(qreps)
+        featurizer.prepare_for_unseen_workload(qreps)
+
+        qmask = None
+        if args.remove_duplicate_subqueries:
+            qmask, _ = remove_duplicate_subqueries(qreps, split_name=name)
+        print(f"Extra eval set {name}: {len(qreps)} queries from {qdir}")
+        eval_alg(alg, eval_fns, qreps, cfg, name, featurizer=featurizer,
+                subplan_mask=qmask)
+        print(f"Evaluation time on extra eval set {name}: "
+                f"{time.time() - start_time:.2f} seconds")
+        del qreps[:]
+
 def read_flags():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, required=False,
@@ -1932,6 +1979,18 @@ def read_flags():
     parser.add_argument("--load_model", type=str, required=False,
             default=None,
             help="If specified, load the model from the given path")
+    parser.add_argument("--extra_eval_query_dir", type=str, required=False,
+            default=None,
+            help="Comma-separated query dirs (e.g. queries/ceb-imdb,queries/job) "
+                 "to also score the model on, loaded after the featurizer is "
+                 "built so they do not change it. Meant for --load_model: the "
+                 "other arguments must match the run that trained the model.")
+    parser.add_argument("--extra_eval_templates", type=str, required=False,
+            default="all",
+            help="Templates to keep from --extra_eval_query_dir (comma-separated).")
+    parser.add_argument("--skip_train_eval", type=int, required=False,
+            default=0,
+            help="Set to 1 to skip scoring the train split at the end.")
     parser.add_argument("--disc_holdout_frac", type=float, required=False,
             default=0.5,
             help="Fraction of target/eval queries held out for MSCN evaluation")
