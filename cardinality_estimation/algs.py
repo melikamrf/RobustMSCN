@@ -674,6 +674,21 @@ class NN(CardinalityEstimationAlg):
             method = "pca"
         return method
 
+    def _latent_visualization_views(self):
+        """Which network activations to plot, one panel each.
+
+        out_mlp1_input: pooled set-encoder activations (the latent z that the
+            MMD / discriminator see).
+        out_mlp1_output: ReLU(out_mlp1(z)), the last hidden layer before the
+            regression head.
+        """
+        views = getattr(self, "latent_viz_views", None)
+        if not views:
+            views = ["out_mlp1_input", "out_mlp1_output"]
+        if isinstance(views, str):
+            views = [v.strip() for v in views.split(",") if v.strip()]
+        return list(views)
+
     def _prepare_run_plot_dir(self, kwargs):
         run_result_dir = kwargs.get("result_dir", "./results")
         return os.path.join(run_result_dir, self.get_exp_name())
@@ -692,37 +707,50 @@ class NN(CardinalityEstimationAlg):
             )
         return True
 
-    def _build_latent_visualization_loader(self, samples):
-        if samples is None or len(samples) == 0:
+    def _build_latent_visualization_loader(self, ds, tag):
+        """Unshuffled loader over a fixed random subset of ds.
+
+        The subset is drawn once (seeded by train_seed and tag), so every
+        epoch's plot embeds exactly the same subplans. Taking the first N rows
+        of an unshuffled dataset instead would only cover the first few
+        queries; taking them from the shuffled trainloader would give
+        different points every epoch.
+        """
+        if ds is None or len(ds) == 0:
             return None
 
-        ds = self.init_dataset(
-            samples,
-            self.load_query_together,
-            max_num_tables=self.max_num_tables,
-            load_padded_mscn_feats=self.load_padded_mscn_feats,
-        )
+        max_points = self._latent_visualization_sample_limit()
+        rng = make_numpy_generator(self.train_seed, "latent_viz_" + tag)
+        idxs = rng.permutation(len(ds))[:max_points].tolist()
+
         batch_size = 1 if self.load_query_together else self.mb_size
         return data.DataLoader(
-            ds,
+            data.Subset(ds, idxs),
             batch_size=batch_size,
             shuffle=False,
             collate_fn=self.collate_fn,
         )
 
     def _setup_latent_visualization_loaders(self, target_samples=None):
-        self.latent_viz_source_loader = getattr(self, "trainloader", None)
+        self.latent_viz_source_loader = self._build_latent_visualization_loader(
+            getattr(self, "trainds", None), "source")
 
         self.latent_viz_eval_loaders = {}
         for eval_name, eval_ds in getattr(self, "eval_ds", {}).items():
-            eval_loader = self._build_eval_dataset_loader(eval_ds)
+            eval_loader = self._build_latent_visualization_loader(eval_ds, eval_name)
             if eval_loader is not None:
                 self.latent_viz_eval_loaders[eval_name] = eval_loader
 
-        target_loader = getattr(self, "target_loader", None)
-        if target_loader is None and target_samples is not None and len(target_samples) > 0:
-            target_loader = self._build_latent_visualization_loader(target_samples)
-        self.latent_viz_target_loader = target_loader
+        target_ds = getattr(self, "targetds", None)
+        if target_ds is None and target_samples is not None and len(target_samples) > 0:
+            target_ds = self.init_dataset(
+                target_samples,
+                self.load_query_together,
+                max_num_tables=self.max_num_tables,
+                load_padded_mscn_feats=self.load_padded_mscn_feats,
+            )
+        self.latent_viz_target_loader = self._build_latent_visualization_loader(
+            target_ds, "target")
 
     def _build_eval_dataset_loader(self, ds):
         if ds is None:
@@ -866,12 +894,12 @@ class NN(CardinalityEstimationAlg):
         collected = defaultdict(list)
         num_rows = 0
 
-        # Set fixed seed for deterministic sampling across epochs
-        if hasattr(loader, 'sampler') and hasattr(loader.sampler, 'set_epoch'):
-            loader.sampler.set_epoch(42)  # Fixed seed for reproducibility
-
+        # The loader is an unshuffled fixed subset (see
+        # _build_latent_visualization_loader), so the same rows come back
+        # every call. The normalized target y of each row is kept under
+        # "__y__" so the plot can color points by true cardinality.
         with torch.no_grad():
-            for xbatch, _, _ in loader:
+            for xbatch, ybatch, _ in loader:
                 views = net.get_latent_visualization_tensors(xbatch)
                 batch_rows = None
                 converted = {}
@@ -882,6 +910,11 @@ class NN(CardinalityEstimationAlg):
                     converted[key] = arr
                     if batch_rows is None:
                         batch_rows = arr.shape[0]
+
+                if torch.is_tensor(ybatch):
+                    converted["__y__"] = ybatch.detach().cpu().numpy().reshape(-1)
+                else:
+                    converted["__y__"] = np.asarray(ybatch, dtype=np.float64).reshape(-1)
 
                 if batch_rows is None or batch_rows == 0:
                     continue
@@ -964,7 +997,31 @@ class NN(CardinalityEstimationAlg):
             print(f"Warning: t-SNE projection failed ({e}). Falling back to PCA.")
             return self._project_with_pca(combined)
 
+    def _latent_viz_color_values(self, ys):
+        """Map normalized targets y back to log10(true cardinality).
+
+        Inverts featurizer.normalize_val for the log-style normalizations;
+        anything else is colored by the raw normalized y.
+        """
+        ys = np.asarray(ys, dtype=np.float64)
+        featurizer = getattr(self, "featurizer", None)
+        ynorm = getattr(featurizer, "ynormalization", None)
+        if ynorm == "log":
+            ln_card = ys * (featurizer.max_val - featurizer.min_val) + featurizer.min_val
+            return ln_card / np.log(10), "log10(true cardinality)"
+        if ynorm == "logwhitening":
+            ln_card = ys * featurizer.stdy + featurizer.meany
+            return ln_card / np.log(10), "log10(true cardinality)"
+        return ys, "normalized target y"
+
     def _save_latent_visualization(self, save_dir, tag="final"):
+        """One figure per eval split, one panel per activation view.
+
+        Each panel is a joint 2-D projection (t-SNE or PCA) of the same fixed
+        source subset and the same fixed split subset. Source points are
+        shaded blue, split points orange; within each, darker = higher true
+        cardinality, on a color scale shared by both.
+        """
         if not self._latent_visualization_enabled():
             return None
         if not self._ensure_latent_visualization_ready():
@@ -986,51 +1043,83 @@ class NN(CardinalityEstimationAlg):
 
         split_mmds = getattr(self, "latest_eval_latent_mmds", {}) or {}
 
-        source_view = source_views.get("out_mlp1_input")
-        if source_view is None or len(source_view) == 0:
+        view_names = [
+            v for v in self._latent_visualization_views()
+            if source_views.get(v) is not None and len(source_views[v]) > 0
+        ]
+        if len(view_names) == 0:
             return None
+        n_source = len(source_views[view_names[0]])
+        source_vals, color_label = self._latent_viz_color_values(
+            source_views["__y__"])
+
+        # Truncate so the lowest cardinalities are still visible on white.
+        from matplotlib import colors as mcolors
+        from matplotlib import cm
+        source_cmap = mcolors.LinearSegmentedColormap.from_list(
+            "source_blues", plt.get_cmap("Blues")(np.linspace(0.3, 1.0, 256)))
+        target_cmap = mcolors.LinearSegmentedColormap.from_list(
+            "target_oranges", plt.get_cmap("Oranges")(np.linspace(0.3, 1.0, 256)))
 
         os.makedirs(save_dir, exist_ok=True)
         plot_paths = []
         for split_name, target_loader in target_loaders.items():
             target_views = self._collect_latent_visualization_views(
                 target_loader, max_points)
-            target_view = target_views.get("out_mlp1_input")
-            if target_view is None or len(target_view) == 0:
+            if any(target_views.get(v) is None or len(target_views[v]) == 0
+                    for v in view_names):
                 continue
+            n_target = len(target_views[view_names[0]])
+            target_vals, _ = self._latent_viz_color_values(target_views["__y__"])
 
-            source_proj, target_proj = self._project_latent_view(
-                source_view,
-                target_view,
+            all_vals = np.concatenate([source_vals, target_vals])
+            norm = mcolors.Normalize(vmin=float(all_vals.min()),
+                    vmax=float(all_vals.max()))
+            point_colors = np.concatenate([
+                source_cmap(norm(source_vals)),
+                target_cmap(norm(target_vals)),
+            ])
+            point_colors[:, 3] = 0.7
+            # Draw source and target interleaved so neither set systematically
+            # hides the other.
+            draw_order = make_numpy_generator(
+                self.train_seed, "latent_viz_draw_" + split_name).permutation(
+                        n_source + n_target)
+
+            fig, axes = plt.subplots(
+                1, len(view_names),
+                figsize=(6.5 * len(view_names) + 1.5, 6),
+                squeeze=False, constrained_layout=True,
             )
-            if source_proj is None and target_proj is None:
-                continue
+            axes = axes[0]
+            for ax, view_name in zip(axes, view_names):
+                source_proj, target_proj = self._project_latent_view(
+                    source_views[view_name],
+                    target_views[view_name],
+                )
+                proj = np.concatenate([source_proj, target_proj])[draw_order]
+                ax.scatter(proj[:, 0], proj[:, 1], s=8,
+                        c=point_colors[draw_order], linewidths=0)
+                dim = source_views[view_name].shape[1]
+                ax.set_title(f"{view_name} ({dim}-d activations)")
+                ax.set_xlabel("Dimension 1")
+                ax.set_ylabel("Dimension 2")
+                ax.grid(True, alpha=0.2)
 
-            fig, ax = plt.subplots(1, 1, figsize=(7, 6))
-            if source_proj is not None and len(source_proj) > 0:
-                ax.scatter(
-                    source_proj[:, 0], source_proj[:, 1],
-                    s=10, alpha=0.55, label="source", color="#1f77b4",
-                )
-            if target_proj is not None and len(target_proj) > 0:
-                ax.scatter(
-                    target_proj[:, 0], target_proj[:, 1],
-                    s=10, alpha=0.55, label=split_name, color="#ff7f0e",
-                )
+            target_sm = cm.ScalarMappable(norm=norm, cmap=target_cmap)
+            source_sm = cm.ScalarMappable(norm=norm, cmap=source_cmap)
+            fig.colorbar(target_sm, ax=list(axes), fraction=0.03, pad=0.01,
+                    label=f"{split_name} (n={n_target}): {color_label}")
+            fig.colorbar(source_sm, ax=list(axes), fraction=0.03, pad=0.01,
+                    label=f"source (n={n_source}): {color_label}")
 
             mmd_value = split_mmds.get(split_name)
-            if mmd_value is None:
-                caption = f"MMD(source, {split_name}) = n/a"
-            else:
-                caption = f"MMD(source, {split_name}) = {mmd_value:.6f}"
-
-            ax.set_title(f"Latent space: source vs {split_name}")
-            ax.set_xlabel("Dimension 1")
-            ax.set_ylabel("Dimension 2")
-            ax.grid(True, alpha=0.2)
-            ax.legend()
-            fig.text(0.5, 0.01, caption, ha="center", fontsize=10)
-            fig.tight_layout(rect=(0, 0.04, 1, 1))
+            mmd_text = "n/a" if mmd_value is None else f"{mmd_value:.6f}"
+            fig.suptitle(
+                f"Latent space ({self._latent_visualization_method()}), "
+                f"epoch {getattr(self, 'epoch', '?')}: source vs {split_name}  |  "
+                f"MMD(source, {split_name}) = {mmd_text}"
+            )
 
             plot_path = os.path.join(save_dir, f"latent_views_{split_name}_{tag}.png")
             fig.savefig(plot_path, dpi=200, bbox_inches="tight")

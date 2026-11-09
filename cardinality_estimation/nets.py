@@ -444,6 +444,7 @@ class SetConv(nn.Module):
 
         return {
             "out_mlp1_input": out_mlp1_input,
+            "out_mlp1_output": out_mlp1_output,
             "discriminator_input": discriminator_input,
             "regressor_input": regressor_input,
         }
@@ -829,6 +830,7 @@ class SetConvFlow(nn.Module):
 
         return {
             "out_mlp1_input": out_mlp1_input,
+            "out_mlp1_output": out_mlp1_output,
             "discriminator_input": discriminator_input,
             "regressor_input": regressor_input,
         }
